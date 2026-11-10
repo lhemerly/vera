@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vera-lang"
+version = "1.0.0"
+description = "VERA: Verified Relational Architecture — language, verifier, and runtime"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = ["z3-solver>=4.12"]
+
+[project.scripts]
+vera = "vera.cli:main"
+
+[tool.setuptools]
+packages = ["vera"]

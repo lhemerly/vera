@@ -1,0 +1,99 @@
+// VERA v1.0 example: a minimal, verified banking core.
+//
+// Run:  python -m vera check examples/bank.vera
+//       python -m vera verify examples/bank.vera
+
+module Bank;
+
+table Account capacity 32 {
+  key id : id64<Account>;
+  col balance : dec64 [tracked_sum];
+  col frozen  : bool;
+}
+
+table Order capacity 8 {
+  key id    : id64<Order>;
+  col owner : id64<Account>;
+  col amount : dec64;
+  col state : enum { Created, Paid, Cancelled };
+}
+
+// Global per-row invariant: balances are non-negative and bounded, so the
+// tracked_sum accumulator can never leave its domain on an intermediate step.
+invariant non_negative_balance {
+  forall k in Account : ge(Account[k].balance, 0);
+}
+
+invariant balance_bounded {
+  forall k in Account : le(Account[k].balance, 1000000000);
+}
+
+// Referential invariant: every order points at a live account.
+invariant order_owner_live {
+  forall k in Order : table_exists(Account, Order[k].owner);
+}
+
+// Egress effect declaration (outbox record).
+effect SendWireTransfer(acct_id : id64<Account>, amount : dec64, idempotency_key : bytes32);
+
+transition transfer(from : id64<Account>, to : id64<Account>, amount : dec64)
+  reads [Account[from].balance, Account[to].balance, Account[from].frozen, Account[to].frozen]
+  writes [Account[from].balance, Account[to].balance]
+  require positive_amount : gt(amount, 0);
+  require from_exists     : table_exists(Account, from);
+  require to_exists       : table_exists(Account, to);
+  require not_frozen      : eq(Account[from].frozen, false);
+  require no_bound_breach : le(amount, sub(1000000000, Account[to].balance));
+  ensure conservation_of_funds : eq(sum(Account.balance), old_sum(Account.balance));
+  body {
+    let %bal_from : dec64 = table_get(Account, from, balance);
+    let %bal_to   : dec64 = table_get(Account, to, balance);
+    let %frozen_to : bool = table_get(Account, to, frozen);
+    guard(ge(%bal_from, amount), ERR_INSUFFICIENT);
+    guard(ne(from, to), ERR_SELF_TRANSFER);
+    guard(eq(%frozen_to, false), ERR_RECIPIENT_FROZEN);
+    let %new_from : dec64 = sub(%bal_from, amount);
+    let %new_to   : dec64 = add(%bal_to, amount);
+    table_set(Account, from, balance, %new_from);
+    table_set(Account, to, balance, %new_to);
+    commit;
+  }
+
+transition freeze(acct : id64<Account>)
+  reads [Account[acct].frozen]
+  writes [Account[acct].frozen]
+  require acct_exists : table_exists(Account, acct);
+  require not_already_frozen : eq(Account[acct].frozen, false);
+  ensure frozen_now : eq(Account[acct].frozen, true);
+  body {
+    let %f : bool = table_get(Account, acct, frozen);
+    guard(eq(%f, false), ERR_ALREADY_FROZEN);
+    table_set(Account, acct, frozen, true);
+    commit;
+  }
+
+transition place_order(buyer : id64<Account>, amount : dec64)
+  reads [Account[buyer].balance]
+  writes [Order[*].owner, Order[*].amount, Order[*].state]  require buyer_exists : table_exists(Account, buyer);
+  require positive_amount : gt(amount, 0);
+  body {
+    let %bal : dec64 = table_get(Account, buyer, balance);
+    guard(ge(%bal, amount), ERR_INSUFFICIENT);
+    let %new_order_id : id64<Order> = table_alloc(Order, {
+      owner : buyer,
+      amount : amount,
+      state : Created
+    });
+    commit;
+  }
+
+// Zero-HTML projection: the runtime evaluates this in O(1) and streams a
+// binary State & Affordance Frame to any deterministic shell.
+projection AccountView(from : id64<Account>) {
+  allow_if : eq(Account[from].frozen, false);
+  expose : [Account.balance[from], Account.frozen[from]];
+  enable_intents : [
+    transfer when (ge(Account[from].balance, 1)),
+    freeze when (eq(Account[from].frozen, false))
+  ];
+}

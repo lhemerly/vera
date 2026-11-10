@@ -1,0 +1,9 @@
+{
+  "tables": {
+    "Account": [
+      {"id": 32, "balance": 500000000, "frozen": false},
+      {"id": 33, "balance": 300000000, "frozen": false}
+    ],
+    "Order": []
+  }
+}
