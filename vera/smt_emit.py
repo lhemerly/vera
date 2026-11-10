@@ -25,7 +25,7 @@ import z3
 from . import ast_nodes as A
 from .errors import Diagnostic, DiagnosticBag, ERR_VACUOUS_IMPLEMENTATION
 from .semantic import Program, TransitionInfo
-from .types import BOOL, I64, ScalarType, id64, slot_bits_for
+from .types import BOOL, I64, MAX_PROBES, ScalarType, id64, slot_bits_for
 
 
 @dataclass
@@ -156,6 +156,10 @@ class SmtEncoder:
         self.pre_occ: Dict[str, str] = {}
         self.pre_gen: Dict[str, str] = {}
         self.pre_col: Dict[str, Dict[str, str]] = {}
+        self.pre_hkey: Dict[Tuple[str, str], str] = {}
+        self.cur_hkey: Dict[Tuple[str, str], str] = {}
+        self.pre_hused: Dict[Tuple[str, str], str] = {}
+        self.cur_hused: Dict[Tuple[str, str], str] = {}
         self.pre_agg: Dict[str, Dict[str, str]] = {}
         self.cur_agg: Dict[str, Dict[str, str]] = {}
         self.agg_wide: Dict[Tuple[str, str], int] = {}
@@ -225,6 +229,12 @@ class SmtEncoder:
 
     def _apply(self, fn: str, idx: str) -> str:
         return f"({fn} {idx})"
+
+    def _select_arr(self, arr: str, idx: str) -> str:
+        return f"(select {arr} {idx})"
+
+    def _store_arr(self, arr: str, idx: str, val: str) -> str:
+        return f"(store {arr} {idx} {val})"
 
     def _ite(self, cond: str, a: str, b: str) -> str:
         return f"(ite {cond} {a} {b})"
@@ -315,6 +325,22 @@ class SmtEncoder:
                 self.declare(col, f"(declare-fun {col} ((_ BitVec {sbits})) {self._sort_of(cinfo.type)})",
                              ("fun", sbits, "bool" if cinfo.type.is_bool else cinfo.type.width))
                 self.pre_col[tname][cname] = col
+            for cname, cinfo in tinfo.columns.items():
+                if cinfo.unique:
+                    B = tinfo.layout.unique_hashes[cname]
+                    bb = max(1, B.bit_length() - 1)
+                    hkey = f"{tname}_{cname}_hkey"
+                    self.declare(hkey,
+                                 f"(declare-const {hkey} (Array (_ BitVec {bb}) (_ BitVec {sbits})))",
+                                 ("array", bb, sbits))
+                    hused = f"{tname}_{cname}_hused"
+                    self.declare(hused,
+                                 f"(declare-const {hused} (Array (_ BitVec {bb}) Bool))",
+                                 ("array", bb, "bool"))
+                    self.pre_hkey[(tname, cname)] = hkey
+                    self.cur_hkey[(tname, cname)] = hkey
+                    self.pre_hused[(tname, cname)] = hused
+                    self.cur_hused[(tname, cname)] = hused
             if tinfo.layout.agg_offsets:
                 self.pre_agg[tname] = {}
                 self.cur_agg[tname] = {}
@@ -419,6 +445,92 @@ class SmtEncoder:
                              f"(= {high} {self._bv(0, high_bits)})")
         return self._and(occ, f"(= {gen} {expected})")
 
+    # --- secondary unique-key index (linear probing, P_max bounded) ---------
+    def _hash_int_smt(self, ctype: ScalarType, expr: str) -> str:
+        if ctype.kind == "bytes32":
+            return f"((_ extract 63 0) {expr})"
+        if ctype.width < 64:
+            return self._extend(expr, ctype.width, 64, False)
+        return expr
+
+    def _mix64_smt(self, x: str) -> str:
+        t = f"(bvxor {x} (bvlshr {x} {self._bv(30, 64)}))"
+        t = f"(bvmul {t} {self._bv(0xBF58476D1CE4E5B9, 64)})"
+        t = f"(bvxor {t} (bvlshr {t} {self._bv(27, 64)}))"
+        t = f"(bvmul {t} {self._bv(0x94D049BB133111EB, 64)})"
+        return f"(bvxor {t} (bvlshr {t} {self._bv(31, 64)}))"
+
+    def _bucket_smt(self, ctype: ScalarType, value_expr: str, buckets: int) -> str:
+        h = self._mix64_smt(self._hash_int_smt(ctype, value_expr))
+        bb = max(1, buckets.bit_length() - 1)
+        return f"((_ extract {bb - 1} 0) (bvand {h} {self._bv(buckets - 1, 64)}))"
+
+    def _hash_lookup_smt(self, tname: str, cname: str, value_expr: str,
+                         ctype: ScalarType):
+        tinfo = self.prog.tables[tname]
+        B = tinfo.layout.unique_hashes[cname]
+        bb = max(1, B.bit_length() - 1)
+        sbits = self.table_slot_bits[tname]
+        h = self._bucket_smt(ctype, value_expr, B)
+        hused = self.cur_hused[(tname, cname)]
+        hkey = self.cur_hkey[(tname, cname)]
+        col = self.pre_col[tname][cname]
+        result = self._bv(0, sbits)
+        found = "false"
+        active = "true"
+        for i in range(MAX_PROBES):
+            pos = f"(bvadd {h} {self._bv(i, bb)})"
+            used = self._select_arr(hused, pos)
+            slot = self._select_arr(hkey, pos)
+            val = self._apply(col, slot)
+            match = self._and(used, f"(= {val} {value_expr})")
+            take = self._and(active, match)
+            result = self._ite(take, slot, result)
+            found = self._or(found, take)
+            active = self._and(active, used)
+        return result, found
+
+    def _hash_insert_smt(self, tname: str, cname: str, value_expr: str,
+                         slot_expr: str, ctype: ScalarType) -> None:
+        tinfo = self.prog.tables[tname]
+        B = tinfo.layout.unique_hashes[cname]
+        bb = max(1, B.bit_length() - 1)
+        sbits = self.table_slot_bits[tname]
+        h = self._bucket_smt(ctype, value_expr, B)
+        hused = self.cur_hused[(tname, cname)]
+        hkey = self.cur_hkey[(tname, cname)]
+        col = self.pre_col[tname][cname]
+        free_pos = self._bv(0, bb)
+        free_found = "false"
+        duplicate = "false"
+        active = "true"
+        for i in range(MAX_PROBES):
+            pos = f"(bvadd {h} {self._bv(i, bb)})"
+            used = self._select_arr(hused, pos)
+            slot = self._select_arr(hkey, pos)
+            val = self._apply(col, slot)
+            duplicate = self._or(duplicate, self._and(active, used, f"(= {val} {value_expr})"))
+            free = self._and(active, self._not(used))
+            free_pos = self._ite(free, pos, free_pos)
+            free_found = self._or(free_found, free)
+            active = self._and(active, used)
+        ok = self._and(self._not(duplicate), free_found)
+        # Saturation / duplicate insertion are *handled* deterministic reverts
+        # (ERR_INDEX_SATURATED / ERR_DUPLICATE_KEY), not unhandled panics.
+        self._pi_update(ok)
+        base = f"{tname}_{cname}_hused"
+        new_hused = self._fresh(base,
+                                f"(declare-const {base}_{self._version.get(base, 0)} (Array (_ BitVec {bb}) Bool))",
+                                ("array", bb, "bool"))
+        self.assert_common(f"(= {new_hused} {self._store_arr(hused, free_pos, 'true')})")
+        self.cur_hused[(tname, cname)] = new_hused
+        base = f"{tname}_{cname}_hkey"
+        new_hkey = self._fresh(base,
+                               f"(declare-const {base}_{self._version.get(base, 0)} (Array (_ BitVec {bb}) (_ BitVec {sbits})))",
+                               ("array", bb, sbits))
+        self.assert_common(f"(= {new_hkey} {self._store_arr(hkey, free_pos, slot_expr)})")
+        self.cur_hkey[(tname, cname)] = new_hkey
+
     # --- well-formedness ---------------------------------------------------
     def _build_well_formedness(self) -> None:
         for tname, tinfo in self.prog.tables.items():
@@ -431,6 +543,20 @@ class SmtEncoder:
                     val = self._apply(self.pre_col[tname][cname], slot)
                     self.assert_common(
                         f"(=> {self._not(occ)} (= {val} {self._zero(cinfo.type)}))")
+            for cname in tinfo.layout.unique_hashes:
+                B = tinfo.layout.unique_hashes[cname]
+                bb = max(1, B.bit_length() - 1)
+                hused = self.pre_hused[(tname, cname)]
+                hkey = self.pre_hkey[(tname, cname)]
+                free = [self._not(self._select_arr(hused, self._bv(i, bb)))
+                        for i in range(B)]
+                self.assert_common(self._or(*free))
+                # Every occupied bucket must point at a live row.
+                for i in range(B):
+                    slot = self._select_arr(hkey, self._bv(i, bb))
+                    used = self._select_arr(hused, self._bv(i, bb))
+                    occ = self._apply(self.pre_occ[tname], slot)
+                    self.assert_common(f"(=> {used} {occ})")
 
     # --- pre-invariants ----------------------------------------------------
     def _build_pre_invariants(self) -> None:
@@ -774,6 +900,8 @@ class SmtEncoder:
             self._record_final(tname, cname, slot, init, active, True)
             if cinfo.tracked_sum:
                 self._agg_add(tname, cname, init, cinfo.type, active)
+            if cinfo.unique:
+                self._hash_insert_smt(tname, cname, init, slot, cinfo.type)
 
     def _agg_add(self, tname: str, cname: str, v_new: str, ctype: ScalarType,
                  active: Optional[str] = None) -> None:
@@ -931,6 +1059,22 @@ class SmtEncoder:
             if state == "pre":
                 return self._pre_valid(key, expr.table)
             return self._current_valid(key, expr.table)
+        if isinstance(expr, A.TableExistsUnique):
+            tinfo = self.prog.tables[expr.table]
+            cinfo = tinfo.columns[expr.key_column]
+            key = self._encode_expr(expr.key, env, state)
+            _, found = self._hash_lookup_smt(expr.table, expr.key_column, key, cinfo.type)
+            return found
+        if isinstance(expr, A.TableLookup):
+            tinfo = self.prog.tables[expr.table]
+            cinfo = tinfo.columns[expr.key_column]
+            key = self._encode_expr(expr.key, env, state)
+            slot, found = self._hash_lookup_smt(expr.table, expr.key_column, key, cinfo.type)
+            self._trap_update(self._not(found))
+            self._pi_update(found)
+            gen = self._apply(self.pre_gen[expr.table], slot)
+            width = tinfo.layout.generation_bits + tinfo.layout.key_bits
+            return self._extend(f"(concat {gen} {slot})", width, 64, False)
         if isinstance(expr, A.TableAccess):
             cinfo = self.prog.tables[expr.table].columns[expr.column]
             key = self._encode_expr(expr.key, env, state)

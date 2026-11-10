@@ -182,12 +182,20 @@ class Parser:
             self.expect_punct(":")
             ctype = self.parse_type_ref()
             tracked = False
+            unique = False
             if self.accept_punct("["):
-                self.expect_keyword("tracked_sum")
+                while True:
+                    if self.accept_keyword("tracked_sum"):
+                        tracked = True
+                    elif self.accept_keyword("unique"):
+                        unique = True
+                    else:
+                        self.error("expected 'tracked_sum' or 'unique'")
+                    if not self.accept_punct(","):
+                        break
                 self.expect_punct("]")
-                tracked = True
             self.expect_punct(";")
-            columns.append(A.ColumnDecl(col_tok.value, ctype, tracked,
+            columns.append(A.ColumnDecl(col_tok.value, ctype, tracked, unique,
                                         col_tok.line, col_tok.col))
         return A.TableDecl(name, capacity, key_name, key_type, columns,
                            tok.line, tok.col)
@@ -512,6 +520,26 @@ class Parser:
                 key = self.parse_pure_expr()
                 self.expect_punct(")")
                 return A.TableExists(table, key, tok.line, tok.col)
+            if kw == "table_lookup":
+                self.advance()
+                self.expect_punct("(")
+                table = self.expect_ident().value
+                self.expect_punct(",")
+                key_column = self.expect_ident().value
+                self.expect_punct(",")
+                key = self.parse_pure_expr()
+                self.expect_punct(")")
+                return A.TableLookup(table, key_column, key, tok.line, tok.col)
+            if kw == "table_exists_unique":
+                self.advance()
+                self.expect_punct("(")
+                table = self.expect_ident().value
+                self.expect_punct(",")
+                key_column = self.expect_ident().value
+                self.expect_punct(",")
+                key = self.parse_pure_expr()
+                self.expect_punct(")")
+                return A.TableExistsUnique(table, key_column, key, tok.line, tok.col)
             if kw == "key_of":
                 self.advance()
                 self.expect_punct("<")
@@ -717,6 +745,26 @@ class Parser:
                 key = self.parse_logic_expr()
                 self.expect_punct(")")
                 return A.TableExists(table, key, tok.line, tok.col)
+            if kw == "table_lookup":
+                self.advance()
+                self.expect_punct("(")
+                table = self.expect_ident().value
+                self.expect_punct(",")
+                key_column = self.expect_ident().value
+                self.expect_punct(",")
+                key = self.parse_logic_expr()
+                self.expect_punct(")")
+                return A.TableLookup(table, key_column, key, tok.line, tok.col)
+            if kw == "table_exists_unique":
+                self.advance()
+                self.expect_punct("(")
+                table = self.expect_ident().value
+                self.expect_punct(",")
+                key_column = self.expect_ident().value
+                self.expect_punct(",")
+                key = self.parse_logic_expr()
+                self.expect_punct(")")
+                return A.TableExistsUnique(table, key_column, key, tok.line, tok.col)
             if kw == "table_get":
                 self.advance()
                 self.expect_punct("(")

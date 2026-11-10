@@ -5,6 +5,9 @@ from typing import Dict, List, Optional, Tuple
 
 from .errors import D_CAPACITY, D_UNKNOWN_TABLE, VeraError
 
+# Maximum probe sequence length for secondary unique-key indexes (Section 2.3).
+MAX_PROBES = 16
+
 
 @dataclass(frozen=True)
 class ScalarType:
@@ -191,6 +194,9 @@ class TableLayout:
     agg_offsets: Dict[str, int] = field(default_factory=dict)
     agg_types: Dict[str, ScalarType] = field(default_factory=dict)
     column_types: Dict[str, ScalarType] = field(default_factory=dict)
+    unique_hashes: Dict[str, int] = field(default_factory=dict)
+    hash_key_offsets: Dict[str, int] = field(default_factory=dict)
+    hash_used_offsets: Dict[str, int] = field(default_factory=dict)
 
     @property
     def slot_mask(self) -> int:
@@ -225,12 +231,20 @@ def _align_up(value: int, alignment: int) -> int:
     return (value + alignment - 1) // alignment * alignment
 
 
+def _next_pow2(value: int) -> int:
+    if value <= 1:
+        return 1
+    return 1 << (value - 1).bit_length()
+
+
 def compute_layout(name: str, capacity: int, columns: List[Tuple[str, ScalarType]],
-                   tracked: List[str]) -> TableLayout:
+                   tracked: List[str], unique: Optional[List[str]] = None) -> TableLayout:
     """Compute the 64-byte-aligned SoA layout for a table.
 
     Every column vector (and the occupancy bitmap / generation array) starts on a
-    64-byte boundary, matching the Section 2.3 memory formula.
+    64-byte boundary, matching the Section 2.3 memory formula.  Unique-key
+    secondary indexes get a fixed-capacity linear-probing hash table with a
+    probe bound ``UERA_MAX_PROBES`` (Section 2.3).
     """
     if capacity <= 0 or (capacity & (capacity - 1)) != 0:
         raise VeraError(D_CAPACITY,
@@ -246,7 +260,7 @@ def compute_layout(name: str, capacity: int, columns: List[Tuple[str, ScalarType
         layout.fields.append(FieldLayout(fname, start, fsize, falign, ftype, pad))
         offset = start + fsize
 
-    # Occupancy bitmap: C bits stored as C/64 u64 words.
+    # Occupancy bitmap: C bits stored as ceil(C/64) u64 words.
     add_field("occupied_bitmap", max(8, ((capacity + 63) // 64) * 8), 8, U64)
     # Generation array: one u32 per slot.
     add_field("generation", 4 * capacity, 4, U32)
@@ -262,6 +276,19 @@ def compute_layout(name: str, capacity: int, columns: List[Tuple[str, ScalarType
         add_field(f"agg_sum_{cname}", ctype.size, ctype.align, ctype)
         layout.agg_offsets[cname] = layout.fields[-1].offset
         layout.agg_types[cname] = ctype
+    for cname in (unique or []):
+        if cname not in layout.column_types:
+            raise VeraError(D_UNKNOWN_COLUMN,
+                            f"unique column {cname!r} is not declared in table {name!r}")
+        # Two buckets per slot keep the load factor <= 0.5 so the probe bound is
+        # meaningful; the table never holds more than ``capacity`` rows.
+        buckets = _next_pow2(max(2 * capacity, 16))
+        add_field(f"hash_{cname}_key", 8 * buckets, 8, U64)
+        layout.hash_key_offsets[cname] = layout.fields[-1].offset
+        words = max(1, (buckets + 63) // 64)
+        add_field(f"hash_{cname}_used", 8 * words, 8, U64)
+        layout.hash_used_offsets[cname] = layout.fields[-1].offset
+        layout.unique_hashes[cname] = buckets
     layout.size = _align_up(offset, 64)
     return layout
 
@@ -272,3 +299,35 @@ def slot_bits_for(capacity: int) -> int:
         raise VeraError(D_CAPACITY,
                         f"capacity {capacity} is not a positive power of two")
     return max(1, capacity.bit_length() - 1)
+
+
+MASK64 = (1 << 64) - 1
+
+# splitmix64 finalizer: the deterministic mix used by the secondary index.
+_MIX1 = 0xBF58476D1CE4E5B9
+_MIX2 = 0x94D049BB133111EB
+
+
+def hash_int(value) -> int:
+    """Convert a scalar column value to a 64-bit integer for hashing."""
+    if isinstance(value, bool):
+        return 1 if value else 0
+    if isinstance(value, int):
+        return value & MASK64
+    if isinstance(value, (bytes, bytearray)):
+        return int.from_bytes(bytes(value), "little") & MASK64
+    if isinstance(value, str):
+        from .smt_emit import _intern_symbol
+        return _intern_symbol(value)
+    return 0
+
+
+def mix64(z: int) -> int:
+    z &= MASK64
+    z = ((z ^ (z >> 30)) * _MIX1) & MASK64
+    z = ((z ^ (z >> 27)) * _MIX2) & MASK64
+    return (z ^ (z >> 31)) & MASK64
+
+
+def bucket_of(value, buckets: int) -> int:
+    return mix64(hash_int(value)) & (buckets - 1)

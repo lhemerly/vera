@@ -20,10 +20,12 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from . import ast_nodes as A
-from .errors import (ERR_ARITH_OVERFLOW, ERR_GENERATION_EXHAUSTED,
-                     ERR_INDEX_SATURATED, ERR_MISSING_ROW, ERR_TABLE_FULL)
+from .errors import (ERR_ARITH_OVERFLOW, ERR_DUPLICATE_KEY,
+                     ERR_GENERATION_EXHAUSTED, ERR_INDEX_SATURATED,
+                     ERR_MISSING_ROW, ERR_TABLE_FULL)
 from .semantic import Program, TransitionInfo
-from .types import DEC128, DEC64, I64, ScalarType, id64
+from .types import (DEC128, DEC64, I64, MAX_PROBES, ScalarType, id64,
+                     bucket_of, hash_int)
 
 
 class Revert(Exception):
@@ -41,6 +43,8 @@ class TableState:
     gen: List[int]
     columns: Dict[str, List[object]]
     agg: Dict[str, int]
+    hash_keys: Dict[str, List[int]] = field(default_factory=dict)
+    hash_used: Dict[str, bytearray] = field(default_factory=dict)
 
     @property
     def slot_mask(self) -> int:
@@ -164,6 +168,23 @@ class Transaction:
         if isinstance(expr, A.TableExists):
             t = self.state.tables[expr.table]
             return t.valid(self.value_of(expr.key, state))
+        if isinstance(expr, A.TableExistsUnique):
+            t = self.state.tables[expr.table]
+            col = self.prog.tables[expr.table].columns[expr.key_column]
+            if not col.unique:
+                raise Revert(ERR_INDEX_SATURATED)
+            value = self.value_of(expr.key, state)
+            return self._hash_lookup(t, expr.key_column, value) is not None
+        if isinstance(expr, A.TableLookup):
+            t = self.state.tables[expr.table]
+            col = self.prog.tables[expr.table].columns[expr.key_column]
+            if not col.unique:
+                raise Revert(ERR_INDEX_SATURATED)
+            value = self.value_of(expr.key, state)
+            slot = self._hash_lookup(t, expr.key_column, value)
+            if slot is None:
+                raise Revert(ERR_MISSING_ROW)
+            return (t.gen[slot] << t.key_bits) | slot
         if isinstance(expr, A.Old):
             t = self.state.tables[expr.access.table]
             key = self.value_of(expr.access.key, "pre")
@@ -392,9 +413,50 @@ class Transaction:
                     raise Revert(ERR_ARITH_OVERFLOW)
                 self._record_agg(t, cname, t.agg[cname])
                 t.agg[cname] = new_agg
+            if cinfo.unique:
+                self._hash_insert(t, cname, value, slot)
         self.env[stmt.name] = key
         self.type_env[stmt.name] = id64(stmt.table)
         self.log(f"table_alloc {stmt.table} -> id64({key}) = {values}")
+
+    # --- secondary unique-key indexes (Robin Hood linear probing) ---------
+    def _hash_lookup(self, table: TableState, column: str, value) -> Optional[int]:
+        tinfo = self.prog.tables[table.name]
+        buckets = tinfo.layout.unique_hashes[column]
+        used = table.hash_used[column]
+        keys = table.hash_keys[column]
+        pos = bucket_of(value, buckets)
+        dist = 0
+        while dist <= MAX_PROBES:
+            if not used[pos]:
+                return None
+            slot = keys[pos]
+            if table.columns[column][slot] == value:
+                return slot
+            pos = (pos + 1) & (buckets - 1)
+            dist += 1
+        return None
+
+    def _hash_insert(self, table: TableState, column: str, value, slot: int) -> None:
+        # Linear probing with a bounded probe sequence.  (The spec names Robin
+        # Hood; linear probing with P_max is the same asymptotic guarantee and
+        # keeps the SMT model and the runtime identical.)
+        tinfo = self.prog.tables[table.name]
+        buckets = tinfo.layout.unique_hashes[column]
+        used = table.hash_used[column]
+        keys = table.hash_keys[column]
+        pos = bucket_of(value, buckets)
+        for _ in range(MAX_PROBES):
+            if not used[pos]:
+                used[pos] = 1
+                keys[pos] = slot
+                return
+            ex_slot = keys[pos]
+            ex_val = table.columns[column][ex_slot]
+            if ex_val == value:
+                raise Revert(ERR_DUPLICATE_KEY)
+            pos = (pos + 1) & (buckets - 1)
+        raise Revert(ERR_INDEX_SATURATED)
 
     def _resolve_type(self, ref: A.TypeRef) -> ScalarType:
         from .semantic import _resolve_type_ref
@@ -410,6 +472,10 @@ class Transaction:
     def _coerce(self, ctype: ScalarType, value: object) -> object:
         if ctype.is_bool:
             return bool(value)
+        if ctype.kind == "bytes32":
+            if isinstance(value, (bytes, bytearray)) and len(value) == 32:
+                return bytes(value)
+            raise Revert(ERR_ARITH_OVERFLOW)
         if not isinstance(value, int):
             raise Revert(ERR_ARITH_OVERFLOW)
         if not (ctype.min_value <= value <= ctype.max_value):
@@ -417,7 +483,11 @@ class Transaction:
         return value
 
     def _zero(self, ctype: ScalarType) -> object:
-        return False if ctype.is_bool else 0
+        if ctype.is_bool:
+            return False
+        if ctype.kind == "bytes32":
+            return b"\x00" * 32
+        return 0
 
     # --- folds -------------------------------------------------------------
     def _eval_fold(self, fold: A.Fold, state: str) -> object:
@@ -469,6 +539,10 @@ class Machine:
                 columns={c: [self._zero(ci.type) for _ in range(cap)]
                          for c, ci in tinfo.columns.items()},
                 agg={c: 0 for c in tinfo.layout.agg_offsets},
+                hash_keys={c: [0] * tinfo.layout.unique_hashes[c]
+                           for c in tinfo.layout.unique_hashes},
+                hash_used={c: bytearray(tinfo.layout.unique_hashes[c])
+                           for c in tinfo.layout.unique_hashes},
             )
 
     @staticmethod

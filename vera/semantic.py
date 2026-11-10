@@ -20,7 +20,8 @@ class ColumnInfo:
     name: str
     type: ScalarType
     tracked_sum: bool
-    decl: A.ColumnDecl
+    unique: bool = False
+    decl: A.ColumnDecl = None
 
 
 @dataclass
@@ -134,6 +135,7 @@ def _collect_tables(prog: Program) -> None:
         info = TableInfo(name=decl.name, decl=decl, key_type=id64(decl.name))
         col_types: List[Tuple[str, ScalarType]] = []
         tracked: List[str] = []
+        unique_cols: List[str] = []
         for col in decl.columns:
             if col.name in info.columns:
                 prog.error(D_DUPLICATE,
@@ -143,7 +145,7 @@ def _collect_tables(prog: Program) -> None:
             ctype = _resolve_type_ref(prog, col.type, decl.name)
             if ctype is None:
                 continue
-            ci = ColumnInfo(col.name, ctype, col.tracked_sum, col)
+            ci = ColumnInfo(col.name, ctype, col.tracked_sum, col.unique, col)
             if col.tracked_sum and not ctype.is_numeric:
                 prog.error(D_BAD_OPERAND,
                            f"column {decl.name}.{col.name} is marked tracked_sum but has "
@@ -153,8 +155,10 @@ def _collect_tables(prog: Program) -> None:
             col_types.append((col.name, ctype))
             if col.tracked_sum:
                 tracked.append(col.name)
+            if col.unique:
+                unique_cols.append(col.name)
         try:
-            info.layout = compute_layout(decl.name, decl.capacity, col_types, tracked)
+            info.layout = compute_layout(decl.name, decl.capacity, col_types, tracked, unique_cols)
         except VeraError as exc:
             prog.diags.items.append(exc.diag)
             continue
@@ -324,6 +328,46 @@ class _TypeChecker:
         if isinstance(expr, A.TableExists):
             self._check_key(expr.table, expr.key, expr.line, expr.col)
             return BOOL
+        if isinstance(expr, A.TableExistsUnique):
+            tbl = self._require_table(expr.table, expr.line, expr.col)
+            if tbl is None:
+                return BOOL
+            col = tbl.columns.get(expr.key_column)
+            if col is None:
+                self.prog.error(D_UNKNOWN_COLUMN,
+                                f"unknown lookup column {expr.table}.{expr.key_column!r}",
+                                expr.line, expr.col)
+                return BOOL
+            if not col.unique:
+                self.prog.error(D_BAD_OPERAND,
+                                f"{expr.table}.{expr.key_column} is not declared [unique]",
+                                expr.line, expr.col)
+            kt = self.type_of(expr.key)
+            if kt != col.type:
+                self.prog.error(D_TYPE_MISMATCH,
+                                f"lookup key for {expr.table}.{expr.key_column} must be "
+                                f"{col.type}, got {kt}", expr.line, expr.col)
+            return BOOL
+        if isinstance(expr, A.TableLookup):
+            tbl = self._require_table(expr.table, expr.line, expr.col)
+            if tbl is None:
+                return I64
+            col = tbl.columns.get(expr.key_column)
+            if col is None:
+                self.prog.error(D_UNKNOWN_COLUMN,
+                                f"unknown lookup column {expr.table}.{expr.key_column!r}",
+                                expr.line, expr.col)
+                return I64
+            if not col.unique:
+                self.prog.error(D_BAD_OPERAND,
+                                f"{expr.table}.{expr.key_column} is not declared [unique]",
+                                expr.line, expr.col)
+            kt = self.type_of(expr.key)
+            if kt != col.type:
+                self.prog.error(D_TYPE_MISMATCH,
+                                f"lookup key for {expr.table}.{expr.key_column} must be "
+                                f"{col.type}, got {kt}", expr.line, expr.col)
+            return id64(expr.table)
         if isinstance(expr, A.TableAccess):
             return self._table_access_type(expr)
         if isinstance(expr, A.Old):
@@ -694,6 +738,11 @@ class _TypeChecker:
                     self.prog.error(D_UNKNOWN_COLUMN,
                                     f"unknown column {stmt.table}.{stmt.column!r}",
                                     stmt.line, stmt.col)
+                elif col.unique:
+                    self.prog.error(D_BAD_OPERAND,
+                                    f"table_set on unique column {stmt.table}.{stmt.column!r} "
+                                    f"is forbidden (secondary indexes are immutable)",
+                                    stmt.line, stmt.col)
                 else:
                     vt = self.type_of(stmt.value, col.type)
                     if vt != col.type:
@@ -976,6 +1025,18 @@ def _collect_reads(prog: Program, expr: A.Expr, def_kind: Dict[str, str],
     if isinstance(expr, A.TableExists):
         tier = 2 if _expr_uses_read(expr.key, def_kind) else 1
         out.append(AccessRecord(expr.table, None, expr.key, tier, expr.line, len(out)))
+        _collect_reads(prog, expr.key, def_kind, out)
+        return
+    if isinstance(expr, A.TableLookup):
+        tier = 2 if _expr_uses_read(expr.key, def_kind) else 1
+        out.append(AccessRecord(expr.table, expr.key_column, expr.key, tier,
+                                expr.line, len(out)))
+        _collect_reads(prog, expr.key, def_kind, out)
+        return
+    if isinstance(expr, A.TableExistsUnique):
+        tier = 2 if _expr_uses_read(expr.key, def_kind) else 1
+        out.append(AccessRecord(expr.table, expr.key_column, expr.key, tier,
+                                expr.line, len(out)))
         _collect_reads(prog, expr.key, def_kind, out)
         return
     if isinstance(expr, A.Old):

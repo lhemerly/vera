@@ -17,13 +17,21 @@ from typing import Dict, List, Optional, Tuple
 
 from . import ast_nodes as A
 from .semantic import Program
-from .types import ScalarType
+from .types import MAX_PROBES, ScalarType
 
 
 _RUST_BIN = {
     "add": "+", "sub": "-", "mul": "*", "div": "/", "rem": "%",
     "eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">=",
 }
+
+
+def _zero_rust(ctype: ScalarType) -> str:
+    if ctype.is_bool:
+        return "false"
+    if ctype.kind == "bytes32":
+        return "[0u8; 32]"
+    return "0"
 
 
 def _rust_type(ctype: ScalarType) -> str:
@@ -56,9 +64,9 @@ class RustGenerator:
 
     def _collect_error_codes(self) -> None:
         seen = {"ArithOverflow", "MissingRow", "TableFull", "GenerationExhausted",
-                "Precondition"}
+                "Precondition", "DuplicateKey", "IndexSaturated"}
         codes = ["ArithOverflow", "MissingRow", "TableFull", "GenerationExhausted",
-                 "Precondition"]
+                 "Precondition", "DuplicateKey", "IndexSaturated"]
         for ti in self.prog.transitions.values():
             for stmt in ti.decl.body:
                 for s in _walk_stmts(stmt):
@@ -123,6 +131,24 @@ class RustGenerator:
         self.line("    }")
         self.line("    Ok(q as i64)")
         self.line("}")
+        self.line("fn mix64(z: u64) -> u64 {")
+        self.line("    let z = z ^ (z >> 30);")
+        self.line("    let z = z.wrapping_mul(0xBF58476D1CE4E5B9);")
+        self.line("    let z = z ^ (z >> 27);")
+        self.line("    let z = z.wrapping_mul(0x94D049BB133111EB);")
+        self.line("    z ^ (z >> 31)")
+        self.line("}")
+        for tname, tinfo in self.prog.tables.items():
+            for cinfo in tinfo.columns.values():
+                if not cinfo.unique:
+                    continue
+                rt = _rust_type(cinfo.type)
+                self.line(f"fn hash_int_{tname}_{cinfo.name}(v: &{rt}) -> u64 {{")
+                if cinfo.type.kind == "bytes32":
+                    self.line("    mix64(u64::from_le_bytes(v[0..8].try_into().unwrap()))")
+                else:
+                    self.line("    mix64(*v as u64)")
+                self.line("}")
         self.line("fn dec64_div(a: i64, b: i64) -> Result<i64, ErrorCode> {")
         self.line("    if b == 0 { return Err(ErrorCode::ArithOverflow); }")
         self.line("    let n = (a as i128) * 100_000_000;")
@@ -157,6 +183,15 @@ class RustGenerator:
             elif field.name.startswith("agg_sum_"):
                 cname = field.name[8:]
                 self.line(f"    pub agg_sum_{cname}: {_rust_type(field.type)},")
+            elif field.name.startswith("hash_"):
+                rest = field.name[5:]
+                if rest.endswith("_key"):
+                    cname = rest[:-4]
+                    self.line(f"    pub hash_{cname}_key: [u64; {tinfo.layout.unique_hashes[cname]}],")
+                elif rest.endswith("_used"):
+                    cname = rest[:-5]
+                    B = tinfo.layout.unique_hashes[cname]
+                    self.line(f"    pub hash_{cname}_used: [u64; {(B + 63) // 64}],")
         tail = tinfo.layout.size - (tinfo.layout.fields[-1].offset
                                     + tinfo.layout.fields[-1].size) \
             if tinfo.layout.fields else tinfo.layout.size
@@ -190,7 +225,7 @@ class RustGenerator:
                 self.line("    if high == 0 && ((t.occupied_bitmap[slot / 64] >> (slot % 64)) & 1) == 1 && t.generation[slot] == gen {")
                 self.line(f"        (t.col_{cname}[slot], true)")
                 self.line("    } else {")
-                zero = "false" if cinfo.type.is_bool else "0"
+                zero = _zero_rust(cinfo.type)
                 self.line(f"        ({zero}, false)")
                 self.line("    }")
                 self.line("}")
@@ -201,6 +236,52 @@ class RustGenerator:
                 if cinfo.tracked_sum:
                     self.line(f"    t.agg_sum_{cname} = t.agg_sum_{cname} - old + value;")
                 self.line("}")
+            for cinfo in tinfo.columns.values():
+                if not cinfo.unique:
+                    continue
+                cname = cinfo.name
+                B = tinfo.layout.unique_hashes[cname]
+                rt = _rust_type(cinfo.type)
+                self.line(f"fn hash_exists_{tname}_{cname}(t: &Table_{tname}, value: &{rt}) -> bool {{")
+                self.line(f"    let buckets = {B}u64;")
+                self.line(f"    let mut pos = (hash_int_{tname}_{cname}(value) & (buckets - 1)) as usize;")
+                self.line(f"    for _ in 0..{MAX_PROBES} {{")
+                self.line(f"        let used = (t.hash_{cname}_used[pos / 64] >> (pos % 64)) & 1;")
+                self.line(f"        if used == 0 {{ return false; }}")
+                self.line(f"        let slot = t.hash_{cname}_key[pos] as usize;")
+                self.line(f"        if t.col_{cname}[slot] == *value {{ return true; }}")
+                self.line(f"        pos = (pos + 1) & (buckets - 1) as usize;")
+                self.line(f"    }}")
+                self.line(f"    false")
+                self.line(f"}}")
+                self.line(f"fn hash_lookup_{tname}_{cname}(t: &Table_{tname}, value: &{rt}) -> Option<usize> {{")
+                self.line(f"    let buckets = {B}u64;")
+                self.line(f"    let mut pos = (hash_int_{tname}_{cname}(value) & (buckets - 1)) as usize;")
+                self.line(f"    for _ in 0..{MAX_PROBES} {{")
+                self.line(f"        let used = (t.hash_{cname}_used[pos / 64] >> (pos % 64)) & 1;")
+                self.line(f"        if used == 0 {{ return None; }}")
+                self.line(f"        let slot = t.hash_{cname}_key[pos] as usize;")
+                self.line(f"        if t.col_{cname}[slot] == *value {{ return Some(slot); }}")
+                self.line(f"        pos = (pos + 1) & (buckets - 1) as usize;")
+                self.line(f"    }}")
+                self.line(f"    None")
+                self.line(f"}}")
+                self.line(f"fn hash_insert_{tname}_{cname}(t: &mut Table_{tname}, value: &{rt}, slot: usize) -> Result<(), ErrorCode> {{")
+                self.line(f"    let buckets = {B}u64;")
+                self.line(f"    let mut pos = (hash_int_{tname}_{cname}(value) & (buckets - 1)) as usize;")
+                self.line(f"    for _ in 0..{MAX_PROBES} {{")
+                self.line(f"        let used = (t.hash_{cname}_used[pos / 64] >> (pos % 64)) & 1;")
+                self.line(f"        if used == 0 {{")
+                self.line(f"            t.hash_{cname}_used[pos / 64] |= 1u64 << (pos % 64);")
+                self.line(f"            t.hash_{cname}_key[pos] = slot as u64;")
+                self.line(f"            return Ok(());")
+                self.line(f"        }}")
+                self.line(f"        let ex = t.hash_{cname}_key[pos] as usize;")
+                self.line(f"        if t.col_{cname}[ex] == *value {{ return Err(ErrorCode::DuplicateKey); }}")
+                self.line(f"        pos = (pos + 1) & (buckets - 1) as usize;")
+                self.line(f"    }}")
+                self.line(f"    Err(ErrorCode::IndexSaturated)")
+                self.line(f"}}")
             # allocator
             params = ", ".join(f"{c.name}: {_rust_type(c.type)}"
                                for c in tinfo.columns.values())
@@ -250,12 +331,21 @@ class RustGenerator:
                 elif field.name.startswith("col_"):
                     cname = field.name[4:]
                     cinfo = tinfo.columns[cname]
-                    init = "false" if cinfo.type.is_bool else "0"
+                    init = _zero_rust(cinfo.type)
                     self.line(f"                col_{cname}: [{init}; "
                               f"{tinfo.layout.capacity}],")
                 elif field.name.startswith("agg_sum_"):
-                    self.line(f"                               agg_sum_{field.name[8:]}: 0,"
-                              .replace("                ", "                "))
+                    self.line(f"                agg_sum_{field.name[8:]}: 0,")
+                elif field.name.startswith("hash_"):
+                    rest = field.name[5:]
+                    if rest.endswith("_key"):
+                        cname = rest[:-4]
+                        B = tinfo.layout.unique_hashes[cname]
+                        self.line(f"                hash_{cname}_key: [0u64; {B}],")
+                    elif rest.endswith("_used"):
+                        cname = rest[:-5]
+                        B = tinfo.layout.unique_hashes[cname]
+                        self.line(f"                hash_{cname}_used: [0u64; {(B + 63) // 64}],")
             tail = tinfo.layout.size - (tinfo.layout.fields[-1].offset
                                         + tinfo.layout.fields[-1].size)                 if tinfo.layout.fields else tinfo.layout.size
             if tail > 0:
@@ -320,6 +410,14 @@ class RustGenerator:
             name = _const_name(stmt.name)
             self.line(f"    let {name}: u64 = table_alloc_{stmt.table}(&mut state.{stmt.table.lower()}, "
                       + ", ".join(args) + ")?;")
+            for cname, cinfo in self.prog.tables[stmt.table].columns.items():
+                if cinfo.unique:
+                    fexpr = dict(stmt.fields).get(cname)
+                    if fexpr is not None:
+                        v = self._expr(fexpr, env, "post")
+                        up = stmt.table.upper()
+                        self.line(f"    hash_insert_{stmt.table}_{cname}(&mut state.{stmt.table.lower()}, "
+                                  f"&({v}), (({name}) & ((1u64 << KEY_BITS_{up}) - 1)) as usize)?;")
             env[stmt.name] = name
             self.type_env[stmt.name] = ScalarType("id64", 64, 8, key_table=stmt.table)
         elif isinstance(stmt, A.Emit):
@@ -364,6 +462,16 @@ class RustGenerator:
             if expr.name in self._enum_tags():
                 return str(self._enum_tags()[expr.name])
             return _const_name(expr.name)
+        if isinstance(expr, A.TableExistsUnique):
+            key = self._expr(expr.key, env, state)
+            return f"hash_exists_{expr.table}_{expr.key_column}(&state.{expr.table.lower()}, &({key}))"
+        if isinstance(expr, A.TableLookup):
+            tinfo = self.prog.tables[expr.table]
+            key = self._expr(expr.key, env, state)
+            kb = tinfo.layout.key_bits
+            return (f"match hash_lookup_{expr.table}_{expr.key_column}(&state.{expr.table.lower()}, "
+                    f"&({key})) {{ Some(slot) => {{ let gen = state.{expr.table.lower()}.generation[slot]; "
+                    f"((gen as u64) << {kb}) | (slot as u64) }}, None => return Err(ErrorCode::MissingRow) }}")
         if isinstance(expr, A.TableGet):
             return (f"match table_get_{expr.table}_{expr.column}(&state.{expr.table.lower()}, "
                     f"{self._expr(expr.key, env, state)}) "

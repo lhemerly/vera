@@ -320,3 +320,85 @@ def test_cli_check_and_verify():
                             cwd=ROOT, capture_output=True, text=True, env=env)
     assert verify.returncode == 0, verify.stderr
     assert verify.stdout.count("VERDICT: VERIFIED") == 3
+
+
+# ---------------------------------------------------------------------------
+# Secondary unique-key indexes
+# ---------------------------------------------------------------------------
+
+UNIQUE_SRC = """
+module Unique;
+table Account capacity 8 {
+  key id : id64<Account>;
+  col balance : dec64 [tracked_sum];
+  col acct_no : bytes32 [unique];
+}
+invariant non_negative { forall k in Account : ge(Account[k].balance, 0); }
+invariant bounded { forall k in Account : le(Account[k].balance, 1000000000); }
+transition create(balance : dec64, acct_no : bytes32)
+  reads [] writes [Account[*].balance, Account[*].acct_no]
+  require non_negative : ge(balance, 0);
+  require bounded : le(balance, 1000000000);
+  body {
+    let %id : id64<Account> = table_alloc(Account, { balance : balance, acct_no : acct_no });
+    commit;
+  }
+transition lookup(acct_no : bytes32)
+  reads [Account[*].acct_no, Account[*].balance]
+  writes []
+  body {
+    guard(table_exists_unique(Account, acct_no, acct_no), ERR_MISSING_ROW);
+    let %id : id64<Account> = table_lookup(Account, acct_no, acct_no);
+    let %bal : dec64 = table_get(Account, %id, balance);
+    guard(ge(%bal, 0), ERR_INSUFFICIENT);
+    commit;
+  }
+"""
+
+
+def test_unique_key_semantics():
+    prog = analyze(parse_source(UNIQUE_SRC))
+    assert not prog.diags.has_errors()
+    layout = prog.tables["Account"].layout
+    assert "acct_no" in layout.unique_hashes
+    assert layout.unique_hashes["acct_no"] >= 2 * layout.capacity
+
+
+def test_unique_key_runtime():
+    prog = analyze(parse_source(UNIQUE_SRC))
+    machine = Machine(prog)
+    machine.call("create", {"balance": 100_000000, "acct_no": b"\x01" * 32})
+    machine.call("create", {"balance": 200_000000, "acct_no": b"\x02" * 32})
+    t = machine.state.tables["Account"]
+    assert any(t.hash_used["acct_no"])
+    # lookup succeeds
+    machine.call("lookup", {"acct_no": b"\x01" * 32})
+    # missing key reverts
+    with pytest.raises(Revert) as exc:
+        machine.call("lookup", {"acct_no": b"\x09" * 32})
+    assert exc.value.code == "ERR_MISSING_ROW"
+    # duplicate unique key reverts
+    with pytest.raises(Revert) as exc:
+        machine.call("create", {"balance": 300_000000, "acct_no": b"\x01" * 32})
+    assert exc.value.code == "ERR_DUPLICATE_KEY"
+
+
+def test_unique_key_verifies():
+    prog = analyze(parse_source(UNIQUE_SRC))
+    for name in ("create", "lookup"):
+        result = verify_transition_dual(prog, name, SmtConfig(timeout_ms=10000))
+        assert result.ok, result.summary()
+
+
+def test_unique_key_rust_codegen_compiles(tmp_path):
+    rustc = shutil_which("rustc")
+    if rustc is None:
+        pytest.skip("rustc not available")
+    from vera.codegen_rust import generate_rust
+    prog = analyze(parse_source(UNIQUE_SRC))
+    out = tmp_path / "unique.rs"
+    out.write_text(generate_rust(prog))
+    binary = tmp_path / "unique"
+    proc = subprocess.run([rustc, "--edition", "2021", "-O", str(out), "-o", str(binary)],
+                          capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr

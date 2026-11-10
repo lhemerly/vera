@@ -29,6 +29,7 @@ class ColumnDecl:
     name: str
     type: TypeRef
     tracked_sum: bool = False
+    unique: bool = False
     line: int = 0
     col: int = 0
 
@@ -180,6 +181,29 @@ class TableGet:
 @dataclass
 class TableExists:
     table: str
+    key: "Expr"
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class TableExistsUnique:
+    """Existence probe for a declared unique secondary key."""
+    table: str
+    key_column: str
+    key: "Expr"
+    line: int = 0
+    col: int = 0
+
+
+@dataclass
+class TableLookup:
+    """Look up a row by a declared unique secondary key.
+
+    Returns ``id64<T>`` and reverts with ``ERR_MISSING_ROW`` when absent.
+    """
+    table: str
+    key_column: str
     key: "Expr"
     line: int = 0
     col: int = 0

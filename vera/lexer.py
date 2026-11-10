@@ -13,6 +13,7 @@ KEYWORDS = {
     "body", "commit",
     # synthesis IR statements / rvalues
     "let", "guard", "table_set", "table_alloc", "table_get", "table_exists",
+    "table_lookup", "table_exists_unique", "unique",
     "select", "fold_bounded", "yield", "emit", "key_of",
     # scalar types
     "bool", "u8", "u16", "u32", "u64", "i64", "dec64", "dec128", "sym32",

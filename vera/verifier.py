@@ -92,6 +92,25 @@ class ModelProjector:
             out[tname] = rows
         return out
 
+    def pre_hashes(self) -> Dict[Tuple[str, str], List[Tuple[bool, int]]]:
+        out = {}
+        for (tname, cname), hkey_name in self.encoder.pre_hkey.items():
+            hused_name = self.encoder.pre_hused[(tname, cname)]
+            B = self.prog.tables[tname].layout.unique_hashes[cname]
+            bb = max(1, B.bit_length() - 1)
+            hkey = z3.Array(hkey_name, z3.BitVecSort(bb),
+                            z3.BitVecSort(self.encoder.table_slot_bits[tname]))
+            hused = z3.Array(hused_name, z3.BitVecSort(bb), z3.BoolSort())
+            buckets = []
+            for i in range(B):
+                used = z3.is_true(self.model.eval(hused[z3.BitVecVal(i, bb)],
+                                                  model_completion=True))
+                key = self.model.eval(hkey[z3.BitVecVal(i, bb)],
+                                      model_completion=True).as_long()
+                buckets.append((used, key))
+            out[(tname, cname)] = buckets
+        return out
+
     def pre_aggregates(self) -> Dict[str, Dict[str, int]]:
         out: Dict[str, Dict[str, int]] = {}
         for (tname, cname), wide_w in self.encoder.agg_wide.items():
@@ -160,7 +179,9 @@ class ModelProjector:
 
 
 def _materialize_state(prog: Program, pre: Dict[str, List[Dict[str, object]]],
-                       pre_agg: Optional[Dict[str, Dict[str, int]]] = None) -> State:
+                       pre_agg: Optional[Dict[str, Dict[str, int]]] = None,
+                       pre_hashes: Optional[Dict[Tuple[str, str], List[Tuple[bool, int]]]] = None
+                       ) -> State:
     state = State()
     for tname, tinfo in prog.tables.items():
         cap = tinfo.layout.capacity
@@ -183,6 +204,15 @@ def _materialize_state(prog: Program, pre: Dict[str, List[Dict[str, object]]],
                 t.agg[cname] = pre_agg[tname][cname]
             else:
                 t.agg[cname] = sum(t.columns[cname][i] for i in range(cap) if t.occ[i])
+        for cname in tinfo.layout.unique_hashes:
+            B = tinfo.layout.unique_hashes[cname]
+            buckets = (pre_hashes or {}).get((tname, cname))
+            if buckets is None:
+                t.hash_keys[cname] = [0] * B
+                t.hash_used[cname] = bytearray(B)
+            else:
+                t.hash_keys[cname] = [k for _, k in buckets]
+                t.hash_used[cname] = bytearray(1 if u else 0 for u, _ in buckets)
         state.tables[tname] = t
     return state
 
@@ -224,7 +254,8 @@ def lift_counterexample(prog: Program, encoder: SmtEncoder,
 
     machine = Machine(prog)
     pre_agg = projector.pre_aggregates()
-    machine.state = _materialize_state(prog, pre, pre_agg)
+    pre_hashes = projector.pre_hashes()
+    machine.state = _materialize_state(prog, pre, pre_agg, pre_hashes)
     pre_agg = {tname: dict(t.agg) for tname, t in machine.state.tables.items()}
     try:
         _, trace = machine.execute(encoder.tr_name, params, record_trace=True)
