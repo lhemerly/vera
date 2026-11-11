@@ -204,6 +204,9 @@ def cmd_codegen(args) -> int:
     elif args.target == "wgsl":
         from .codegen_gpu import generate_wgsl
         text = generate_wgsl(prog)
+    elif args.target == "glsl":
+        from .codegen_glsl import generate_glsl
+        text = generate_glsl(prog)
     else:
         print(f"error: unknown target {args.target!r}")
         return 1
@@ -284,7 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_run)
 
     p = sub.add_parser("codegen", help="emit a compilation target")
-    p.add_argument("target", choices=["rust", "cuda", "wgsl"])
+    p.add_argument("target", choices=["rust", "cuda", "wgsl", "glsl"])
     p.add_argument("file")
     p.add_argument("--out")
     p.set_defaults(func=cmd_codegen)
