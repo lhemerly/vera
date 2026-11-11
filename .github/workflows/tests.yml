@@ -30,6 +30,13 @@ jobs:
 
       - name: Install native test tools
         run: |
+          export http_proxy="${http_proxy:-${HTTP_PROXY:-${https_proxy:-${HTTPS_PROXY:-}}}}"
+          export https_proxy="${https_proxy:-${HTTPS_PROXY:-$http_proxy}}"
+          if test -n "$http_proxy$https_proxy"; then
+            echo 'Using the configured package-download proxy.'
+          else
+            echo 'No package-download proxy is configured.'
+          fi
           . /etc/os-release
           vera_ubuntu_sources="$RUNNER_TEMP/vera-ubuntu.sources"
           printf '%s\n' \
@@ -53,8 +60,8 @@ jobs:
             -o Acquire::https::Timeout=30
             -o DPkg::Lock::Timeout=60
           )
-          sudo apt-get "${vera_apt_options[@]}" -o APT::Update::Error-Mode=any update
-          sudo apt-get "${vera_apt_options[@]}" install -y --no-install-recommends build-essential curl unzip glslang-tools libegl-dev libgl-dev libgl1-mesa-dri
+          sudo --preserve-env=http_proxy,https_proxy,NO_PROXY,no_proxy apt-get "${vera_apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo --preserve-env=http_proxy,https_proxy,NO_PROXY,no_proxy apt-get "${vera_apt_options[@]}" install -y --no-install-recommends build-essential curl unzip glslang-tools libegl-dev libgl-dev libgl1-mesa-dri
 
       - name: Install static solver
         run: |
