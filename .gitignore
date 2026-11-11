@@ -4,3 +4,6 @@ __pycache__/
 .pytest_cache/
 *.rs
 *.smt2
+
+# Rust runtime crate artifacts
+rust/vera-rt/target/
