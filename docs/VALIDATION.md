@@ -2,13 +2,13 @@
 
 Reviewed baseline: `84badd1ed1372484f995586c71529320305b82d1`.
 
-The validation groups cover **173 Python/backend test cases** and **5
-Rust unit tests**. The PR follow-up used Python 3.12.14, Z3 5.4.1, Rust 1.89.0,
+The validation groups cover **175 Python/backend test cases**, **29 native
+compiler tests**, and **5 Rust runtime tests**. The PR follow-up used Python 3.12.14, Z3 5.4.1, Rust 1.89.0,
 glslangValidator, GCC/C++, and wgpu with Mesa llvmpipe. CI runs Python 3.11–3.14.
 
 | Check | Result |
 |---|---|
-| `python -m pytest tests -q -ra` | 173 passed, including actual GLSL/WGSL execution and CUDA C++ host-mode checks |
+| `python -m pytest tests -q -ra` | 175 passed, including actual GLSL/WGSL execution and CUDA C++ host-mode checks |
 | `cargo test --manifest-path rust/vera-rt/Cargo.toml --locked` | 4 library tests + 1 dispatcher stress test passed |
 | Ruff formatting and fatal-error checks; `git diff --check` | Passed |
 | `python -m build --no-isolation` | Wheel and source distribution built |
@@ -20,6 +20,28 @@ CUDA's shared arithmetic and transaction implementation compiled and executed in
 portable C++ host mode. Native NVIDIA CUDA compilation/device execution was not
 available. The kernel denied io_uring setup, so persistence ran end to end using
 the positional-write fallback; the io_uring path was compiled and reviewed.
+
+## Native Rust migration validation
+
+The first native increment is syntax-only and is described in
+`docs/RUST_MIGRATION.md`. Its executable has no Python subprocess bridge.
+
+| Check | Result |
+|---|---|
+| `cargo test --workspace --locked` | 7 literal/lexer tests, 14 parser tests, 8 CLI tests, and 5 existing runtime tests passed |
+| `cargo fmt -p vera-compiler -- --check` | Passed |
+| `cargo clippy -p vera-compiler --all-targets --locked -- -D warnings` | Passed |
+| `python tools/check_rust_frontend.py --binary target/release/vera` | 148 unique sources: 144 accepted, 4 syntax rejections, zero AST/verdict mismatches; native `PATH` empty |
+| Standalone native executable | Parsed examples and emitted exact canonical AST JSON with an empty `PATH`, including Unix non-UTF-8 filenames |
+| Native crate packaging | `cargo package -p vera-compiler --locked --allow-dirty` built and verified the package independently |
+| Python distribution | Wheel/source distribution built, including the root workspace and native crate sources in the source distribution |
+
+The differential corpus exposed Python's context-rounding unary minus for long
+decimal literals. Two runtime regressions reproduced the loss of the least
+significant dec128 digit in a body and a precondition. Decimal negation now uses
+`copy_negate()` in both parser contexts; native syntax preserves sign and all
+digits. The native CLI also handles non-UTF-8 OS paths through `args_os()` instead
+of panicking in argument decoding.
 
 ## PR follow-up regressions
 

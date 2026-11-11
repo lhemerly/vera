@@ -54,6 +54,24 @@ def test_exact_dec128_literal_and_decimal_multiply():
     assert m.state.tables["T"].columns["v"][0] == 2000000000000000002
 
 
+@pytest.mark.parametrize("location", ["body", "require"])
+def test_negative_dec128_literals_are_not_rounded_by_host_decimal_context(location):
+    exact = -10000000000000000000000000001
+    source_literal = "-10000000000.000000000000000001"
+    requires = (
+        f"require exact:eq(value,{source_literal});" if location == "require" else ""
+    )
+    value = source_literal if location == "body" else "value"
+    p = program(f"""module Exact;
+    table T capacity 2 {{key id:id64<T>;col v:dec128;}}
+    transition create(value:dec128) reads [] writes [T[*].v]
+    {requires}
+    body {{let %k:id64<T> =table_alloc(T,{{v:{value}}});commit;}}""")
+    machine = Machine(p)
+    machine.call("create", {"value": exact})
+    assert machine.state.tables["T"].columns["v"][0] == exact
+
+
 def test_u8_context_checks_literal_only_arithmetic():
     p = program("""module M;table T capacity 2 {key id:id64<T>;col v:u8;}
     transition make() reads [] writes [T[*].v]

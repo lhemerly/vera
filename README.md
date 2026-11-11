@@ -18,6 +18,21 @@ part of the trusted implementation; cross-backend conformance tests are included
 
 Requires Python 3.11+, Z3, and Rust 1.89+ for generated Rust/persistence tools.
 
+The compiler is being migrated to Rust. A Python-free native frontend is now
+available for the complete v1.1 syntax:
+
+```bash
+cargo run --bin vera -- parse examples/bank.vera
+cargo run --bin vera -- parse examples/counter.vera --json
+cargo test --workspace --locked
+cargo build -p vera-compiler --release --locked
+```
+
+The native command currently parses syntax; semantic checking, verification,
+execution and code generation still use the established Python toolchain below.
+It explicitly rejects those native commands until their ports are complete.
+See the [Rust migration design and milestones](docs/RUST_MIGRATION.md).
+
 ```bash
 git clone https://github.com/lhemerly/vera.git
 cd vera
@@ -180,6 +195,8 @@ backend failures are not hidden by `continue-on-error`.
 ## Layout
 
 ```text
+Cargo.toml            native compiler/runtime workspace
+rust/vera-compiler/   native syntax frontend, diagnostics and vera CLI
 vera/                 parser, type checker, verifier, reference engine, backends
 vera/templates/       canonical embedded Rust persistence source
 rust/vera-rt/         optional Linux io_uring runtime and replay demo
