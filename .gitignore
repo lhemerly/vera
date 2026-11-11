@@ -2,7 +2,8 @@
 __pycache__/
 *.pyc
 .pytest_cache/
-*.rs
+# generated Rust output is written to caller-chosen paths; the
+# runtime crate sources under rust/ are tracked.
 *.smt2
 
 # Rust runtime crate artifacts
