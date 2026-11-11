@@ -1,9 +1,9 @@
 # VERA language reference
 
-VERA programs describe finite transactional state machines. The implementation
-has a Python reference interpreter, an SMT verifier, a Rust engine, and compute
-furnaces for GLSL, WGSL and CUDA. Projection frames are boundary data rather than
-HTML or hidden I/O.
+VERA programs describe finite transactional state machines. The compiler checks
+and verifies those programs, executes their transitions, and generates Rust
+engines or GLSL/WGSL/CUDA compute furnaces. Host applications supply initial
+state, submit typed intents, and consume committed effects.
 
 ## Modules, tables, and values
 
@@ -41,7 +41,8 @@ and full tables revert without changing state. There is no deletion syntax.
 
 Integer literals are raw integer/scaled values. Fractional literals are exact
 human decimals: `1.0` means 100000000 in dec64 and 1000000000000000000 in dec128.
-Excess fractional precision is rejected rather than rounded. Strings denote
+Values must be exactly representable at the type's scale; extra trailing zeros
+are allowed and other excess fractional digits are rejected. Strings denote
 `sym32` literals (SHA-256's first four bytes, interpreted little endian), with
 compile-time collision detection. Enum tags can be bare identifiers. An integer
 literal in a bytes32 context is encoded as 32 little-endian bytes; the CLI accepts
@@ -53,8 +54,9 @@ as a handle; it does not allocate or validate a row.
 
 ## Expressions and evaluation
 
-Canonical operators use prefix notation. The specification parser also accepts
-ordinary infix arithmetic, comparison and boolean operators.
+Canonical operators use prefix notation. Specifications such as invariants,
+preconditions, and postconditions also accept ordinary infix arithmetic,
+comparison and boolean operators. Transition bodies use prefix operators.
 
 | Operators | Meaning |
 |---|---|
@@ -82,6 +84,10 @@ Tracked accumulators cover capacity times the column's entire range. Columns up
 to 64 bits use a 128-bit accumulator; dec128 columns use 256 bits. Arithmetic
 containing an aggregate is checked in that accumulator width, retaining decimal
 scaling. Ordinary per-row values remain in their declared scalar width.
+Declare a column with `[tracked_sum]` to use `sum` and `old_sum`; successful
+allocations and writes maintain its sum automatically. `old` evaluates its whole
+argument against the transaction-start state, including expressions that compute
+a row key.
 
 `[unique]` columns are immutable after allocation. Secondary indexes use bounded
 Robin Hood probing with at most 16 probes. Duplicate values and index saturation
@@ -169,8 +175,9 @@ The verifier discharges three obligations for each transition:
 The third obligation is existential non-vacuity, not a temporal progress/fairness
 claim. Handled reverts such as false guards or exhausted allocation remain
 allowed. Any frontend/lowering error, timeout, or solver `unknown` fails closed.
-SMT encodings are part of the trusted compiler; the runtime conformance tests
-check that execution agrees with their intended semantics.
+The guarantee is relative to the declared invariants and the compiler/solver
+implementation. Callers choose the invariants that express their application
+rules.
 
 ## Projections
 
@@ -202,12 +209,59 @@ use the same format.
 
 Snapshots serialize fields and effects explicitly, include a schema identity
 and content checksum, validate invariants and derived data, and are atomically
-replaced after sync. Old raw-memory snapshots and legacy WAL
-records are incompatible with the new formats.
+replaced after sync. Restore rejects incompatible formats, identities and
+invalid state.
 
-`check` analyzes source; `verify` proves it; `run` executes an intent; `project`
-returns a projection frame; `fuzz` explores reference trajectories; `codegen`
-emits Rust/GLSL/WGSL/CUDA. `run` and `codegen` require verification by default.
-`--unverified` is an explicit development/fuzzing opt-out. The Python runtime and
-backend APIs also support unverified programs for counterexample replay and
-conformance testing.
+The CLI provides these commands:
+
+| Command | Purpose |
+|---|---|
+| `parse` | Parse source syntax; `--json` emits its syntax tree |
+| `check` | Check types, declarations, footprints and bounds |
+| `verify` | Run all three proof obligations, or select `--transition NAME` |
+| `run` | Execute a transition with `--transition NAME` and typed `--param NAME=VALUE` arguments |
+| `project` | Evaluate an authorized `--projection NAME` |
+| `replay` | Recover a `--wal PATH` from its original initial-state baseline |
+| `fuzz` | Search bounded execution trajectories for violations |
+| `codegen` | Emit a Rust engine or GLSL/WGSL/CUDA compute furnace |
+
+`run`, `replay`, and `codegen` require verification by default. `--unverified` is
+an explicit development opt-out. `--json` supplies machine-readable output for
+commands that return data.
+
+### Initial state and CLI values
+
+`--setup FILE` supplies occupied rows in JSON. For example:
+
+```json
+{"tables":{"Counter":[{"id":4,"value":7}]}}
+```
+
+Here `id` is the row handle, including its generation. A row can also use
+`{"id":4,"columns":{"value":7}}`. The nested form keeps a column named `id`
+separate from the row handle; the CLI uses it when such a column exists.
+Unspecified columns receive their type's zero value. Unknown fields, invalid
+handles or scalar values, duplicate slots, invalid indexes, sums, or invariants
+are rejected.
+
+CLI integer parameters accept decimal and `0x`/`0o`/`0b` forms. Decimal parameters
+containing a fractional point are scaled exactly; an integer parameter is the raw
+scaled value. Boolean parameters accept `true`/`false` or `1`/`0`. Enum parameters
+accept a tag or its numeric index. Symbol parameter text is hashed, including text
+consisting of digits; typed JSON values can supply a numeric symbol ID.
+A bytes32 parameter contains exactly 64 hexadecimal digits, optionally preceded
+by `0x`.
+
+### CLI recovery
+
+`run --wal PATH` replays existing intents from the original setup baseline, then
+appends and syncs the new attempt before publishing a successful state change.
+Use the same initial setup on subsequent invocations. `replay --wal PATH` recovers
+without submitting another intent. Failed transition attempts remain part of the
+ordered intent log.
+
+`--snapshot-in FILE` restores a snapshot and `--snapshot-out FILE` writes the
+resulting state. Snapshots do not contain a WAL checkpoint cursor, so snapshot
+input cannot be combined with a WAL. Rotate logs explicitly when checkpointing;
+replaying an already-checkpointed log would repeat its intents. Snapshot output
+must not alias the WAL file.

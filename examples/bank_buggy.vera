@@ -1,7 +1,7 @@
 // VERA v1.0 example: a minimal, verified banking core.
 //
-// Run:  python -m vera check examples/bank.vera
-//       python -m vera verify examples/bank.vera
+// Run:  vera check examples/bank_buggy.vera
+//       vera verify examples/bank_buggy.vera
 
 module Bank;
 

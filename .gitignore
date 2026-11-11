@@ -1,11 +1,5 @@
-.venv/
-__pycache__/
-*.pyc
-.pytest_cache/
-.ruff_cache/
-*.egg-info/
-build/
 dist/
+.deps/
 # generated Rust output is written to caller-chosen paths; the
 # runtime crate sources under rust/ are tracked.
 *.smt2
@@ -14,7 +8,7 @@ dist/
 rust/vera-rt/target/
 /target/
 
-# Runtime artifacts produced by running the reference engine
+# Runtime state and intent logs
 vera.snap
 vera.wal
 *.snap

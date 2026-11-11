@@ -1,114 +1,22 @@
-//! Compile and execute GLSL using the same EGL host shipped with VERA.
-use std::{
-    fs,
-    path::PathBuf,
-    process::Command,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        OnceLock,
-    },
-};
+//! Compile and execute generated GLSL through a real EGL compute context.
+#[path = "support/gpu_host.rs"]
+mod gpu_host;
 use vera_compiler::{codegen_gpu::generate_glsl, parse_source, semantic::analyze};
-static SEQUENCE: AtomicU64 = AtomicU64::new(0);
-fn required() -> bool {
-    std::env::var("VERA_REQUIRE_GPU_TESTS").is_ok_and(|v| v == "1")
-}
-fn unavailable(reason: &str) {
-    assert!(!required(), "required GLSL execution unavailable: {reason}");
-    eprintln!("GLSL execution skipped: {reason}");
-}
-fn host() -> Option<&'static PathBuf> {
-    static HOST: OnceLock<Option<PathBuf>> = OnceLock::new();
-    HOST.get_or_init(|| {
-        if let Some(path) = std::env::var_os("VERA_GLSL_HOST") {
-            return Some(PathBuf::from(path));
-        }
-        let folder = std::env::temp_dir().join(format!("vera-glsl-host-{}", std::process::id()));
-        fs::create_dir_all(&folder).unwrap();
-        let executable = folder.join("furnace_host");
-        let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tools/furnace_host.c");
-        let result = match Command::new("cc")
-            .arg(source)
-            .arg("-o")
-            .arg(&executable)
-            .args(["-lEGL", "-lGL"])
-            .output()
-        {
-            Ok(result) => result,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                unavailable("C compiler is not installed");
-                return None;
-            }
-            Err(error) => panic!("failed to start GLSL host compiler: {error}"),
-        };
-        if !result.status.success() {
-            let error = String::from_utf8_lossy(&result.stderr);
-            if error.contains("No such file or directory") || error.contains("cannot find -l") {
-                unavailable(&format!(
-                    "EGL/OpenGL development dependencies are missing: {error}"
-                ));
-                return None;
-            }
-            panic!("EGL host compilation failed: {error}");
-        }
-        Some(executable)
-    })
-    .as_ref()
-}
+
 fn run(source: &str, probe: &str, expected: &str) {
-    let Some(host) = host() else { return };
     let program = analyze(parse_source(source).unwrap()).unwrap();
     let mut code = generate_glsl(&program, 2).unwrap();
     if !probe.is_empty() {
         code = code.replacen("void main(){", "void vera_furnace_main(){", 1);
         code.push_str(probe);
     }
-    let path = std::env::temp_dir().join(format!(
-        "vera-glsl-{}-{}.comp",
-        std::process::id(),
-        SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::write(&path, &code).unwrap();
-    if let Ok(version) = Command::new("glslangValidator").arg("--version").output() {
-        assert!(version.status.success(), "glslangValidator is not runnable");
-        let compiled = Command::new("glslangValidator")
-            .arg(&path)
-            .output()
-            .unwrap();
-        assert!(
-            compiled.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&compiled.stdout),
-            String::from_utf8_lossy(&compiled.stderr)
+    if let Some(result) = gpu_host::dispatch(&code) {
+        let actual = format!(
+            "violations={} committed={} reverted={} effects={}",
+            result[0], result[1], result[2], result[3]
         );
-    } else if required() {
-        panic!("VERA_REQUIRE_GPU_TESTS=1 requires glslangValidator");
+        assert_eq!(actual, expected);
     }
-    let result = Command::new(host)
-        .arg(&path)
-        .arg("1")
-        .env("EGL_PLATFORM", "surfaceless")
-        .env("LIBGL_ALWAYS_SOFTWARE", "1")
-        .env("MESA_GL_VERSION_OVERRIDE", "4.6")
-        .env("MESA_GLSL_VERSION_OVERRIDE", "460")
-        .output()
-        .unwrap();
-    let _ = fs::remove_file(path);
-    if result.status.code() == Some(77) {
-        unavailable(&String::from_utf8_lossy(&result.stderr));
-        return;
-    }
-    assert!(
-        result.status.success(),
-        "{}{}",
-        String::from_utf8_lossy(&result.stdout),
-        String::from_utf8_lossy(&result.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(
-        stdout.contains(expected),
-        "expected {expected}, actual output: {stdout}"
-    );
 }
 
 #[test]

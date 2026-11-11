@@ -1,8 +1,8 @@
-//! Compatibility with the canonical Python compiler's stable program identity.
+//! Canonical serialization for stable program identity.
 //!
 //! The development AST JSON deliberately wraps arbitrary-size numbers. Durable
-//! identities instead retain the original AST shape and Python json.dumps'
-//! sorted keys, ASCII escaping, and default whitespace separators.
+//! identities retain the persisted AST shape with canonical key ordering,
+//! ASCII escaping and fixed whitespace separators.
 
 use std::collections::BTreeMap;
 
@@ -165,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_and_named_modules_match_independent_python_hash_vectors() {
+    fn empty_and_named_modules_match_canonical_hash_vectors() {
         assert_eq!(
             hex(program(&parse_source("").unwrap())),
             "290c2a375a345a06e8d55352127af8089d2e9ea778b36d156403465c625d9736"
@@ -177,7 +177,7 @@ mod tests {
     }
 
     #[test]
-    fn exact_decimal_and_unicode_identity_match_python() {
+    fn exact_decimal_and_unicode_identity_is_stable() {
         let source = "module Exact;table T capacity 2 {key id:id64<T>;col v:dec128;col symbol:sym32;} transition make() reads [] writes [T[*].v,T[*].symbol] body {let %k:id64<T>=table_alloc(T,{v:-0.0000000,symbol:\"á🦀\\n\"});commit;}";
         assert_eq!(
             hex(program(&parse_source(source).unwrap())),
@@ -192,7 +192,7 @@ mod tests {
     }
 
     #[test]
-    fn decimal_display_preserves_python_notation_boundaries() {
+    fn decimal_display_preserves_notation_boundaries() {
         for (negative, digits, scale, expected) in [
             (false, "1", 6, "0.000001"),
             (false, "1", 7, "1E-7"),

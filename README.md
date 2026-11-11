@@ -3,215 +3,150 @@
 [![Tests](https://github.com/lhemerly/vera/actions/workflows/tests.yml/badge.svg)](https://github.com/lhemerly/vera/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-VERA is a language for finite transactional state machines: ledgers, order
-books, registries, access control and governance. You declare invariants and
-transitions; the verifier checks that every committed transition preserves
-those invariants, that evaluated operations do not trap, and that a concrete
-committing input exists.
+VERA is a programming language for transactional systems with rules that must
+hold after every committed change. Define finite tables, write transitions, and
+state your invariants. The verifier checks that those transitions preserve the
+rules for every valid input and pre-state within the declared table capacities.
 
-The compiler rejects proof errors, unsupported lowering, solver timeouts and
-unknown results. Its guarantee is relative to the declared invariants and a
-valid initial state. The compiler's encodings and execution backends remain
-part of the trusted implementation; cross-backend conformance tests are included.
+Use it for the stateful core of a ledger, inventory system, registry, order book,
+or access-control service. The host application handles I/O; VERA describes the
+state and the changes it permits.
 
-## Quick start
+## Why VERA?
 
-The production compiler and CLI are native Rust. Building requires Rust 1.89+,
-a C++ standard library, and network access to Cargo and the pinned official Z3
-release archive. Z3 is linked statically; the executable needs neither Python
-nor a solver executable. Linux release builds target x86-64 with glibc 2.39+.
+- **Rules live with the code.** Express balance conservation, ownership,
+  uniqueness, limits, and other properties as invariants and postconditions.
+- **Changes are atomic.** A rejected transaction preserves rows, indexes,
+  aggregates, and emitted effects together.
+- **Arithmetic is checked.** Integers and fixed-point decimals reject overflow
+  and invalid operations. Aggregate sums use wider accumulators.
+- **Execution is bounded.** Tables have declared capacities and iteration uses
+  bounded folds. These limits make the state machine amenable to verification.
+- **Programs become embeddable engines.** Generate standalone Rust that uses
+  only the standard library, with typed intents, snapshots, and durable replay.
 
-```bash
-git clone https://github.com/lhemerly/vera.git
-cd vera
-cargo build --release --locked
-export PATH="$PWD/target/release:$PATH"
+## A small program
 
-vera check examples/bank.vera
-vera verify examples/bank.vera
-vera verify examples/bank_buggy.vera  # rejected: self-transfer aliasing
-vera run examples/bank.vera --transition transfer \
-  --param from=32 --param to=33 --param amount=100000000 \
-  --setup examples/bank_setup.json
-```
-
-`parse` checks syntax, `check` performs semantic analysis, and `verify` runs all
-three proof obligations. `run`, `replay` and `codegen` prove the selected
-transitions before use. Pass `--unverified` explicitly for development with
-intentionally broken programs. `--json` supplies machine-readable results.
-`--help` lists commands and resource controls.
-
-```bash
-vera codegen rust examples/bank.vera --out /tmp/bank.rs
-rustc --edition 2021 -O /tmp/bank.rs -o /tmp/bank
-(cd /tmp && ./bank)
-vera codegen rust examples/counter.vera --no-main --out /tmp/counter.rs
-vera project examples/bank.vera --projection AccountView \
-  --param from=32 --setup examples/bank_setup.json
-vera fuzz examples/bank.vera --steps 64 --threads 256
-```
-
-Generated Rust engines are standalone and use only the standard library.
-Applications can use typed `Params::encode/decode`, atomic transition functions,
-ordered optimistic `run_batch`, snapshots and replay. The native library also
-exposes the general checked interpreter, projections, persistence and batch API.
-Demo seeds are illustrative; applications must supply a valid initial state.
-
-## Language
+This counter can never exceed 1000. An increment must address a live row and
+fit within the remaining room; otherwise the transaction is rejected.
 
 ```vera
+module Counters;
+
 table Counter capacity 4 {
   key id : id64<Counter>;
   col value : u64 [tracked_sum];
 }
+
 invariant bounded {
-  forall k in Counter : le(Counter[k].value, 1000000000);
+  forall k in Counter : le(Counter[k].value, 1000);
 }
-effect Updated(counter : id64<Counter>, before : u64, after : u64);
+
+effect Increased(counter : id64<Counter>, amount : u64);
 
 transition increase(counter : id64<Counter>, delta : u64)
-  reads [Counter[counter].value] writes [Counter[counter].value]
-  require exists : table_exists(Counter, counter);
-  require room : le(delta, sub(1000000000, Counter[counter].value));
+  reads [Counter[counter].value]
+  writes [Counter[counter].value]
+  require live : table_exists(Counter, counter);
   ensure total : eq(sum(Counter.value), add(old_sum(Counter.value), delta));
   body {
     let %before : u64 = table_get(Counter, counter, value);
+    guard(le(delta, sub(1000, %before)), ERR_LIMIT);
     let %after : u64 = add(%before, delta);
     table_set(Counter, counter, value, %after);
-    emit Updated(counter, %before, %after);
+    emit Increased(counter, delta);
     commit;
   }
 ```
 
-The complete example is in [`examples/counter.vera`](examples/counter.vera).
-See the [language reference](docs/LANGUAGE.md) for syntax, types, evaluation
-order, error behavior, footprints, folds, effects, projections and persistence.
+`id64<Counter>` is a typed row handle. `require` states a precondition; `guard`
+rejects a transaction with an application error. `%` bindings hold intermediate
+values. `ensure` describes a postcondition, and `old_sum` refers to the sum at
+transaction start. The effect enters an outbox only when `commit` succeeds.
 
-| Area | Behavior |
+See the complete [counter](examples/counter.vera) and [bank](examples/bank.vera)
+examples, including allocation, transfers, foreign-key rules, and projections.
+The [language reference](docs/LANGUAGE.md) explains the syntax and semantics.
+
+## Get started
+
+Building requires Rust 1.89 or newer, a C++ linker, and Z3 4.13.3 or newer.
+On Linux x86-64 with glibc 2.39 or newer, the following setup installs a pinned
+Z3 library using `curl` and `unzip`:
+
+```bash
+git clone https://github.com/lhemerly/vera.git
+cd vera
+sh tools/setup_z3.sh
+. ./.deps/z3/env.sh
+cargo build --release --locked
+export PATH="$PWD/target/release:$PATH"
+
+vera check examples/counter.vera
+vera verify examples/counter.vera
+vera run examples/counter.vera --transition increase \
+  --param counter=4 --param delta=3 --setup examples/counter_setup.json
+```
+
+The setup contains a live counter with value 7; the transition commits value 10
+and emits an `Updated` effect. `check` checks syntax, types, footprints, and bounds.
+`verify` checks the proof obligations. `run` verifies the selected transition
+before executing it.
+
+On other hosts, install a compatible native Z3 library and build with Cargo.
+
+Generate a Rust library for an application:
+
+```bash
+vera codegen rust examples/counter.vera --no-main --out counter.rs
+rustc --edition 2021 --crate-type lib counter.rs
+```
+
+## Language features
+
+| Feature | What it provides |
 |---|---|
-| Scalars | bool, u8/u16/u32/u64, i64, dec64, dec128, sym32, bytes32, typed id64 handles, inline enums |
-| Arithmetic | Checked integer operations; exact fixed-point multiply/divide; widened 128/256-bit aggregates |
-| Tables | Fixed capacity, generation-checked handles, lowest-slot allocation, immutable unique columns with bounded Robin Hood indexes |
-| Transactions | Sequential requires, SSA bindings, guards, allocation, writes, typed effects, atomic rollback, immutable old/old_sum |
-| Iteration | Inclusive bounded folds, two nesting levels, maximum bound/product 1024, scoped bindings and no index wrap |
-| Specifications | Named global/row invariants, postconditions, safety, panic freedom and concrete non-vacuity |
-| Boundary | Authorized projection slices, stale-handle checks and configured intent affordances |
-| Execution | Native checked interpreter, generated Rust, and shared exact-limb GLSL/WGSL/CUDA compute furnaces |
-| Batches | Safe optimistic snapshots, ordered validation and re-execution for both input-derived and state-dependent footprints |
-| Persistence | Versioned typed intents, program fingerprints, checksummed WAL/snapshots, replay, torn-tail recovery, optional io_uring |
+| Tables | Fixed capacity, typed generation-checked handles, unique secondary keys |
+| Values | Booleans, fixed-width integers, exact fixed-point decimals, symbols, bytes32, enums |
+| Specifications | Row/global invariants, preconditions, postconditions, old-state values |
+| Transactions | Checked reads and writes, allocation, guards, atomic commit, typed effects |
+| Folds | Inclusive bounded iteration with scoped accumulator and index bindings |
+| Projections | Authorized state slices and available intents with parameter hints |
+| Persistence | Typed intent logs, checksummed snapshots, deterministic replay |
 
-`select` is lazy. Boolean `and`, `or` and `xor` evaluate both operands. Decimal
-literals are exact and excess precision is rejected. Every failed transaction
-preserves rows, generations, indexes, aggregates and effects.
+`select` evaluates only its chosen branch. Boolean `and`, `or`, and `xor` evaluate
+both operands. Decimal literals must be exactly representable in their type.
 
-A proof is inductive over valid initial states. Non-vacuity means at least one
-concrete committing state/input exists; it is not a temporal fairness guarantee.
-Projections expose data and hints, while execution still validates the intent.
+## Verification
 
-## Compute furnaces
+For each transition, VERA uses Z3 to check that:
 
-GPU targets share one lowering and exact 32-bit-limb arithmetic, including
-512-bit multiplication/division intermediates. They execute transactions,
-validate invariants/postconditions, preserve atomic rollback and track committed
-effects by count and value digest; GPU furnaces do not deliver external outbox
-messages. They retain declared table capacities and use a deterministic xoshiro
-PRNG. Furnaces are bounded bug searches, not substitutes for the SMT proofs.
+1. Every committed execution preserves the invariants and postconditions.
+2. Reachable evaluated operations cannot trap on arithmetic or missing rows.
+3. At least one valid state and input can commit, so the implementation is not
+   vacuous.
+
+Guards may reject inputs. Proofs assume a well-formed initial state satisfying
+the declared invariants; setup and snapshot loading validate that state.
+A timeout, resource limit, or unknown solver result rejects verification.
+
+## Explore a program
 
 ```bash
-vera codegen glsl examples/bank.vera --out /tmp/bank.comp
-glslangValidator /tmp/bank.comp
-gcc -O2 tools/furnace_host.c -o /tmp/vera-host -lEGL -lGL
-EGL_PLATFORM=surfaceless /tmp/vera-host /tmp/bank.comp 8
+# Read an authorized state view and available intents.
+vera project examples/counter.vera --projection CounterView \
+  --param counter=4 --setup examples/counter_setup.json
 
-vera codegen wgsl examples/bank.vera --out /tmp/bank.wgsl
-vera codegen cuda examples/bank.vera --out /tmp/bank.cu
+# Search bounded native execution traces for invariant violations or traps.
+vera fuzz examples/counter.vera --steps 64 --threads 256
+
+# Emit a compute furnace for GPU-based bug searches.
+vera codegen wgsl examples/counter.vera --out counter.wgsl
 ```
 
-Tests compile GLSL, validate and dispatch WGSL with `wgpu`, and execute the CUDA
-lowering's portable C++ host mode against mathematical results. The host mode
-checks shared kernel semantics without requiring an NVIDIA device; native CUDA
-compilation/execution additionally requires its own toolchain/device.
+GLSL and CUDA furnaces are also available. Fuzzing searches for bugs; it does not
+replace verification. Pass `--json` for machine-readable command output and use
+`vera --help` for command options. `--unverified` explicitly bypasses proof for
+development when running or generating intentionally broken programs.
 
-## Rust runtime and durable replay
-
-The standalone generated engine embeds the canonical WAL implementation. The
-optional `rust/vera-rt` crate uses io_uring on supported Linux kernels, with the
-same positional-write persistence protocol when io_uring is unavailable.
-
-```bash
-vera codegen rust examples/bank.vera --runtime-crate --no-main --out rust/vera-rt/src/spec.rs
-cargo test --manifest-path rust/vera-rt/Cargo.toml
-cargo run --manifest-path rust/vera-rt/Cargo.toml --bin vera-furnace
-```
-
-Typed intent payloads preserve arbitrary argument counts, complete bytes32
-values and full-width dec128 values. A canonical program fingerprint rejects
-replay under different transition semantics. WAL frames contain sequence and
-integrity checks and are aligned to 64 bytes; banking intents use 128-byte
-frames. `append` finishes the write and `sync` acknowledges durability. A torn
-final frame is recovered on reopen; complete corruption or sequence errors are
-rejected. One writer owns a log.
-
-Snapshots serialize fields explicitly, validate the schema/invariants/derived
-indexes and sums, and use checksums and atomic replacement. Legacy raw-memory
-snapshots and fixed-record WAL files are incompatible with these formats.
-
-The optimistic dispatcher uses safe owned snapshots and conservative validation
-of the whole pre-state. Conflicting candidates are re-executed in input order.
-This prioritizes deterministic correctness; it does not claim zero-allocation
-transactions, fine-grained Block-STM performance, or lock-free shared mutation.
-
-## Verification and tests
-
-```bash
-cargo test --workspace --locked
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-```
-
-Native tests cover syntax and semantic admission, exact scalar and aggregate
-arithmetic, atomic rollback, unique indexes, folds, old-state evaluation, effects,
-projections, all emitted targets, proof results and concrete replay, batch order,
-historical persistence bytes, corruption and restart recovery. Native CLI
-workflows run with an empty `PATH`, including proof-gated compilation/execution.
-
-Compute tests need a C++ compiler, EGL/OpenGL development headers, Mesa and
-`glslangValidator`. WGSL tests dispatch through Rust `wgpu`; GLSL tests use the
-included EGL host. Set `VERA_REQUIRE_GPU_TESTS=1` to require those dependencies
-instead of reporting an explicit unavailable-tool skip. CI requires these tests.
-CUDA semantics run in portable C++ host mode; native NVIDIA hardware execution
-and an enabled io_uring kernel require separate target-host validation.
-
-Python remains an optional, independent development oracle. Its console command
-is `vera-reference`; it does not provide the production `vera` command.
-
-```bash
-python -m pip install -e '.[test]'
-python -m pytest tests -q -ra
-python tools/check_rust_frontend.py --binary target/debug/vera
-python tools/check_native_semantics.py --binary target/debug/vera
-python tools/check_native_execution.py --binary target/debug/vera
-```
-
-CI runs the native suite plus the complete reference suite on Python 3.11–3.14.
-See [the native architecture and compatibility notes](docs/RUST_MIGRATION.md).
-Build a local release archive with `sh tools/package_native.sh`; CI uploads the
-same archive and checksum without publishing a tag or GitHub Release.
-
-## Layout
-
-```text
-Cargo.toml            native compiler/runtime workspace
-rust/vera-compiler/   native analyzer, verifier, interpreter, backends and vera CLI
-vera/                 optional Python reference oracle and historical backend tests
-vera/templates/       historical reference templates (wire-compatible native copies)
-rust/vera-rt/         optional Linux io_uring runtime and replay demo
-tools/                crate regeneration and headless GLSL host
-examples/             bank, deliberately broken bank, counter and setup states
-tests/                language, verifier, backend and persistence conformance
-docs/LANGUAGE.md      language semantics and API reference
-docs/IMPLEMENTATION.md implementation decisions and validation sequence
-```
-
-Contributions should include an executable behavioral regression and preserve
-fail-closed verification. VERA is released under the [MIT License](LICENSE).
+VERA is released under the [MIT License](LICENSE).

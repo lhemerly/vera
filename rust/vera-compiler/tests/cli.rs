@@ -1,4 +1,4 @@
-//! Black-box native CLI checks: no Python executable is available to children.
+//! Black-box CLI checks with external commands unavailable to children.
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -11,7 +11,7 @@ fn run(args: &[&str], source: &str) -> Output {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("launch native vera with an empty PATH");
+        .expect("launch vera with an empty PATH");
     if let Err(error) = child.stdin.take().unwrap().write_all(source.as_bytes()) {
         // Argument errors can close stdin before the parent writes its input.
         assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
@@ -28,7 +28,7 @@ fn stderr(output: &Output) -> String {
 }
 
 #[test]
-fn parses_stdin_and_emits_only_canonical_json_without_python() {
+fn parses_stdin_and_emits_only_canonical_json_without_external_commands() {
     let output = run(
         &["parse", "-", "--json"],
         "module Native;table T capacity 2 {key id:id64<T>;col v:u64;}\n\
@@ -99,7 +99,7 @@ fn invalid_syntax_reports_a_location_without_partial_json() {
 }
 
 #[test]
-fn malformed_native_commands_fail_without_python() {
+fn malformed_native_commands_fail_without_external_commands() {
     for args in [
         vec!["unknown", "-"],
         vec!["run", "-"],
@@ -115,7 +115,7 @@ fn malformed_native_commands_fail_without_python() {
 }
 
 #[test]
-fn help_and_version_work_without_python() {
+fn help_and_version_work_without_external_commands() {
     let help = run(&["--help"], "");
     assert!(help.status.success(), "{}", stderr(&help));
     assert!(stdout(&help).contains("parse"));
@@ -142,7 +142,7 @@ fn missing_files_and_unrecognized_options_fail_without_panics() {
 
 #[cfg(unix)]
 #[test]
-fn parses_utf8_source_from_a_non_utf8_path_without_python() {
+fn parses_utf8_source_from_a_non_utf8_path_without_external_commands() {
     use std::ffi::{OsStr, OsString};
     use std::fs::{self, OpenOptions};
     use std::os::unix::ffi::OsStrExt;

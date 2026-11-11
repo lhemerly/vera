@@ -18,11 +18,10 @@ path = "src/main.rs"
 num-bigint = { version = "0.4", features = ["serde"] }
 num-traits = "0.2"
 sha2 = "0.10"
-regex = "1"
-z3 = { version = "0.21", features = ["gh-release"] }
+z3 = "0.21"
 vera-rt = { path = "../vera-rt" }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
 
 [dev-dependencies]
-wgpu = { version = "26", default-features = false, features = ["gles", "wgsl"] }
+naga = { version = "26", default-features = false, features = ["wgsl-in", "glsl-out"] }

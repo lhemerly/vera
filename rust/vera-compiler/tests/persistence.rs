@@ -1,5 +1,4 @@
-//! Durable-format compatibility vectors were emitted by the historical Python
-//! compiler and executed by its standalone Rust engine, before removing Python.
+//! Durable-format compatibility against independently frozen wire vectors.
 //! Tests consume only native Rust and checked-in bytes.
 
 use std::{
@@ -108,7 +107,7 @@ impl Drop for TestDir {
 }
 
 #[test]
-fn shipped_source_identities_match_historical_python() {
+fn shipped_source_identities_match_canonical_wire_vectors() {
     for (source, program_hash, schema_hash) in [
         (
             include_str!("../../../examples/counter.vera"),

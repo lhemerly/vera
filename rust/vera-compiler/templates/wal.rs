@@ -1,5 +1,5 @@
 // Canonical VERA intent WAL. This source is embedded by the Rust generator and
-// mirrored between the native compiler, runtime crate and Python test oracle.
+// shared by the native compiler and runtime crate.
 // Requires Rust 1.89 for advisory File::try_lock().
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};

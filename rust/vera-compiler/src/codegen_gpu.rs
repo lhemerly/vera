@@ -4,11 +4,10 @@
 //! exact without requiring native 64-bit shader integers. Arithmetic templates
 //! are target syntax, not an interpreter or a compiler subprocess bridge.
 
-use std::{collections::BTreeMap, sync::OnceLock};
+use std::collections::BTreeMap;
 
 use num_bigint::BigInt;
 use num_traits::ToPrimitive;
-use regex::{Captures, Regex};
 
 use crate::{
     diagnostic::{Diagnostic, Span},
@@ -45,19 +44,123 @@ impl GpuTarget {
     }
 }
 
-fn declaration_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(
-            r"\b(u32|bool|V|W|R|D|Ctx|State)\s+([A-Za-z_]\w*)(?:\[(\d+)\])?\s*(?:=\s*([^;\n]+))?;",
-        )
-        .expect("fixed GPU declaration pattern")
-    })
+fn word_end(source: &str, start: usize) -> usize {
+    start
+        + source[start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count()
 }
 
-fn word_u32() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"\bu32\b").expect("fixed GPU type pattern"))
+fn unsigned_type(source: &str, name: &str) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut start = 0;
+    while start < source.len() {
+        let end = word_end(source, start);
+        if end == start {
+            let ch = source[start..].chars().next().expect("nonempty suffix");
+            result.push(ch);
+            start += ch.len_utf8();
+        } else {
+            let word = &source[start..end];
+            result.push_str(if word == "u32" { name } else { word });
+            start = end;
+        }
+    }
+    result
+}
+
+/// The shared emitter writes fixed C-style declarations. Translate those small
+/// fragments directly; source-language syntax has already been resolved in IR.
+fn declarations(source: &str, target: GpuTarget) -> String {
+    let mut result = String::with_capacity(source.len());
+    let mut start = 0;
+    while start < source.len() {
+        let end = word_end(source, start);
+        if end == start {
+            let ch = source[start..].chars().next().expect("nonempty suffix");
+            result.push(ch);
+            start += ch.len_utf8();
+            continue;
+        }
+        let ty = &source[start..end];
+        if let Some((name, size, value, next)) = declaration(source, end, ty) {
+            let initializer = value.map(|v| format!(" = {v}")).unwrap_or_default();
+            if target == GpuTarget::Wgsl {
+                let ty = size
+                    .map(|n| format!("array<{ty}, {n}>"))
+                    .unwrap_or_else(|| ty.to_owned());
+                result.push_str(&format!("var {name}: {ty}{initializer};"));
+            } else {
+                let size = size.map(|n| format!("[{n}]")).unwrap_or_default();
+                result.push_str(&format!("{ty} {name}{size}{initializer};"));
+            }
+            start = next;
+        } else {
+            result.push_str(ty);
+            start = end;
+        }
+    }
+    result
+}
+
+type Declaration<'a> = (&'a str, Option<&'a str>, Option<&'a str>, usize);
+
+fn declaration<'a>(source: &'a str, mut next: usize, ty: &str) -> Option<Declaration<'a>> {
+    if !matches!(ty, "u32" | "bool" | "V" | "W" | "R" | "D" | "Ctx" | "State") {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    if !bytes.get(next)?.is_ascii_whitespace() {
+        return None;
+    }
+    while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
+        next += 1;
+    }
+    if !bytes
+        .get(next)
+        .is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_')
+    {
+        return None;
+    }
+    let end = word_end(source, next);
+    let name = &source[next..end];
+    next = end;
+    let mut size = None;
+    if bytes.get(next) == Some(&b'[') {
+        next += 1;
+        let start = next;
+        while bytes.get(next).is_some_and(u8::is_ascii_digit) {
+            next += 1;
+        }
+        if start == next || bytes.get(next) != Some(&b']') {
+            return None;
+        }
+        size = Some(&source[start..next]);
+        next += 1;
+    }
+    while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
+        next += 1;
+    }
+    let mut value = None;
+    if bytes.get(next) == Some(&b'=') {
+        next += 1;
+        while bytes.get(next).is_some_and(u8::is_ascii_whitespace) {
+            next += 1;
+        }
+        let start = next;
+        while bytes.get(next).is_some_and(|b| *b != b';' && *b != b'\n') {
+            next += 1;
+        }
+        if start == next {
+            return None;
+        }
+        value = Some(&source[start..next]);
+    }
+    if bytes.get(next) != Some(&b';') {
+        return None;
+    }
+    Some((name, size, value, next + 1))
 }
 
 struct Output {
@@ -99,26 +202,11 @@ impl Output {
     }
 
     fn syntax(&self, body: &str) -> String {
-        let body = declaration_regex().replace_all(body, |captures: &Captures<'_>| {
-            let ty = &captures[1];
-            let name = &captures[2];
-            let size = captures.get(3).map(|v| v.as_str());
-            let value = captures.get(4).map(|v| v.as_str());
-            let initializer = value.map(|v| format!(" = {v}")).unwrap_or_default();
-            if self.target == GpuTarget::Wgsl {
-                let ty = size
-                    .map(|n| format!("array<{ty}, {n}>"))
-                    .unwrap_or_else(|| ty.to_owned());
-                format!("var {name}: {ty}{initializer};")
-            } else {
-                let size = size.map(|n| format!("[{n}]")).unwrap_or_default();
-                format!("{ty} {name}{size}{initializer};")
-            }
-        });
+        let body = declarations(body, self.target);
         match self.target {
-            GpuTarget::Wgsl => body.into_owned(),
-            GpuTarget::Glsl => word_u32().replace_all(&body, "uint").into_owned(),
-            GpuTarget::Cuda => word_u32().replace_all(&body, "uint32_t").into_owned(),
+            GpuTarget::Wgsl => body,
+            GpuTarget::Glsl => unsigned_type(&body, "uint"),
+            GpuTarget::Cuda => unsigned_type(&body, "uint32_t"),
         }
     }
 
@@ -222,10 +310,8 @@ impl Output {
     fn finish(self) -> String {
         match self.target {
             GpuTarget::Wgsl => self.source,
-            GpuTarget::Glsl => word_u32().replace_all(&self.source, "uint").into_owned(),
-            GpuTarget::Cuda => word_u32()
-                .replace_all(&self.source, "uint32_t")
-                .into_owned(),
+            GpuTarget::Glsl => unsigned_type(&self.source, "uint"),
+            GpuTarget::Cuda => unsigned_type(&self.source, "uint32_t"),
         }
     }
 }
@@ -1035,5 +1121,33 @@ impl<'a> Generator<'a> {
         };
         self.output.line(format!("if(status==3u){{{}{}break;}}if(status==0u){{{}}}else{{{}{}if(status==2u){{{}break;}}}}", count("violations", 0, "1u"), count("reverted", 2, "1u"), count("reverted", 2, "1u"), count("committed", 1, "1u"), count("effects", 3, "local_ctx.s.effect_count-before_effects"), count("violations", 0, "1u")));
         self.output.line("}\n}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{unsigned_type, GpuTarget, Output};
+
+    #[test]
+    fn wgsl_declarations_preserve_loop_bounds_arrays_and_identifiers() {
+        let body =
+            "for(u32 i=0u;i<4u;i=i+1u){V row=v_zero();u32 words[8];bool done;}return value_u32;";
+        assert_eq!(
+            Output::new(GpuTarget::Wgsl).syntax(body),
+            "for(var i: u32 = 0u;i<4u;i=i+1u){var row: V = v_zero();var words: array<u32, 8>;var done: bool;}return value_u32;"
+        );
+    }
+
+    #[test]
+    fn unsigned_type_names_are_replaced_only_as_complete_tokens() {
+        let body = "u32 words[4];value_u32=v_u32(value);u32_count=4u;";
+        assert_eq!(
+            unsigned_type(body, "uint"),
+            "uint words[4];value_u32=v_u32(value);u32_count=4u;"
+        );
+        assert_eq!(
+            Output::new(GpuTarget::Cuda).syntax(body),
+            "uint32_t words[4];value_u32=v_u32(value);u32_count=4u;"
+        );
     }
 }
