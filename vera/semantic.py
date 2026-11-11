@@ -808,7 +808,7 @@ class _TypeChecker:
                             getattr(stmt, "line", 0), getattr(stmt, "col", 0))
 
     def _expr_kind(self, expr: A.Expr) -> str:
-        if isinstance(expr, A.TableGet):
+        if isinstance(expr, (A.TableGet, A.TableLookup, A.TableExistsUnique)):
             return "read"
         if isinstance(expr, A.KeyOf):
             return "key"

@@ -366,7 +366,10 @@ class Transaction:
         cinfo = self.prog.tables[stmt.table].columns[stmt.column]
         if cinfo.tracked_sum:
             new_agg = t.agg[stmt.column] - old + value
-            if not (ctype.min_value <= new_agg <= ctype.max_value):
+            # The widened accumulator's domain is the range of possible sums,
+            # [C*Min_tau, C*Max_tau] -- not the per-row domain (Spec 2.3/4.2).
+            if not (ctype.min_value * t.capacity <= new_agg
+                    <= ctype.max_value * t.capacity):
                 self.log(f"tracked_sum {stmt.table}.{stmt.column} overflow: "
                          f"{t.agg[stmt.column]} - {old} + {value}", "trap",
                          ERR_ARITH_OVERFLOW)
@@ -407,7 +410,8 @@ class Transaction:
             values[cname] = value
             if cinfo.tracked_sum:
                 new_agg = t.agg[cname] + value
-                if not (cinfo.type.min_value <= new_agg <= cinfo.type.max_value):
+                if not (cinfo.type.min_value * t.capacity <= new_agg
+                        <= cinfo.type.max_value * t.capacity):
                     self.log(f"tracked_sum {stmt.table}.{cname} overflow", "trap",
                              ERR_ARITH_OVERFLOW)
                     raise Revert(ERR_ARITH_OVERFLOW)

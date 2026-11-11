@@ -85,7 +85,7 @@ transition transfer(from : id64<Account>, to : id64<Account>, amount : dec64)
 | `vera/lexer.py`, `vera/parser.py` | Full EBNF grammar, prefix-canonical synthesis IR, infix sugar normalized in the human layer |
 | `vera/types.py` | Fixed-width scalars, domains, SoA layout (64-byte-aligned columns), id64 generation |
 | `vera/semantic.py` | Symbol tables, strict coercion-free typing, access-footprint extraction (Tier 1/2), WCET bounds, fold depth/product |
-| `vera/smt_emit.py` | AST → SMT-LIB 2.6 (QF_ABV), three proof obligations, versioned state, footprint localization |
+| `vera/smt_emit.py` | AST → SMT-LIB 2.6 (QF_ABV), three proof obligations, versioned state, footprint localization, frame-decomposed tracked sums |
 | `vera/verifier.py` | Model projection, runtime replay, counterexample lifting, diagnostic packet |
 | `vera/runtime.py` | Reference SoA engine: undo log, checked arithmetic, tracked sums, atomic revert |
 | `vera/projection.py` | State & Affordance Frame with parameter interval bounds |
@@ -194,9 +194,7 @@ them as follows and documents each choice.
 ## Performance
 
 On a 6-core Linux host, the dual-mode verifier proves the banking core's three
-transitions in ~1.5 s total (capacity 32/8). The exact-sum mode is slower and
-scales with capacity; it is intended for small tables or absolute-sum
-invariants.
+transitions in ~1.5 s total (capacity 32/8).
 
 The fold/allocation encoding was rewritten for O(1) per-access cost: the
 last-write map (`widx`/`wval` arrays), an occupancy array with symbolic-slot
@@ -204,6 +202,35 @@ stores, a known-slot fast path for `table_get` on an allocation result, and a
 symbolic allocator slot with an O(C) lowest-free constraint. A `fold_bounded<8>`
 with an allocation and a read per iteration verifies in ~0.8 s (previously
 >60 s); `fold_bounded<16>` in ~15 s.
+
+### Frame-decomposed tracked sums (Spec 6.2)
+
+`tracked_sum` pre-aggregates use the frame decomposition
+`σ₀ = σ_local + σ_rest`:
+
+* `σ_local` is the exact deduplicated sum over the transition's touched
+  footprint `K_rw` (typically ≤ 4 keys), with the aliasing guard
+  `δ_i = occ₀(k_i) ∧ ∧_{j<i} k_i ≠ k_j`;
+* `σ_rest` is a symbolic scalar for the untouched frame, bounded by the
+  **invariant-derived convex hull** `n_rest·L_c ≤ σ_rest ≤ n_rest·U_c`, where
+  `[L_c, U_c]` is extracted from the `forall` invariants on the column;
+* the post-state identity is the telescoping equation
+  `σ_final = σ_rest + σ_local(Σ_final)`.
+
+This keeps Footprint Localization sound (the rest frame never reads the SMT
+array) and makes the proof O(|K_rw|) in capacity instead of O(C):
+
+| capacity | frame (panic) | exact O(C) sum |
+|---|---|---|
+| 256 | 48 ms | >30 s (timeout) |
+| 1024 | 130 ms | — |
+| 4096 | 439 ms | — |
+
+Two dependent columns are handled with one shared `n_rest` per table and one
+`σ_rest` per column; a joint invariant such as
+`sum(A.assets) + sum(A.liabilities) ≤ cap` is bounded by the per-column hulls.
+That joint query is correct but solver-hard (~20 s at capacity 2); the
+per-column and single-column cases are fast.
 
 ## GPU furnace (OpenGL 4.6 / Target B)
 
@@ -254,8 +281,9 @@ replay matches live state: deterministic
   a unique column is forbidden (indexes are insert-only).
 * The lock-free Tier-1 dispatcher and the io_uring WAL are implemented for the
   generated Rust engine; the MVMemory Tier-2 Block-STM fallback is not.
-* The exact-sum verifier mode remains exponential in the number of rows; the
-  default free-accumulator mode is the practical path.
+* The frame-decomposed sum is the default and is O(|K_rw|) in capacity. The
+  exact O(C) sum remains as a fallback for wildcard / Tier-2 footprints, and a
+  joint bound over two tracked_sum columns is correct but solver-hard.
 
 ## Tests
 
@@ -265,7 +293,8 @@ replay matches live state: deterministic
   capacity/fold limits, all three obligations (including a vacuous transition
   and a missing-row trap), counterexample lifting, runtime atomicity, projections,
   the fuzzer, Rust codegen compilation/execution, unique-key indexes, fold/alloc
-  scaling, and the CLI.
+  scaling, frame-decomposed tracked sums (scaling, two-column, joint bound), and
+  the CLI.
 * `tests/test_gpu_backend.py` — GLSL compilation, end-to-end furnace run on the
   GPU, and violation detection on a bound-breaking spec.
 * `tests/test_rust_runtime.py` — Tier-1 batch dispatch, intent WAL, snapshot, and

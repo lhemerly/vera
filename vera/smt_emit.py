@@ -40,6 +40,11 @@ class SmtConfig:
     # accumulator is additionally tied to the exact O(C) column sum, which is
     # stronger but costs solver time proportional to capacity.
     exact_sum: bool = False
+    # When True (default), tracked_sum pre-aggregates use the frame-decomposed
+    # symbolic sum (sigma_local over the touched footprint + a bounded symbolic
+    # rest frame), which is O(|K_rw|) in capacity instead of O(C).  Falls back
+    # to the free/exact modes when a table has wildcard or Tier-2 accesses.
+    frame_sum: bool = True
 
 
 @dataclass
@@ -165,6 +170,16 @@ class SmtEncoder:
         self.cur_agg: Dict[str, Dict[str, str]] = {}
         self.agg_wide: Dict[Tuple[str, str], int] = {}
         self.agg_signed: Dict[Tuple[str, str], bool] = {}
+        # frame-decomposed aggregate state
+        self.frame_ok: Dict[Tuple[str, str], bool] = {}
+        self.frame_rest: Dict[Tuple[str, str], str] = {}
+        self.frame_nrest: Dict[Tuple[str, str], str] = {}
+        self.frame_nbits: Dict[Tuple[str, str], int] = {}
+        self.frame_local_pre: Dict[Tuple[str, str], str] = {}
+        self.frame_local_post: Dict[Tuple[str, str], str] = {}
+        self.frame_keys: Dict[Tuple[str, str], List[str]] = {}
+        self.frame_m: Dict[Tuple[str, str], str] = {}
+        self.agg_bounds: Dict[Tuple[str, str], Tuple[int, int]] = {}
 
         # writes / allocations
         self.writes: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
@@ -301,6 +316,7 @@ class SmtEncoder:
         self._build_state()
         self._build_well_formedness()
         self._encode_body()
+        self._build_frame()
         self._relevant = self._relevant_slots()
         self._build_pre_invariants()
         self._build_post_condition()
@@ -371,6 +387,7 @@ class SmtEncoder:
                     self.pre_hused[(tname, cname)] = hused
                     self.cur_hused[(tname, cname)] = hused
             if tinfo.layout.agg_offsets:
+                self._compute_agg_bounds()
                 self.pre_agg[tname] = {}
                 self.cur_agg[tname] = {}
                 wide_w = self._wide_width(tinfo)
@@ -381,14 +398,274 @@ class SmtEncoder:
                     agg = self._fresh(f"{tname}_{cname}_agg",
                                       f"(declare-const {tname}_{cname}_agg_0 (_ BitVec {wide_w}))",
                                       ("bv", wide_w))
-                    if self.config.exact_sum:
+                    self.pre_agg[tname][cname] = agg
+                    self.cur_agg[tname][cname] = agg
+                    n_bits = max(1, cap.bit_length())
+                    use_frame = self.config.frame_sum and self._frame_possible(tname)
+                    self.frame_ok[(tname, cname)] = use_frame
+                    if use_frame:
+                        rest = self._fresh(
+                            f"{tname}_{cname}_rest",
+                            f"(declare-const {tname}_{cname}_rest_0 (_ BitVec {wide_w}))",
+                            ("bv", wide_w))
+                        nrest = self._fresh(
+                            f"{tname}_{cname}_nrest",
+                            f"(declare-const {tname}_{cname}_nrest_0 (_ BitVec {n_bits}))",
+                            ("bv", n_bits))
+                        self.frame_rest[(tname, cname)] = rest
+                        self.frame_nrest[(tname, cname)] = nrest
+                        self.frame_nbits[(tname, cname)] = n_bits
+                    elif self.config.exact_sum:
                         exact = self._exact_sum(tname, self.pre_col[tname][cname], ctype,
                                                 cap, wide_w)
                         self.assert_common(f"(= {agg} {exact})")
                     else:
                         self.assert_common(self._range_check(agg, ctype, wide_w))
-                    self.pre_agg[tname][cname] = agg
-                    self.cur_agg[tname][cname] = agg
+
+    def _pre_occ(self, key: str, tname: str) -> str:
+        return self._select_arr(self.pre_occ[tname], self._slot_of_key(key, tname))
+
+    def _add_all(self, terms: List[str], width: int) -> str:
+        if not terms:
+            return self._bv(0, width)
+        acc = terms[0]
+        for t in terms[1:]:
+            acc = f"(bvadd {acc} {t})"
+        return acc
+
+    def _bound_mul(self, nrest: str, const: int, wide_w: int, n_bits: int) -> str:
+        """n_rest * const as a signed wide product (n_rest is non-negative)."""
+        ext = self._extend(nrest, n_bits, wide_w, False)
+        lit = self._bv(const & ((1 << wide_w) - 1), wide_w)
+        return f"(bvmul {ext} {lit})"
+
+    def _agg_domain_check(self, expr: str, wide_w: int, cap: int,
+                          tname: str, cname: str) -> str:
+        """The tracked_sum accumulator's domain is [C*L_c, C*U_c], the range of
+        possible sums under the invariant-derived per-row interval."""
+        ctype = self.prog.tables[tname].columns[cname].type
+        lo_b, hi_b = self.agg_bounds.get((tname, cname),
+                                         (ctype.min_value, ctype.max_value))
+        mn = (lo_b * cap) & ((1 << wide_w) - 1)
+        mx = (hi_b * cap) & ((1 << wide_w) - 1)
+        if ctype.is_signed:
+            return self._and(f"(bvsge {expr} {self._bv(mn, wide_w)})",
+                             f"(bvsle {expr} {self._bv(mx, wide_w)})")
+        return self._and(f"(bvuge {expr} {self._bv(0, wide_w)})",
+                         f"(bvule {expr} {self._bv(mx, wide_w)})")
+
+    def _is_col_access(self, expr: A.Expr, qvar: str, tname: str,
+                       cname: str) -> bool:
+        return (isinstance(expr, A.TableAccess) and expr.table == tname
+                and expr.column == cname and isinstance(expr.key, A.Var)
+                and expr.key.name == qvar)
+
+    def _const_eval(self, expr: A.Expr):
+        if isinstance(expr, A.Literal) and isinstance(expr.value, int) \
+                and not isinstance(expr.value, bool):
+            return expr.value
+        if isinstance(expr, A.Binary):
+            a = self._const_eval(expr.left)
+            b = self._const_eval(expr.right)
+            if a is None or b is None:
+                return None
+            if expr.op == "add":
+                return a + b
+            if expr.op == "sub":
+                return a - b
+            if expr.op == "mul":
+                return a * b
+            if expr.op == "div" and b != 0:
+                return a // b
+        return None
+
+    def _tighten(self, expr: A.Expr, qvar: str, tname: str, cname: str,
+                 bounds: List[int]) -> None:
+        """Spec 6.2 Step 3: extract the per-row interval implied by a
+        forall-invariant on T[q].c."""
+        if isinstance(expr, A.Binary):
+            if expr.op == "and":
+                self._tighten(expr.left, qvar, tname, cname, bounds)
+                self._tighten(expr.right, qvar, tname, cname, bounds)
+                return
+            op = expr.op
+            other = None
+            if self._is_col_access(expr.left, qvar, tname, cname):
+                other = expr.right
+            elif self._is_col_access(expr.right, qvar, tname, cname):
+                other = expr.left
+                op = {"ge": "le", "le": "ge", "gt": "lt", "lt": "gt"}.get(op, op)
+            if other is None:
+                return
+            val = self._const_eval(other)
+            if val is None:
+                return
+            if op == "ge":
+                bounds[0] = max(bounds[0], val)
+            elif op == "gt":
+                bounds[0] = max(bounds[0], val + 1)
+            elif op == "le":
+                bounds[1] = min(bounds[1], val)
+            elif op == "lt":
+                bounds[1] = min(bounds[1], val - 1)
+            elif op == "eq":
+                bounds[0] = max(bounds[0], val)
+                bounds[1] = min(bounds[1], val)
+
+    def _compute_agg_bounds(self) -> None:
+        for tname, tinfo in self.prog.tables.items():
+            for cname, cinfo in tinfo.columns.items():
+                if not cinfo.tracked_sum:
+                    continue
+                bounds = [cinfo.type.min_value, cinfo.type.max_value]
+                for inv in self.prog.invariants.values():
+                    if inv.quant_table == tname:
+                        self._tighten(inv.expr, inv.quant_var, tname, cname, bounds)
+                self.agg_bounds[(tname, cname)] = (bounds[0], bounds[1])
+
+    def _frame_possible(self, tname: str) -> bool:
+        """The frame is built when every *write* to `tname` has a statically
+        resolvable primary-key handle.  Reads may be skipped (they cannot change
+        the sum); allocation slots are fresh primary keys."""
+        for rec in self.tr.reads + self.tr.writes:
+            if rec.table == tname and rec.key is not None and rec.tier != 1:
+                return False
+        return True
+
+    def _collect_frame_keys(self, tname: str) -> Optional[List[str]]:
+        """Primary-key expressions accessed in `tname`, or None when a write key
+        cannot be established (the frame would be unsound)."""
+        keys: List[str] = []
+        seen = set()
+
+        def add(expr: str) -> None:
+            if expr not in seen:
+                seen.add(expr)
+                keys.append(expr)
+
+        # Reads: only primary-key handles can index the local sum.
+        for rec in self.tr.reads:
+            if rec.table != tname or rec.key is None:
+                continue
+            try:
+                kt = self._infer_type(rec.key, self.env)
+            except Exception:
+                continue
+            if kt.kind != "id64" or kt.key_table != tname:
+                continue
+            add(self._encode_expr(rec.key, self.env, "post"))
+        # Writes: every write key must be resolvable to a primary key.
+        for rec in self.tr.writes:
+            if rec.table != tname or rec.key is None:
+                continue
+            try:
+                kt = self._infer_type(rec.key, self.env)
+            except Exception:
+                return None
+            if kt.kind != "id64" or kt.key_table != tname:
+                return None
+            add(self._encode_expr(rec.key, self.env, "post"))
+        # Allocation slots are fresh primary keys.
+        tinfo = self.prog.tables[tname]
+        kb = tinfo.layout.key_bits
+        gen_bits = tinfo.layout.generation_bits
+        for slot, new_gen in self.alloc_records.get(tname, []):
+            raw = new_gen if kb == 0 else f"(concat {new_gen} {slot})"
+            add(self._extend(raw, gen_bits + kb, 64, False))
+        return keys
+
+    def _delta_terms(self, keys: List[str], tname: str, occ_fn) -> List[str]:
+        deltas: List[str] = []
+        for i, k in enumerate(keys):
+            occ = occ_fn(k)
+            if i == 0:
+                deltas.append(occ)
+            else:
+                ne = [f"(not (= {k} {keys[j]}))" for j in range(i)]
+                deltas.append(self._and(occ, *ne))
+        return deltas
+
+    def _build_frame(self) -> None:
+        """Frame-decomposed pre-aggregate (Spec 6.2).
+
+        sigma_0 = sigma_local,0 + sigma_rest, where sigma_local,0 is the exact
+        deduplicated sum over the touched footprint K_rw and sigma_rest is a
+        symbolic scalar bounded by the invariant-derived convex hull
+        n_rest * L_c <= sigma_rest <= n_rest * U_c.  This keeps Footprint
+        Localization sound without instantiating all C slots.
+        """
+        for tname, tinfo in self.prog.tables.items():
+            if not tinfo.layout.agg_offsets:
+                continue
+            cap = tinfo.layout.capacity
+            keys = self._collect_frame_keys(tname)
+            for cname in tinfo.layout.agg_offsets:
+                if not self.frame_ok.get((tname, cname)):
+                    continue
+                ctype = tinfo.columns[cname].type
+                wide_w = self.agg_wide[(tname, cname)]
+                if keys is None:
+                    # A write key could not be resolved to a primary key: the
+                    # frame would be unsound, so fall back to the naive modes.
+                    self.frame_ok[(tname, cname)] = False
+                    if self.config.exact_sum:
+                        exact = self._exact_sum(tname, self.pre_col[tname][cname],
+                                                ctype, cap, wide_w)
+                        self.assert_common(f"(= {self.pre_agg[tname][cname]} {exact})")
+                    else:
+                        self.assert_common(
+                            self._range_check(self.pre_agg[tname][cname], ctype, wide_w))
+                    continue
+                signed = self.agg_signed[(tname, cname)]
+                n_bits = self.frame_nbits[(tname, cname)]
+                rest = self.frame_rest[(tname, cname)]
+                nrest = self.frame_nrest[(tname, cname)]
+                self.frame_keys[(tname, cname)] = keys
+                deltas = self._delta_terms(
+                    keys, tname, lambda k: self._pre_occ(k, tname))
+                m_terms = [self._ite(d, self._bv(1, n_bits), self._bv(0, n_bits))
+                           for d in deltas]
+                m_local = self._add_all(m_terms, n_bits)
+                self.frame_m[(tname, cname)] = m_local
+                terms = []
+                for d, k in zip(deltas, keys):
+                    slot = self._slot_of_key(k, tname)
+                    v = self._apply(self.pre_col[tname][cname], slot)
+                    terms.append(self._ite(
+                        d, self._extend(v, ctype.width, wide_w, signed),
+                        self._bv(0, wide_w)))
+                local_pre = self._add_all(terms, wide_w)
+                self.frame_local_pre[(tname, cname)] = local_pre
+                self.assert_common(
+                    f"(= {self.pre_agg[tname][cname]} (bvadd {local_pre} {rest}))")
+                lo_b, hi_b = self.agg_bounds.get((tname, cname),
+                                                 (ctype.min_value, ctype.max_value))
+                lo = self._bound_mul(nrest, lo_b, wide_w, n_bits)
+                hi = self._bound_mul(nrest, hi_b, wide_w, n_bits)
+                self.assert_common(f"(bvsle {lo} {rest})")
+                self.assert_common(f"(bvsle {rest} {hi})")
+                # Every allocation consumes a free slot, so the untouched frame
+                # must leave room for all of them.
+                n_allocs = len(self.alloc_records.get(tname, []))
+                room = (f"(bvsub {self._bv(cap, n_bits)} {m_local})" if n_allocs == 0
+                        else f"(bvsub (bvsub {self._bv(cap, n_bits)} {m_local}) "
+                             f"{self._bv(n_allocs, n_bits)})")
+                self.assert_common(f"(bvule {nrest} {room})")
+
+    def _frame_local_post(self, tname: str, cname: str) -> str:
+        ctype = self.prog.tables[tname].columns[cname].type
+        wide_w = self.agg_wide[(tname, cname)]
+        signed = self.agg_signed[(tname, cname)]
+        keys = self.frame_keys.get((tname, cname), [])
+        deltas = self._delta_terms(
+            keys, tname,
+            lambda k: self._current_occ(tname, self._slot_of_key(k, tname)))
+        terms = []
+        for d, k in zip(deltas, keys):
+            v = self._current_col(tname, cname, k, ctype)
+            terms.append(self._ite(d, self._extend(v, ctype.width, wide_w, signed),
+                                    self._bv(0, wide_w)))
+        return self._add_all(terms, wide_w)
 
     def _wide_width(self, tinfo) -> int:
         max_w = max(c.type.width for c in tinfo.columns.values())
@@ -900,7 +1177,9 @@ class SmtEncoder:
         w_old = self._extend(v_old, ctype.width, wide_w, signed)
         w_new = self._extend(v_new, ctype.width, wide_w, signed)
         new_val = f"(bvadd (bvsub {cur} {w_old}) {w_new})"
-        in_range = self._range_check(new_val, ctype, wide_w)
+        in_range = self._agg_domain_check(new_val, wide_w,
+                                          self.prog.tables[tname].layout.capacity,
+                                          tname, cname)
         self._trap_update(self._not(in_range))
         self._pi_update(in_range)
         new_agg = self._fresh(f"{tname}_{cname}_agg",
@@ -981,7 +1260,9 @@ class SmtEncoder:
         w_new = self._extend(v_new, ctype.width, wide_w, signed)
         delta = w_new if active is None else self._ite(active, w_new, self._bv(0, wide_w))
         new_val = f"(bvadd {cur} {delta})"
-        in_range = self._range_check(new_val, ctype, wide_w)
+        in_range = self._agg_domain_check(new_val, wide_w,
+                                          self.prog.tables[tname].layout.capacity,
+                                          tname, cname)
         if active is None:
             self._trap_update(self._not(in_range))
             self._pi_update(in_range)
@@ -1253,6 +1534,38 @@ class SmtEncoder:
                          expr.line, expr.col)
         return self._bv(0, 8)
 
+    def _sumagg_width(self, expr: A.Expr):
+        """Widest tracked_sum accumulator reachable in `expr`, or None."""
+        if isinstance(expr, A.SumAgg):
+            return self.agg_wide.get((expr.table, expr.column))
+        if isinstance(expr, A.Binary):
+            ws = [self._sumagg_width(expr.left), self._sumagg_width(expr.right)]
+            ws = [w for w in ws if w is not None]
+            return max(ws) if ws else None
+        if isinstance(expr, A.Unary):
+            return self._sumagg_width(expr.operand)
+        if isinstance(expr, A.Select):
+            ws = [self._sumagg_width(expr.cond), self._sumagg_width(expr.a),
+                  self._sumagg_width(expr.b)]
+            ws = [w for w in ws if w is not None]
+            return max(ws) if ws else None
+        return None
+
+    def _encoded_width(self, expr: A.Expr) -> int:
+        """Width of the SMT expression `_encode_expr` produces for `expr`."""
+        if isinstance(expr, A.SumAgg):
+            return self.agg_wide.get((expr.table, expr.column), 64)
+        if isinstance(expr, A.Binary):
+            aw = self._sumagg_width(expr)
+            if aw is not None:
+                if expr.op in ("add", "sub"):
+                    return aw + 1
+                if expr.op == "mul":
+                    return aw * 2
+                return aw
+            return 64
+        return 64
+
     def _encode_binary(self, expr: A.Binary, env: Dict[str, str], state: str,
                        expected: Optional[ScalarType]) -> str:
         op = expr.op
@@ -1267,27 +1580,62 @@ class SmtEncoder:
         if op in ("add", "sub", "mul", "div", "rem", "min", "max"):
             if expected is not None and not expected.is_numeric:
                 expected = None
+            aw = self._sumagg_width(expr)
+            if aw is not None:
+                # Arithmetic on tracked_sum accumulators: the widened registers
+                # are exact, so no overflow trap is emitted.
+                a = self._encode_expr(expr.left, env, state, None)
+                b = self._encode_expr(expr.right, env, state, None)
+                aw_l = self._sumagg_width(expr.left) or aw
+                aw_r = self._sumagg_width(expr.right) or aw
+                if op in ("add", "sub"):
+                    w = aw + 1
+                    a = self._extend(a, self._encoded_width(expr.left), w, True)
+                    b = self._extend(b, self._encoded_width(expr.right), w, True)
+                    return f"(bv{'add' if op == 'add' else 'sub'} {a} {b})"
+                if op == "mul":
+                    w = aw * 2
+                    a = self._extend(a, self._encoded_width(expr.left), w, True)
+                    b = self._extend(b, self._encoded_width(expr.right), w, True)
+                    return f"(bvmul {a} {b})"
+                a = self._extend(a, self._encoded_width(expr.left), aw, True)
+                b = self._extend(b, self._encoded_width(expr.right), aw, True)
+                if op == "min":
+                    return self._ite(self._cmp("lt", a, b, True), a, b)
+                if op == "max":
+                    return self._ite(self._cmp("gt", a, b, True), a, b)
+                if op == "div":
+                    return f"(bvsdiv {a} {b})"
+                if op == "rem":
+                    return f"(bvsrem {a} {b})"
             ctype = self._infer_arith_type(expr, env, expected)
             a = self._encode_expr(expr.left, env, state, ctype)
             b = self._encode_expr(expr.right, env, state, ctype)
             return self._encode_arith(op, a, b, ctype, expr)
         if op in ("eq", "ne", "lt", "le", "gt", "ge"):
             ctype = self._infer_cmp_type(expr, env, None)
-            left_is_agg = isinstance(expr.left, A.SumAgg)
-            right_is_agg = isinstance(expr.right, A.SumAgg)
-            if left_is_agg or right_is_agg:
+            aw = self._sumagg_width(expr)
+            if aw is not None:
+                # Compare at one bit above the widest accumulator so an
+                # add(sum, sum) term is represented exactly.
+                w = aw + 1
+                a = self._encode_expr(expr.left, env, state, None)
+                b = self._encode_expr(expr.right, env, state, None)
+                a = self._extend(a, self._encoded_width(expr.left), w, True)
+                b = self._extend(b, self._encoded_width(expr.right), w, True)
+            elif isinstance(expr.left, A.SumAgg) or isinstance(expr.right, A.SumAgg):
                 widths = []
-                if left_is_agg:
+                if isinstance(expr.left, A.SumAgg):
                     widths.append(self.agg_wide[(expr.left.table, expr.left.column)])
-                if right_is_agg:
+                if isinstance(expr.right, A.SumAgg):
                     widths.append(self.agg_wide[(expr.right.table, expr.right.column)])
                 wide_w = max(widths)
                 a = self._encode_expr(expr.left, env, state, ctype)
                 b = self._encode_expr(expr.right, env, state, ctype)
                 a_width = self.agg_wide[(expr.left.table, expr.left.column)] \
-                    if left_is_agg else ctype.width
+                    if isinstance(expr.left, A.SumAgg) else ctype.width
                 b_width = self.agg_wide[(expr.right.table, expr.right.column)] \
-                    if right_is_agg else ctype.width
+                    if isinstance(expr.right, A.SumAgg) else ctype.width
                 a = self._extend(a, a_width, wide_w, ctype.is_signed)
                 b = self._extend(b, b_width, wide_w, ctype.is_signed)
             else:
@@ -1486,9 +1834,15 @@ class SmtEncoder:
                 body = self._encode_forall_body(inv.expr, tname, inv.quant_var,
                                                 w, "post")
                 parts.append(f"(=> {occ} {body})")
-        # aggregate consistency: exact post sum rebuilt from pre-agg + deltas
+        # aggregate consistency
         for (tname, cname), wide_w in self.agg_wide.items():
             if not self.modified_slots.get(tname):
+                continue
+            if self.frame_ok.get((tname, cname)):
+                # Telescoping frame identity: sigma_final = sigma_rest + sigma_local(final)
+                rest = self.frame_rest[(tname, cname)]
+                local_post = self._frame_local_post(tname, cname)
+                parts.append(f"(= {self.cur_agg[tname][cname]} (bvadd {rest} {local_post}))")
                 continue
             ctype = self.prog.tables[tname].columns[cname].type
             signed = ctype.is_signed
@@ -1621,24 +1975,32 @@ def verify_transition_dual(prog: Program, transition_name: str,
     """
     from dataclasses import replace
     config = config or SmtConfig()
-    free_cfg = replace(config, exact_sum=False)
-    exact_cfg = replace(config, exact_sum=True)
-    free = SmtEncoder(prog, transition_name, free_cfg)
-    free.build()
-    exact = SmtEncoder(prog, transition_name, exact_cfg)
-    exact.build()
+    frame_cfg = replace(config, exact_sum=False, frame_sum=True)
+    frame = SmtEncoder(prog, transition_name, frame_cfg)
+    frame.build()
+    exact = None
     result = VerificationResult(transition=transition_name,
                                 safety=ObligationResult("safety"),
                                 panic=ObligationResult("panic"),
                                 liveness=ObligationResult("liveness"))
-    result.safety = free._solve_one("safety")
-    result.liveness = free._solve_one("liveness")
-    result.panic = exact._solve_one("panic")
-    result.script = (free.script_full()
-                     + "\n; ---- Obligation 2 with exact column sums ----\n"
-                     + exact.script_for("panic"))
-    result.diagnostics = list(free.diags.items) + list(exact.diags.items)
-    result.encoders = {"safety": free, "panic": exact, "liveness": free}
+    result.safety = frame._solve_one("safety")
+    result.liveness = frame._solve_one("liveness")
+    # The frame is exact over the touched footprint, so it is sufficient for the
+    # accumulator range proof.  Only fall back to the O(C) exact sum when the
+    # frame could not be built (wildcard / Tier-2 accesses).
+    if all(frame.frame_ok.values()):
+        result.panic = frame._solve_one("panic")
+    else:
+        exact = SmtEncoder(prog, transition_name,
+                           replace(config, exact_sum=True, frame_sum=False))
+        exact.build()
+        result.panic = exact._solve_one("panic")
+    result.script = (frame.script_full()
+                     + ("\n; ---- Obligation 2 with exact column sums ----\n"
+                        + exact.script_for("panic") if exact is not None else ""))
+    result.diagnostics = list(frame.diags.items) + (
+        list(exact.diags.items) if exact is not None else [])
+    result.encoders = {"safety": frame, "panic": exact or frame, "liveness": frame}
     return result
 
 

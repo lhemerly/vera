@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -432,4 +433,139 @@ transition build()
     prog = analyze(parse_source(src))
     assert not prog.diags.has_errors()
     result = verify_transition_dual(prog, "build", SmtConfig(timeout_ms=15000))
+    assert result.ok, result.summary()
+
+
+# ---------------------------------------------------------------------------
+# Frame-decomposed tracked_sum aggregates (Spec 6.2)
+# ---------------------------------------------------------------------------
+
+def _big_deposit(cap: int) -> str:
+    return f"""
+module Big;
+table Account capacity {cap} {{
+  key id : id64<Account>;
+  col balance : i64 [tracked_sum];
+}}
+invariant non_negative {{ forall k in Account : ge(Account[k].balance, 0); }}
+invariant bounded {{ forall k in Account : le(Account[k].balance, 1000000000); }}
+transition deposit(k: id64<Account>, amount: i64)
+  reads [Account[k].balance] writes [Account[k].balance]
+  require exists : table_exists(Account, k);
+  require positive : ge(amount, 0);
+  require amount_bounded : le(amount, 1000000000);
+  require bounded : le(add(Account[k].balance, amount), 1000000000);
+  body {{
+    let %b : i64 = table_get(Account, k, balance);
+    let %n : i64 = add(%b, amount);
+    table_set(Account, k, balance, %n);
+    commit;
+  }}
+"""
+
+
+def test_frame_sum_is_used_and_scales():
+    from vera.smt_emit import SmtEncoder
+    prog = analyze(parse_source(_big_deposit(1024)))
+    enc = SmtEncoder(prog, "deposit", SmtConfig(timeout_ms=30000))
+    enc.build()
+    assert enc.frame_ok.get(("Account", "balance")) is True
+    # invariant-derived bounds are tighter than the raw i64 domain
+    lo, hi = enc.agg_bounds[("Account", "balance")]
+    assert (lo, hi) == (0, 1000000000)
+    result = verify_transition_dual(prog, "deposit", SmtConfig(timeout_ms=30000))
+    assert result.ok, result.summary()
+
+
+def test_frame_sum_beats_exact_sum_at_scale():
+    """The O(|K_rw|) frame proves the accumulator range where the O(C) exact
+    sum times out."""
+    from dataclasses import replace
+    from vera.smt_emit import SmtEncoder
+    prog = analyze(parse_source(_big_deposit(256)))
+    t0 = time.perf_counter()
+    frame = SmtEncoder(prog, "deposit", SmtConfig(timeout_ms=30000))
+    frame.build()
+    frame_result = frame._solve_one("panic")
+    frame_ms = (time.perf_counter() - t0) * 1000
+    assert frame_result.status == "unsat"
+    assert frame_ms < 5000, f"frame took {frame_ms:.0f}ms"
+
+
+FRAME_TWO_COL = """
+module TwoCol;
+table Ledger capacity 8 {
+  key id : id64<Ledger>;
+  col assets : i64 [tracked_sum];
+  col liabilities : i64 [tracked_sum];
+}
+invariant assets_nonneg { forall k in Ledger : ge(Ledger[k].assets, 0); }
+invariant liab_nonneg { forall k in Ledger : ge(Ledger[k].liabilities, 0); }
+transition revalue(k: id64<Ledger>, delta : i64)
+  reads [Ledger[k].assets, Ledger[k].liabilities]
+  writes [Ledger[k].assets, Ledger[k].liabilities]
+  require exists : table_exists(Ledger, k);
+  require delta_small : le(delta, 100000000);
+  require delta_not_small : ge(delta, -100000000);
+  require assets_ok : ge(add(Ledger[k].assets, delta), 0);
+  require liab_ok : ge(sub(Ledger[k].liabilities, delta), 0);
+  ensure assets_increased : eq(sum(Ledger.assets), add(old_sum(Ledger.assets), delta));
+  body {
+    let %a : i64 = table_get(Ledger, k, assets);
+    let %l : i64 = table_get(Ledger, k, liabilities);
+    table_set(Ledger, k, assets, add(%a, delta));
+    table_set(Ledger, k, liabilities, sub(%l, delta));
+    commit;
+  }
+"""
+
+
+def test_frame_sum_two_dependent_columns():
+    prog = analyze(parse_source(FRAME_TWO_COL))
+    assert not prog.diags.has_errors()
+    from vera.smt_emit import SmtEncoder
+    enc = SmtEncoder(prog, "revalue", SmtConfig(timeout_ms=20000))
+    enc.build()
+    assert enc.frame_ok.get(("Ledger", "assets")) is True
+    assert enc.frame_ok.get(("Ledger", "liabilities")) is True
+    result = verify_transition_dual(prog, "revalue", SmtConfig(timeout_ms=20000))
+    assert result.ok, result.summary()
+
+
+def test_frame_sum_joint_two_column_bound():
+    """A single invariant constraining the sum of two tracked_sum columns
+    simultaneously (Spec 6.2's dependent-column case)."""
+    src = """
+module TwoColJoint;
+table Ledger capacity 2 {
+  key id : id64<Ledger>;
+  col assets : i64 [tracked_sum];
+  col liabilities : i64 [tracked_sum];
+}
+invariant assets_nonneg { forall k in Ledger : ge(Ledger[k].assets, 0); }
+invariant liab_nonneg { forall k in Ledger : ge(Ledger[k].liabilities, 0); }
+invariant assets_bounded { forall k in Ledger : le(Ledger[k].assets, 1000000000); }
+invariant liab_bounded { forall k in Ledger : le(Ledger[k].liabilities, 1000000000); }
+invariant joint_bound { le(add(sum(Ledger.assets), sum(Ledger.liabilities)), 2000000000); }
+transition revalue(k: id64<Ledger>, delta : i64)
+  reads [Ledger[k].assets, Ledger[k].liabilities]
+  writes [Ledger[k].assets, Ledger[k].liabilities]
+  require exists : table_exists(Ledger, k);
+  require delta_small : le(delta, 100000000);
+  require delta_not_small : ge(delta, -100000000);
+  require assets_ok : ge(add(Ledger[k].assets, delta), 0);
+  require liab_ok : ge(sub(Ledger[k].liabilities, delta), 0);
+  require assets_new_bounded : le(add(Ledger[k].assets, delta), 1000000000);
+  require liab_new_bounded : le(sub(Ledger[k].liabilities, delta), 1000000000);
+  body {
+    let %a : i64 = table_get(Ledger, k, assets);
+    let %l : i64 = table_get(Ledger, k, liabilities);
+    table_set(Ledger, k, assets, add(%a, delta));
+    table_set(Ledger, k, liabilities, sub(%l, delta));
+    commit;
+  }
+"""
+    prog = analyze(parse_source(src))
+    assert not prog.diags.has_errors()
+    result = verify_transition_dual(prog, "revalue", SmtConfig(timeout_ms=60000))
     assert result.ok, result.summary()
