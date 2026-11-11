@@ -644,7 +644,13 @@ class RustGenerator:
             ti = self.prog.transitions[tname]
             if ti.decl.params:
                 binds = ", ".join(p.name for p in ti.decl.params)
-                vals = ["*" + p.name + " as u64" for p in ti.decl.params]
+                vals = []
+                for p in ti.decl.params:
+                    pt = ti.param_types[p.name]
+                    if pt.kind == "bytes32":
+                        vals.append(f"u64::from_le_bytes({p.name}[0..8].try_into().unwrap())")
+                    else:
+                        vals.append(f"*{p.name} as u64")
                 vals += ["0u64"] * (4 - len(vals))
                 self.line("            Params::" + self._variant(tname) + " { " + binds + " } => ("
                           + str(idx) + ", [" + ", ".join(vals) + "]),")

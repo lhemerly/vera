@@ -279,11 +279,13 @@ def test_rust_codegen_compiles_and_runs(tmp_path):
     proc = subprocess.run([rustc, "--edition", "2021", "-O", str(out),
                            "-o", str(binary)], capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
-    run = subprocess.run([str(binary)], capture_output=True, text=True)
+    run = subprocess.run([str(binary)], capture_output=True, text=True,
+                         cwd=tmp_path)
     assert run.returncode == 0, run.stderr
-    assert "transfer committed" in run.stdout
-    assert "balance[0] = 400000000" in run.stdout
-    assert "agg_sum_balance = 800000000" in run.stdout
+    assert "batch committed" in run.stdout
+    assert "replay matches live state: deterministic" in run.stdout
+    assert (tmp_path / "vera.wal").exists()
+    assert (tmp_path / "vera.snap").exists()
 
 
 def test_gpu_codegen_emits():
