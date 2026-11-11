@@ -8,3 +8,9 @@ __pycache__/
 
 # Rust runtime crate artifacts
 rust/vera-rt/target/
+
+# Runtime artifacts produced by running the reference engine
+vera.snap
+vera.wal
+*.snap
+*.wal
