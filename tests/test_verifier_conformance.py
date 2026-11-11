@@ -238,6 +238,64 @@ def test_newly_allocated_unique_key_is_found_in_same_transaction():
     assert result.ok, result.summary()
 
 
+@pytest.mark.parametrize(
+    "key_type", ["bool", "u8", "u64", "bytes32", "dec128", "enum{A,B}"]
+)
+def test_unique_existence_guard_proves_returned_handle_is_live(key_type):
+    result = checked(f"""module Unique;
+    table T capacity 8 {{key id:id64<T>;col code:{key_type} [unique];col v:i64;}}
+    transition go(value:{key_type}) reads [T[*].code,T[*].v] writes []
+    body {{
+      guard(table_exists_unique(T,code,value),ERR_MISSING);
+      let %first:id64<T> =table_lookup(T,code,value);
+      let %second:id64<T> =table_lookup(T,code,value);
+      let %v:i64=table_get(T,%second,v);
+      guard(eq(%first,%second),ERR_CHANGED);
+      commit;
+    }}""")
+    assert result.ok, result.summary()
+
+
+def test_unique_existence_guard_does_not_cover_a_different_key():
+    result = checked("""module Unique;
+    table T capacity 2 {key id:id64<T>;col code:u8 [unique];}
+    transition go(present:u8,missing:u8) reads [T[*].code] writes []
+    body {
+      guard(table_exists_unique(T,code,present),ERR_MISSING);
+      let %other:id64<T> =table_lookup(T,code,missing);
+      commit;
+    }""")
+    assert result.panic.status == "sat", result.summary()
+    assert not result.ok
+
+
+def test_unique_lookup_observes_allocations_after_an_earlier_miss():
+    result = checked("""module Unique;
+    table T capacity 2 {key id:id64<T>;col code:u8 [unique];}
+    transition go(value:u8) reads [T[*].code] writes [T[*].code]
+    body {
+      guard(not(table_exists_unique(T,code,value)),ERR_DUPLICATE);
+      let %new:id64<T> =table_alloc(T,{code:value});
+      let %found:id64<T> =table_lookup(T,code,value);
+      guard(eq(%new,%found),ERR_CHANGED);
+      commit;
+    }""")
+    assert result.ok, result.summary()
+
+
+def test_unique_lookup_before_allocation_still_reports_a_missing_key_trap():
+    result = checked("""module Unique;
+    table T capacity 2 {key id:id64<T>;col code:u8 [unique];}
+    transition go(value:u8) reads [T[*].code] writes [T[*].code]
+    body {
+      let %missing:id64<T> =table_lookup(T,code,value);
+      let %new:id64<T> =table_alloc(T,{code:value});
+      commit;
+    }""")
+    assert result.panic.status == "sat", result.summary()
+    assert not result.ok
+
+
 def test_constructor_from_small_integer_has_64_bit_handle_width():
     result = checked(
         HEADER
@@ -324,3 +382,87 @@ def test_exported_dual_proof_script_has_no_duplicate_declarations():
     assert result.ok, result.summary()
     z3.parse_smt2_string(result.script)
     assert result.script.count("(check-sat)") == 3
+
+
+@pytest.mark.parametrize("attribute", ["", "[tracked_sum]"])
+def test_table_and_column_names_cannot_alias_independent_state_in_a_proof(attribute):
+    from vera.verifier import attach_counterexample
+
+    prog = program(f"""module Names;
+    table A capacity 1 {{key id:id64<A>;col b_c:i64 {attribute};}}
+    table A_b capacity 1 {{key id:id64<A_b>;col c:i64 {attribute};}}
+    transition go(k:id64<A>,l:id64<A_b>) reads [A[k].b_c,A_b[l].c] writes []
+    require a:table_exists(A,k);
+    require b:table_exists(A_b,l);
+    ensure same:eq(A[k].b_c,A_b[l].c);
+    body {{commit;}}""")
+    result = verify_transition_dual(prog, "go", SmtConfig(timeout_ms=10000))
+    assert result.safety.status == "sat", result.summary()
+    assert not result.ok
+    attach_counterexample(prog, result.encoders, result)
+    assert result.counterexample is not None
+    assert "ensure same" in result.counterexample.violated
+    assert set(result.counterexample.params) == {"k", "l"}
+
+
+def test_column_names_do_not_collide_with_generated_state_symbols():
+    result = checked("""module Names;
+    table T capacity 2 {
+      key id:id64<T>;
+      col occ:bool;
+      col gen:u32;
+      col v:i64;
+      col v_widx:u8;
+      col v_widx_0:u8;
+      col v_agg_0:i64;
+    }
+    transition go(k:id64<T>) reads [T[k].occ,T[k].v_widx] writes [T[k].v]
+    require live:table_exists(T,k);
+    body {
+      let %occupied:bool=table_get(T,k,occ);
+      let %index:u8=table_get(T,k,v_widx);
+      table_set(T,k,v,0);commit;
+    }""")
+    assert result.ok, result.summary()
+
+
+def test_parameter_names_do_not_collide_with_table_column_symbols():
+    result = checked("""module Names;
+    table p capacity 1 {key id:id64<p>;col value:i64;}
+    transition go(k:id64<p>,value:i64) reads [] writes [p[k].value]
+    require live:table_exists(p,k);
+    ensure stored:eq(p[k].value,value);
+    body {table_set(p,k,value,value);commit;}""")
+    assert result.ok, result.summary()
+
+
+@pytest.mark.parametrize(
+    "scalar,limit,excluded",
+    [
+        ("i64", "div(-3,2)", -1),
+        ("dec64", "div(300000000,200000000)", 2),
+        ("dec64", "mul(-100000000,100000000)", -100000000),
+        ("dec128", "div(3000000000000000000,2000000000000000000)", 2),
+        (
+            "dec128",
+            "mul(-1000000000000000000,1000000000000000000)",
+            -1000000000000000000,
+        ),
+    ],
+)
+def test_frame_bounds_use_typed_constant_arithmetic(scalar, limit, excluded):
+    from vera.verifier import attach_counterexample
+
+    prog = program(f"""module Bounds;
+    table T capacity 2 {{key id:id64<T>;col v:{scalar} [tracked_sum];}}
+    invariant limit {{forall k in T:le(T[k].v,{limit});}}
+    transition go(k:id64<T>) reads [T[k].v] writes []
+    require live:table_exists(T,k);
+    ensure false_bound:ne(sub(sum(T.v),T[k].v),{excluded});
+    body {{commit;}}""")
+    result = verify_transition_dual(prog, "go", SmtConfig(timeout_ms=10000))
+    assert result.safety.status == "sat", result.summary()
+    assert not result.ok
+    attach_counterexample(prog, result.encoders, result)
+    assert result.counterexample is not None
+    assert "ensure false_bound" in result.counterexample.violated

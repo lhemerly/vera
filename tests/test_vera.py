@@ -173,13 +173,24 @@ def test_missing_row_trap_detected():
 
 
 def test_smt_script_emission():
+    import z3
+
     prog = load("examples/bank.vera")
     enc = SmtEncoder(prog, "freeze", SmtConfig())
     enc.build()
     script = enc.script_full()
-    assert "(set-logic QF_ABV)" in script
-    assert "(declare-const Account_occ (Array" in script
-    assert "check-sat" in script
+    assert "(set-logic QF_AUFBV)" in script
+    z3.parse_smt2_string(script)
+    assert script.count("(check-sat)") == 3
+    for name, expected in (
+        ("safety", z3.unsat),
+        ("panic", z3.unsat),
+        ("liveness", z3.sat),
+    ):
+        solver = z3.Solver()
+        solver.set(timeout=10000)
+        solver.from_string(enc.script_for(name))
+        assert solver.check() == expected
 
 
 # ---------------------------------------------------------------------------

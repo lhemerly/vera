@@ -458,6 +458,11 @@ class RustGenerator:
         self.effect_variants = self._name_map(
             prog.effects, self._base_variant, "Effect"
         )
+        self.column_functions = self._name_map(
+            [(tn, cn) for tn, ti in prog.tables.items() for cn in ti.columns],
+            lambda pair: "_".join(pair),
+            "column",
+        )
         reserved = {
             "main",
             "run_batch",
@@ -483,12 +488,12 @@ class RustGenerator:
             for cn in ti.columns:
                 reserved.update(
                     {
-                        f"table_get_{tn}_{cn}",
-                        f"table_set_{tn}_{cn}",
-                        f"hash_bucket_{tn}_{cn}",
-                        f"hash_lookup_{tn}_{cn}",
-                        f"hash_exists_{tn}_{cn}",
-                        f"hash_insert_{tn}_{cn}",
+                        f"table_get_{self._column_function(tn, cn)}",
+                        f"table_set_{self._column_function(tn, cn)}",
+                        f"hash_bucket_{self._column_function(tn, cn)}",
+                        f"hash_lookup_{self._column_function(tn, cn)}",
+                        f"hash_exists_{self._column_function(tn, cn)}",
+                        f"hash_insert_{self._column_function(tn, cn)}",
                     }
                 )
         self.transition_functions = self._name_map(
@@ -527,7 +532,9 @@ class RustGenerator:
             if list(bases.values()).count(bases[name]) == 1:
                 result[name] = bases[name]
             else:
-                candidate = prefix + "_" + name
+                candidate = (
+                    prefix + "_" + (name if isinstance(name, str) else bases[name])
+                )
                 while candidate in used:
                     candidate += "_"
                 result[name] = candidate
@@ -536,6 +543,9 @@ class RustGenerator:
 
     def _field(self, table):
         return self.table_fields[table]
+
+    def _column_function(self, table, column):
+        return self.column_functions[(table, column)]
 
     @staticmethod
     def _base_variant(name):
@@ -746,10 +756,10 @@ fn mix64(z:u64)->u64{let z=z^(z>>30);let z=z.wrapping_mul(0xBF58476D1CE4E5B9);le
             for cn, ci in ti.columns.items():
                 rt = _rust_type(ci.type)
                 self.line(
-                    f"fn table_get_{tn}_{cn}(t:&Table_{tn},key:u64)->Result<{rt},ErrorCode>{{if !table_exists_{tn}(t,key){{return Err(ErrorCode::MissingRow);}}Ok(t.col_{cn}[(key&{cap - 1}) as usize])}}"
+                    f"fn table_get_{self._column_function(tn, cn)}(t:&Table_{tn},key:u64)->Result<{rt},ErrorCode>{{if !table_exists_{tn}(t,key){{return Err(ErrorCode::MissingRow);}}Ok(t.col_{cn}[(key&{cap - 1}) as usize])}}"
                 )
                 self.line(
-                    f"fn table_set_{tn}_{cn}(t:&mut Table_{tn},key:u64,value:{rt})->Result<(),ErrorCode>{{if !table_exists_{tn}(t,key){{return Err(ErrorCode::MissingRow);}}let slot=(key&{cap - 1}) as usize;let old=t.col_{cn}[slot];"
+                    f"fn table_set_{self._column_function(tn, cn)}(t:&mut Table_{tn},key:u64,value:{rt})->Result<(),ErrorCode>{{if !table_exists_{tn}(t,key){{return Err(ErrorCode::MissingRow);}}let slot=(key&{cap - 1}) as usize;let old=t.col_{cn}[slot];"
                 )
                 if ci.tracked_sum:
                     self.line(
@@ -759,7 +769,7 @@ fn mix64(z:u64)->u64{let z=z^(z>>30);let z=z.wrapping_mul(0xBF58476D1CE4E5B9);le
                 if ci.unique:
                     self._emit_hash(tn, cn, ci)
             fields = ", ".join(
-                f"{_ident(cn)}:{_rust_type(ci.type)}" for cn, ci in ti.columns.items()
+                f"field_{cn}:{_rust_type(ci.type)}" for cn, ci in ti.columns.items()
             )
             self.line(
                 f"fn table_alloc_{tn}(t:&mut Table_{tn}{', ' + fields if fields else ''})->Result<u64,ErrorCode>{{"
@@ -773,15 +783,17 @@ fn mix64(z:u64)->u64{let z=z^(z>>30);let z=z.wrapping_mul(0xBF58476D1CE4E5B9);le
             for cn, ci in ti.columns.items():
                 if ci.tracked_sum:
                     self.line(
-                        f"    t.agg_sum_{cn}=t.agg_sum_{cn}.checked_add({self._agg_cast(_ident(cn), ci.type)}).ok_or(ErrorCode::ArithOverflow)?;"
+                        f"    t.agg_sum_{cn}=t.agg_sum_{cn}.checked_add({self._agg_cast('field_' + cn, ci.type)}).ok_or(ErrorCode::ArithOverflow)?;"
                     )
-                self.line(f"    t.col_{cn}[slot]={_ident(cn)};")
+                self.line(f"    t.col_{cn}[slot]=field_{cn};")
             self.line(
                 "    t.generation[slot]=gen+1;t.occupied_bitmap[slot/64]|=1u64<<(slot%64);"
             )
             for cn, ci in ti.columns.items():
                 if ci.unique:
-                    self.line(f"    hash_insert_{tn}_{cn}(t,&{_ident(cn)},slot)?;")
+                    self.line(
+                        f"    hash_insert_{self._column_function(tn, cn)}(t,&field_{cn},slot)?;"
+                    )
             self.line(f"    Ok((((gen+1) as u64)<<{kb})|slot as u64)}}")
 
     def _emit_hash(self, tn, cn, ci):
@@ -793,25 +805,25 @@ fn mix64(z:u64)->u64{let z=z^(z>>30);let z=z.wrapping_mul(0xBF58476D1CE4E5B9);le
         else:
             hash_expr = "*value as u64"
         self.line(
-            f"fn hash_bucket_{tn}_{cn}(value:&{rt})->usize{{(mix64({hash_expr})&{B - 1}) as usize}}"
+            f"fn hash_bucket_{self._column_function(tn, cn)}(value:&{rt})->usize{{(mix64({hash_expr})&{B - 1}) as usize}}"
         )
         self.line(
-            f"fn hash_lookup_{tn}_{cn}(t:&Table_{tn},value:&{rt})->Option<usize>{{let mut pos=hash_bucket_{tn}_{cn}(value);for _ in 0..{MAX_PROBES}{{if (t.hash_{cn}_used[pos/64]>>(pos%64))&1==0{{return None;}}let slot=t.hash_{cn}_key[pos] as usize;if slot<{ti.layout.capacity}&&(t.occupied_bitmap[slot/64]>>(slot%64))&1==1&&t.col_{cn}[slot]==*value{{return Some(slot);}}pos=(pos+1)&{B - 1};}}None}}"
+            f"fn hash_lookup_{self._column_function(tn, cn)}(t:&Table_{tn},value:&{rt})->Option<usize>{{let mut pos=hash_bucket_{self._column_function(tn, cn)}(value);for _ in 0..{MAX_PROBES}{{if (t.hash_{cn}_used[pos/64]>>(pos%64))&1==0{{return None;}}let slot=t.hash_{cn}_key[pos] as usize;if slot<{ti.layout.capacity}&&(t.occupied_bitmap[slot/64]>>(slot%64))&1==1&&t.col_{cn}[slot]==*value{{return Some(slot);}}pos=(pos+1)&{B - 1};}}None}}"
         )
         self.line(
-            f"fn hash_exists_{tn}_{cn}(t:&Table_{tn},value:&{rt})->bool{{hash_lookup_{tn}_{cn}(t,value).is_some()}}"
+            f"fn hash_exists_{self._column_function(tn, cn)}(t:&Table_{tn},value:&{rt})->bool{{hash_lookup_{self._column_function(tn, cn)}(t,value).is_some()}}"
         )
         self.line(
-            f"fn hash_insert_{tn}_{cn}(t:&mut Table_{tn},value:&{rt},slot:usize)->Result<(),ErrorCode>{{"
+            f"fn hash_insert_{self._column_function(tn, cn)}(t:&mut Table_{tn},value:&{rt},slot:usize)->Result<(),ErrorCode>{{"
         )
         self.line(
-            f"    if hash_exists_{tn}_{cn}(t,value){{return Err(ErrorCode::DuplicateKey);}}let mut incoming=slot;let mut pos=hash_bucket_{tn}_{cn}(value);let mut distance=0usize;"
+            f"    if hash_exists_{self._column_function(tn, cn)}(t,value){{return Err(ErrorCode::DuplicateKey);}}let mut incoming=slot;let mut pos=hash_bucket_{self._column_function(tn, cn)}(value);let mut distance=0usize;"
         )
         self.line(
             f"    for _ in 0..{MAX_PROBES}{{if (t.hash_{cn}_used[pos/64]>>(pos%64))&1==0{{t.hash_{cn}_used[pos/64]|=1u64<<(pos%64);t.hash_{cn}_key[pos]=incoming as u64;return Ok(());}}"
         )
         self.line(
-            f"        let resident=t.hash_{cn}_key[pos] as usize;let home=hash_bucket_{tn}_{cn}(&t.col_{cn}[resident]);let resident_distance=(pos+{B}-home)&{B - 1};if resident_distance<distance{{t.hash_{cn}_key[pos]=incoming as u64;incoming=resident;distance=resident_distance;}}pos=(pos+1)&{B - 1};distance+=1;}}Err(ErrorCode::IndexSaturated)}}"
+            f"        let resident=t.hash_{cn}_key[pos] as usize;let home=hash_bucket_{self._column_function(tn, cn)}(&t.col_{cn}[resident]);let resident_distance=(pos+{B}-home)&{B - 1};if resident_distance<distance{{t.hash_{cn}_key[pos]=incoming as u64;incoming=resident;distance=resident_distance;}}pos=(pos+1)&{B - 1};distance+=1;}}Err(ErrorCode::IndexSaturated)}}"
         )
 
     def _emit_state(self):
@@ -878,7 +890,7 @@ fn mix64(z:u64)->u64{let z=z^(z>>30);let z=z.wrapping_mul(0xBF58476D1CE4E5B9);le
             key = self._expr(stmt.key, env, state)
             kt, vt = self._fresh("key"), self._fresh("value")
             self.line(
-                f"    let {kt}={key};let {vt}={value};table_set_{stmt.table}_{stmt.column}(&mut state.{self._field(stmt.table)},{kt},{vt})?;"
+                f"    let {kt}={key};let {vt}={value};table_set_{self._column_function(stmt.table, stmt.column)}(&mut state.{self._field(stmt.table)},{kt},{vt})?;"
             )
         elif isinstance(stmt, A.TableAlloc):
             ti = self.prog.tables[stmt.table]
@@ -1009,7 +1021,7 @@ fn mix64(z:u64)->u64{let z=z^(z>>30);let z=z.wrapping_mul(0xBF58476D1CE4E5B9);le
             if isinstance(expr, A.TableAccess):
                 cap = self.prog.tables[expr.table].layout.capacity
                 return f"{{let {temp}={key};{current}.{self._field(expr.table)}.col_{expr.column}[({temp}&{cap - 1}) as usize]}}"
-            return f"{{let {temp}={key};table_get_{expr.table}_{expr.column}(&{current}.{self._field(expr.table)},{temp})?}}"
+            return f"{{let {temp}={key};table_get_{self._column_function(expr.table, expr.column)}(&{current}.{self._field(expr.table)},{temp})?}}"
         if isinstance(expr, A.TableExists):
             temp = self._fresh("exists_key")
             return f"{{let {temp}={self._expr(expr.key, env, state)};table_exists_{expr.table}(&{current}.{self._field(expr.table)},{temp})}}"
@@ -1017,7 +1029,7 @@ fn mix64(z:u64)->u64{let z=z^(z>>30);let z=z.wrapping_mul(0xBF58476D1CE4E5B9);le
             ct = self.prog.tables[expr.table].columns[expr.key_column].type
             k = self._expr(expr.key, env, state, ct)
             temp = self._fresh("unique_value")
-            lookup = f"hash_lookup_{expr.table}_{expr.key_column}(&{current}.{self._field(expr.table)},&{temp})"
+            lookup = f"hash_lookup_{self._column_function(expr.table, expr.key_column)}(&{current}.{self._field(expr.table)},&{temp})"
             if isinstance(expr, A.TableExistsUnique):
                 return f"{{let {temp}:{_rust_type(ct)}={k};{lookup}.is_some()}}"
             kb = self.prog.tables[expr.table].layout.key_bits
@@ -1545,7 +1557,7 @@ pub fn run_batch(state:&mut State,intents:&[Params])->Vec<Result<(),ErrorCode>>{
                     )
                 if ci.unique:
                     self.line(
-                        f"let mut check={obj}.clone();check.hash_{cn}_key.fill(0);check.hash_{cn}_used.fill(0);for i in 0..{ti.layout.capacity}{{if (check.occupied_bitmap[i/64]>>(i%64))&1==1{{let value=check.col_{cn}[i];hash_insert_{tn}_{cn}(&mut check,&value,i).map_err(|_|ErrorCode::InvalidEncoding)?;}}}}if check.hash_{cn}_key!={obj}.hash_{cn}_key||check.hash_{cn}_used!={obj}.hash_{cn}_used{{return Err(ErrorCode::InvalidEncoding);}}"
+                        f"let mut check={obj}.clone();check.hash_{cn}_key.fill(0);check.hash_{cn}_used.fill(0);for i in 0..{ti.layout.capacity}{{if (check.occupied_bitmap[i/64]>>(i%64))&1==1{{let value=check.col_{cn}[i];hash_insert_{self._column_function(tn, cn)}(&mut check,&value,i).map_err(|_|ErrorCode::InvalidEncoding)?;}}}}if check.hash_{cn}_key!={obj}.hash_{cn}_key||check.hash_{cn}_used!={obj}.hash_{cn}_used{{return Err(ErrorCode::InvalidEncoding);}}"
                     )
         for inv in self.prog.invariants.values():
             if inv.quant_table is None:

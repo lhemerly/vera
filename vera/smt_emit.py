@@ -1,4 +1,4 @@
-"""Target 1: AST -> SMT-LIB 2.6 (QF_ABV) symbolic verification engine.
+"""Target 1: AST -> SMT-LIB 2.6 (QF_AUFBV) symbolic verification engine.
 
 Implements the Section 6 translation:
   * table columns as functional SMT state (uninterpreted slot functions),
@@ -187,6 +187,15 @@ class SmtEncoder:
         self.const_kinds: Dict[str, Tuple] = {}
         self._declared: Set[str] = set()
         self._version: Dict[str, int] = {}
+        # Source names are separate namespaces. Concatenating them would alias
+        # A.b_c with A_b.c, or a column named "occ" with the occupancy array.
+        # Stable ordinal bases keep all state symbols independent of spelling.
+        self._table_symbols = {name: f"t{i}" for i, name in enumerate(prog.tables)}
+        self._column_symbols = {
+            (name, column): f"{self._table_symbols[name]}_c{i}"
+            for name, info in prog.tables.items()
+            for i, column in enumerate(info.columns)
+        }
 
         # pre-state function names
         self.pre_occ: Dict[str, str] = {}
@@ -222,6 +231,7 @@ class SmtEncoder:
         self.alloc_records: Dict[str, List[Tuple[str, str]]] = {}
         self.known_unique = {}
         self.lookup_results = {}
+        self._hash_lookups: Dict[Tuple[str, ...], Tuple[str, str]] = {}
         self.final_values: Dict[Tuple[str, str], Dict[str, str]] = {}
         self.slot_pre_value: Dict[Tuple[str, str], Dict[str, str]] = {}
 
@@ -250,6 +260,12 @@ class SmtEncoder:
         self.precondition = "true"
 
     # --- SMT-LIB primitives -------------------------------------------------
+    def _table_symbol(self, table: str) -> str:
+        return self._table_symbols[table]
+
+    def _column_symbol(self, table: str, column: str) -> str:
+        return self._column_symbols[(table, column)]
+
     def declare(self, name: str, decl: str, kind: Tuple) -> str:
         if name in self._declared:
             return name
@@ -381,13 +397,13 @@ class SmtEncoder:
             cap = tinfo.layout.capacity
             sbits = self.table_slot_bits[tname]
             gen_bits = min(64 - tinfo.layout.key_bits, 32)
-            occ = f"{tname}_occ"
+            occ = f"{self._table_symbol(tname)}_occ"
             self.declare(
                 occ,
                 f"(declare-const {occ} (Array (_ BitVec {sbits}) Bool))",
                 ("array", sbits, "bool"),
             )
-            gen = f"{tname}_gen"
+            gen = f"{self._table_symbol(tname)}_gen"
             self.declare(
                 gen,
                 f"(declare-fun {gen} ((_ BitVec {sbits})) (_ BitVec {gen_bits}))",
@@ -398,7 +414,7 @@ class SmtEncoder:
             self.pre_gen[tname] = gen
             self.pre_col[tname] = {}
             for cname, cinfo in tinfo.columns.items():
-                col = f"{tname}_{cname}"
+                col = self._column_symbol(tname, cname)
                 self.declare(
                     col,
                     f"(declare-fun {col} ((_ BitVec {sbits})) {self._sort_of(cinfo.type)})",
@@ -408,13 +424,13 @@ class SmtEncoder:
                 n_writes = max(1, self.tr.wcet_bound)
                 ib = max(1, n_writes.bit_length())
                 self.idx_bits[(tname, cname)] = ib
-                widx = f"{tname}_{cname}_widx"
+                widx = f"{self._column_symbol(tname, cname)}_widx"
                 self.declare(
                     widx,
                     f"(declare-const {widx} (Array (_ BitVec {sbits}) (_ BitVec {ib})))",
                     ("array", sbits, ib),
                 )
-                wval = f"{tname}_{cname}_wval"
+                wval = f"{self._column_symbol(tname, cname)}_wval"
                 self.declare(
                     wval,
                     f"(declare-const {wval} (Array (_ BitVec {ib}) {self._sort_of(cinfo.type)}))",
@@ -437,13 +453,13 @@ class SmtEncoder:
                 if cinfo.unique:
                     B = tinfo.layout.unique_hashes[cname]
                     bb = max(1, B.bit_length() - 1)
-                    hkey = f"{tname}_{cname}_hkey"
+                    hkey = f"{self._column_symbol(tname, cname)}_hkey"
                     self.declare(
                         hkey,
                         f"(declare-const {hkey} (Array (_ BitVec {bb}) (_ BitVec {sbits})))",
                         ("array", bb, sbits),
                     )
-                    hused = f"{tname}_{cname}_hused"
+                    hused = f"{self._column_symbol(tname, cname)}_hused"
                     self.declare(
                         hused,
                         f"(declare-const {hused} (Array (_ BitVec {bb}) Bool))",
@@ -465,8 +481,8 @@ class SmtEncoder:
                     self.agg_wide[(tname, cname)] = wide_w
                     self.agg_signed[(tname, cname)] = ctype.is_signed
                     agg = self._fresh(
-                        f"{tname}_{cname}_agg",
-                        f"(declare-const {tname}_{cname}_agg_0 (_ BitVec {wide_w}))",
+                        f"{self._column_symbol(tname, cname)}_agg",
+                        f"(declare-const {self._column_symbol(tname, cname)}_agg_0 (_ BitVec {wide_w}))",
                         ("bv", wide_w),
                     )
                     self.pre_agg[tname][cname] = agg
@@ -476,13 +492,13 @@ class SmtEncoder:
                     self.frame_ok[(tname, cname)] = use_frame
                     if use_frame:
                         rest = self._fresh(
-                            f"{tname}_{cname}_rest",
-                            f"(declare-const {tname}_{cname}_rest_0 (_ BitVec {wide_w}))",
+                            f"{self._column_symbol(tname, cname)}_rest",
+                            f"(declare-const {self._column_symbol(tname, cname)}_rest_0 (_ BitVec {wide_w}))",
                             ("bv", wide_w),
                         )
                         nrest = self._fresh(
-                            f"{tname}_{cname}_nrest",
-                            f"(declare-const {tname}_{cname}_nrest_0 (_ BitVec {n_bits}))",
+                            f"{self._column_symbol(tname, cname)}_nrest",
+                            f"(declare-const {self._column_symbol(tname, cname)}_nrest_0 (_ BitVec {n_bits}))",
                             ("bv", n_bits),
                         )
                         self.frame_rest[(tname, cname)] = rest
@@ -544,26 +560,32 @@ class SmtEncoder:
         )
 
     def _const_eval(self, expr: A.Expr):
-        if (
-            isinstance(expr, A.Literal)
-            and isinstance(expr.value, int)
-            and not isinstance(expr.value, bool)
-        ):
-            return expr.value
-        if isinstance(expr, A.Binary):
-            a = self._const_eval(expr.left)
-            b = self._const_eval(expr.right)
-            if a is None or b is None:
-                return None
-            if expr.op == "add":
-                return a + b
-            if expr.op == "sub":
-                return a - b
-            if expr.op == "mul":
-                return a * b
-            if expr.op == "div" and b != 0:
-                return a // b
-        return None
+        """Use the language's checked, typed arithmetic for interval bounds.
+
+        Host integer arithmetic is not interchangeable here: signed division
+        truncates toward zero and decimal operations preserve their scale.
+        An incorrect bound can exclude valid states from a universal proof.
+        """
+        from .runtime import Revert, State, Transaction
+
+        def constant(node):
+            if isinstance(node, A.Literal):
+                return True
+            if isinstance(node, A.Unary):
+                return constant(node.operand)
+            if isinstance(node, A.Binary):
+                return constant(node.left) and constant(node.right)
+            if isinstance(node, A.Select):
+                return constant(node.cond) and constant(node.a) and constant(node.b)
+            return False
+
+        if not constant(expr):
+            return None
+        try:
+            value = Transaction(self.prog, State(), "_constant", {}).value_of(expr)
+        except Revert:
+            return None
+        return value if type(value) is int else None
 
     def _tighten(
         self, expr: A.Expr, qvar: str, tname: str, cname: str, bounds: List[int]
@@ -848,7 +870,7 @@ class SmtEncoder:
         ib = self.idx_bits[(table, cname)]
         idx = self.write_counter.get((table, cname), 0) + 1
         self.write_counter[(table, cname)] = idx
-        base = f"{table}_{cname}_widx"
+        base = f"{self._column_symbol(table, cname)}_widx"
         new_widx = self._fresh(
             base,
             f"(declare-const {base}_{self._version.get(base, 0)} (Array (_ BitVec {self.table_slot_bits[table]}) (_ BitVec {ib})))",
@@ -858,7 +880,7 @@ class SmtEncoder:
             f"(= {new_widx} {self._store_arr(self.cur_widx[(table, cname)], slot, self._bv(idx, ib))})"
         )
         self.cur_widx[(table, cname)] = new_widx
-        base = f"{table}_{cname}_wval"
+        base = f"{self._column_symbol(table, cname)}_wval"
         new_wval = self._fresh(
             base,
             f"(declare-const {base}_{self._version.get(base, 0)} (Array (_ BitVec {ib}) {self._sort_of(self.prog.tables[table].columns[cname].type)}))",
@@ -951,6 +973,21 @@ class SmtEncoder:
         h = self._bucket_smt(ctype, value_expr, B)
         hused = (self.pre_hused if state == "pre" else self.cur_hused)[(tname, cname)]
         hkey = (self.pre_hkey if state == "pre" else self.cur_hkey)[(tname, cname)]
+        occ = (self.pre_occ if state == "pre" else self.cur_occ)[tname]
+        # A lookup is pure in the index, occupancy and unique-column versions.
+        # Reusing its result lets an existence guard and the subsequent read
+        # share a proof, rather than forcing the solver to equate independent
+        # probe chains containing nonlinear 64-bit hash arithmetic. Include column
+        # writes as well as index arrays: the frame encoding abstracts insertion
+        # without updating the concrete index arrays.
+        version = (
+            (self.pre_col[tname][cname],)
+            if state == "pre"
+            else (self.cur_widx[(tname, cname)], self.cur_wval[(tname, cname)])
+        )
+        cache_key = (tname, cname, value_expr, hused, hkey, occ, *version)
+        if cache_key in self._hash_lookups:
+            return self._hash_lookups[cache_key]
         result, found, active = self._bv(0, sbits), "false", "true"
         for i in range(MAX_PROBES):
             pos = f"(bvadd {h} {self._bv(i, bb)})"
@@ -966,19 +1003,19 @@ class SmtEncoder:
             reachable = self._and(active, used, f"(bvuge {distance} {self._bv(i, bb)})")
             take = self._and(reachable, f"(= {val} {value_expr})")
             result = self._bind(
-                f"{tname}_{cname}_lookup_slot",
+                f"{self._column_symbol(tname, cname)}_lookup_slot",
                 self._ite(take, slot, result),
                 f"(_ BitVec {sbits})",
                 ("bv", sbits),
             )
             found = self._bind(
-                f"{tname}_{cname}_lookup_found",
+                f"{self._column_symbol(tname, cname)}_lookup_found",
                 self._or(found, take),
                 "Bool",
                 ("bool",),
             )
             active = self._bind(
-                f"{tname}_{cname}_lookup_active",
+                f"{self._column_symbol(tname, cname)}_lookup_active",
                 self._and(reachable, self._not(take)),
                 "Bool",
                 ("bool",),
@@ -987,6 +1024,17 @@ class SmtEncoder:
             take = self._and(guard, f"(= {value} {value_expr})")
             result = self._ite(take, slot, result)
             found = self._or(found, take)
+        # The reference lookup returns a handle only for an occupied row.
+        # Keep this check in the returned predicate, so a guarded table_get
+        # does not have to rediscover row liveness through every hash probe.
+        occupied = self._select_arr(occ, result)
+        found = self._bind(
+            f"{self._column_symbol(tname, cname)}_lookup_live",
+            self._and(found, occupied),
+            "Bool",
+            ("bool",),
+        )
+        self._hash_lookups[cache_key] = result, found
         return result, found
 
     def _hash_insert_smt(
@@ -997,7 +1045,12 @@ class SmtEncoder:
             (value_expr, slot_expr, self.active)
         )
         if not self.config.exact_sum:
-            outcome = self._bind(f"{tname}_{cname}_index_ok", "true", "Bool", ("bool",))
+            outcome = self._bind(
+                f"{self._column_symbol(tname, cname)}_index_ok",
+                "true",
+                "Bool",
+                ("bool",),
+            )
             # Successful index insertion preserves logical lookup.  Resource
             # saturation and duplicate keys are handled reverts; allowing a
             # commit here only enlarges the safety/panic search space.
@@ -1021,7 +1074,7 @@ class SmtEncoder:
             incoming_value = self._current_col_slot(tname, cname, incoming, ctype)
             resident_home = self._bucket_smt(ctype, resident_value, B)
             resident_dist = self._bind(
-                f"{tname}_{cname}_resident_dist",
+                f"{self._column_symbol(tname, cname)}_resident_dist",
                 f"(bvsub {pos} {resident_home})",
                 bsort,
                 ("bv", bb),
@@ -1033,48 +1086,51 @@ class SmtEncoder:
             )
             put = self._or(free, swap)
             duplicate = self._bind(
-                f"{tname}_{cname}_duplicate",
+                f"{self._column_symbol(tname, cname)}_duplicate",
                 self._or(duplicate, match),
                 "Bool",
                 ("bool",),
             )
             placed = self._bind(
-                f"{tname}_{cname}_placed", self._or(placed, free), "Bool", ("bool",)
+                f"{self._column_symbol(tname, cname)}_placed",
+                self._or(placed, free),
+                "Bool",
+                ("bool",),
             )
             next_key = self._ite(put, self._store_arr(hkey, pos, incoming), hkey)
             hkey = self._bind(
-                f"{tname}_{cname}_hkey",
+                f"{self._column_symbol(tname, cname)}_hkey",
                 next_key,
                 f"(Array {bsort} {ssort})",
                 ("array", bb, sbits),
             )
             next_used = self._ite(free, self._store_arr(hused, pos, "true"), hused)
             hused = self._bind(
-                f"{tname}_{cname}_hused",
+                f"{self._column_symbol(tname, cname)}_hused",
                 next_used,
                 f"(Array {bsort} Bool)",
                 ("array", bb, "bool"),
             )
             incoming = self._bind(
-                f"{tname}_{cname}_incoming",
+                f"{self._column_symbol(tname, cname)}_incoming",
                 self._ite(swap, resident, incoming),
                 ssort,
                 ("bv", sbits),
             )
             distance = self._bind(
-                f"{tname}_{cname}_distance",
+                f"{self._column_symbol(tname, cname)}_distance",
                 f"(bvadd {self._ite(swap, resident_dist, distance)} {self._bv(1, bb)})",
                 bsort,
                 ("bv", bb),
             )
             pos = self._bind(
-                f"{tname}_{cname}_position",
+                f"{self._column_symbol(tname, cname)}_position",
                 f"(bvadd {pos} {self._bv(1, bb)})",
                 bsort,
                 ("bv", bb),
             )
             active = self._bind(
-                f"{tname}_{cname}_insert_active",
+                f"{self._column_symbol(tname, cname)}_insert_active",
                 self._and(active, used, self._not(match)),
                 "Bool",
                 ("bool",),
@@ -1548,8 +1604,8 @@ class SmtEncoder:
         self._trap_update(self._not(in_range))
         self._pi_update(in_range)
         new_agg = self._fresh(
-            f"{tname}_{cname}_agg",
-            f"(declare-const {tname}_{cname}_agg_{self._version[f'{tname}_{cname}_agg']} (_ BitVec {wide_w}))",
+            f"{self._column_symbol(tname, cname)}_agg",
+            f"(declare-const {self._column_symbol(tname, cname)}_agg_{self._version[f'{self._column_symbol(tname, cname)}_agg']} (_ BitVec {wide_w}))",
             ("bv", wide_w),
         )
         self.assert_common(f"(= {new_agg} {new_val})")
@@ -1612,7 +1668,7 @@ class SmtEncoder:
         self.alloc_records.setdefault(tname, []).append((slot, stored_gen))
         self.modified_slots[tname].append(slot)
         # occupancy array: mark the allocated slot live
-        base = f"{tname}_occ"
+        base = f"{self._table_symbol(tname)}_occ"
         new_occ_arr = self._fresh(
             base,
             f"(declare-const {base}_{self._version.get(base, 0)} (Array (_ BitVec {sbits}) Bool))",
@@ -1666,8 +1722,8 @@ class SmtEncoder:
             self._trap_update(self._and(active, self._not(in_range)))
             self._pi_update(f"(=> {active} {in_range})")
         new_agg = self._fresh(
-            f"{tname}_{cname}_agg",
-            f"(declare-const {tname}_{cname}_agg_{self._version[f'{tname}_{cname}_agg']} (_ BitVec {wide_w}))",
+            f"{self._column_symbol(tname, cname)}_agg",
+            f"(declare-const {self._column_symbol(tname, cname)}_agg_{self._version[f'{self._column_symbol(tname, cname)}_agg']} (_ BitVec {wide_w}))",
             ("bv", wide_w),
         )
         self.assert_common(f"(= {new_agg} {new_val})")
@@ -1691,7 +1747,7 @@ class SmtEncoder:
         tinfo = self.prog.tables[table]
         cap = tinfo.layout.capacity
         sbits = self.table_slot_bits[table]
-        base = f"{table}_alloc_slot"
+        base = f"{self._table_symbol(table)}_alloc_slot"
         name = self._fresh(
             base,
             f"(declare-const {base}_{self._version.get(base, 0)} (_ BitVec {sbits}))",
@@ -1713,8 +1769,8 @@ class SmtEncoder:
 
     def _symbolic_free_slot(self, table: str, cap: int, sbits: int) -> str:
         name = self._fresh(
-            f"{table}_alloc_slot",
-            f"(declare-const {table}_alloc_slot_{self._version[f'{table}_alloc_slot']} (_ BitVec {sbits}))",
+            f"{self._table_symbol(table)}_alloc_slot",
+            f"(declare-const {self._table_symbol(table)}_alloc_slot_{self._version[f'{self._table_symbol(table)}_alloc_slot']} (_ BitVec {sbits}))",
             ("bv", sbits),
         )
         self.assert_common(self._not(self._current_occ(table, name)))
@@ -1838,8 +1894,8 @@ class SmtEncoder:
                 self._trap_update(self._not(in_range))
                 self._pi_update(in_range)
                 new_agg = self._fresh(
-                    f"{tname}_{stmt.column}_agg",
-                    f"(declare-const {tname}_{stmt.column}_agg_{self._version[f'{tname}_{stmt.column}_agg']} (_ BitVec {wide_w}))",
+                    f"{self._column_symbol(tname, stmt.column)}_agg",
+                    f"(declare-const {self._column_symbol(tname, stmt.column)}_agg_{self._version[f'{self._column_symbol(tname, stmt.column)}_agg']} (_ BitVec {wide_w}))",
                     ("bv", wide_w),
                 )
                 self.assert_common(f"(= {new_agg} {new_val})")
@@ -2409,7 +2465,7 @@ class SmtEncoder:
 
     # --- script ------------------------------------------------------------
     def script_for(self, obligation: Optional[str] = None) -> str:
-        lines = ["(set-logic QF_ABV)"]
+        lines = ["(set-logic QF_AUFBV)"]
         lines.extend(self.decls)
         lines.extend(self.common_asserts)
         if obligation is None:
@@ -2420,7 +2476,7 @@ class SmtEncoder:
         return "\n".join(lines) + "\n"
 
     def script_full(self) -> str:
-        lines = ["(set-logic QF_ABV)"]
+        lines = ["(set-logic QF_AUFBV)"]
         lines.extend(self.decls)
         lines.extend(self.common_asserts)
         for name, label in (
@@ -2491,9 +2547,9 @@ class SmtEncoder:
 
         for name, ctype in self.tr.param_types.items():
             const = (
-                z3.Bool(f"p_{name}")
+                z3.Bool(self.params[name])
                 if ctype.is_bool
-                else z3.BitVec(f"p_{name}", ctype.width)
+                else z3.BitVec(self.params[name], ctype.width)
             )
             value = read(const)
             fixed.append(const == value)

@@ -2,25 +2,43 @@
 
 Reviewed baseline: `84badd1ed1372484f995586c71529320305b82d1`.
 
-The final validation groups cover **153 Python/backend test cases** and **5
-Rust unit tests**. Toolchain checks used Python 3.14, Z3 5.4.1, Rust/Cargo,
-glslangValidator, GCC/C++, and wgpu with Mesa llvmpipe.
+The validation groups cover **173 Python/backend test cases** and **5
+Rust unit tests**. The PR follow-up used Python 3.12.14, Z3 5.4.1, Rust 1.89.0,
+glslangValidator, GCC/C++, and wgpu with Mesa llvmpipe. CI runs Python 3.11–3.14.
 
 | Check | Result |
 |---|---|
-| `python -m pytest tests -q -ra --ignore=tests/test_gpu_backend.py` | 150 passed |
-| Three GLSL backend tests (`tests/test_gpu_backend.py`) | 3 passed, including actual correct/broken furnace execution |
+| `python -m pytest tests -q -ra` | 173 passed, including actual GLSL/WGSL execution and CUDA C++ host-mode checks |
 | `cargo test --manifest-path rust/vera-rt/Cargo.toml --locked` | 4 library tests + 1 dispatcher stress test passed |
 | Ruff formatting and fatal-error checks; `git diff --check` | Passed |
 | `python -m build --no-isolation` | Wheel and source distribution built |
 | Fresh wheel extraction/import | Proved a program, emitted all four targets, compiled/executed Rust, and round-tripped a snapshot |
-| Exported SMT-LIB execution through Z3 | `unsat`, `unsat`, `sat` for the counter's three obligations |
+| Exported SMT-LIB execution through Z3 | `unsat`, `unsat`, `sat`; exports declare `QF_AUFBV` to admit slot functions |
 
 Actual WGSL kernels and GLSL furnaces executed on the software OpenGL adapter.
 CUDA's shared arithmetic and transaction implementation compiled and executed in
 portable C++ host mode. Native NVIDIA CUDA compilation/device execution was not
 available. The kernel denied io_uring setup, so persistence ran end to end using
 the positional-write fallback; the io_uring path was compiled and reviewed.
+
+## PR follow-up regressions
+
+The original `test_unique_key_verifies` timeout was reproduced: the lookup's
+trap-freedom query returned `unknown` after the configured 10-second solver
+budget. Identical secondary lookups now share results for the same index,
+occupancy and column versions, and retain the reference runtime's occupied-row
+check. Eight consecutive reruns discharged the query in roughly 0.4–0.6 seconds
+including parsing. The timeout and fail-closed verdicts remain unchanged.
+
+Twenty additional cases cover guarded lookups for six key types, distinct and
+missing keys, allocation after a miss, independent SMT state symbols, typed
+constant bounds, and generated Rust naming. The naming and constant-bound
+regressions reproduced false `VERIFIED` verdicts before their fixes; their exact
+counterexamples now replay through the interpreter. Internal Rust accessors and
+allocation parameters also avoid collisions between table/column pairs and
+runtime variables. The script-emission test executes all three exported queries
+through the solver's strict SMT-LIB entry point instead of matching an internal
+symbol spelling.
 
 ## Behavioral regression coverage
 

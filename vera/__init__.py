@@ -9,7 +9,7 @@ Sub-packages / modules:
     lexer       -- tokenizer
     parser      -- recursive-descent parser
     semantic    -- symbol tables, type checking, access sets, WCET
-    smt_emit    -- AST -> SMT-LIB 2.6 (QF_ABV) lowering
+    smt_emit    -- AST -> SMT-LIB 2.6 (QF_AUFBV) lowering
     verifier    -- three-proof-obligation driver + counterexample lifting
     runtime     -- reference SoA execution engine
     projection  -- State & Affordance Frame construction

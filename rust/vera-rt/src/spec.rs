@@ -451,12 +451,12 @@ fn table_set_Account_balance(t:&mut Table_Account,key:u64,value:i64)->Result<(),
 fn table_get_Account_frozen(t:&Table_Account,key:u64)->Result<bool,ErrorCode>{if !table_exists_Account(t,key){return Err(ErrorCode::MissingRow);}Ok(t.col_frozen[(key&31) as usize])}
 fn table_set_Account_frozen(t:&mut Table_Account,key:u64,value:bool)->Result<(),ErrorCode>{if !table_exists_Account(t,key){return Err(ErrorCode::MissingRow);}let slot=(key&31) as usize;let old=t.col_frozen[slot];
     t.col_frozen[slot]=value;Ok(())}
-fn table_alloc_Account(t:&mut Table_Account, balance:i64, frozen:bool)->Result<u64,ErrorCode>{
+fn table_alloc_Account(t:&mut Table_Account, field_balance:i64, field_frozen:bool)->Result<u64,ErrorCode>{
     let slot=(0..32).find(|&i|(t.occupied_bitmap[i/64]>>(i%64))&1==0).ok_or(ErrorCode::TableFull)?;
     let gen=t.generation[slot];if gen>=4294967295u32{return Err(ErrorCode::GenerationExhausted);}
-    t.agg_sum_balance=t.agg_sum_balance.checked_add((balance as i128)).ok_or(ErrorCode::ArithOverflow)?;
-    t.col_balance[slot]=balance;
-    t.col_frozen[slot]=frozen;
+    t.agg_sum_balance=t.agg_sum_balance.checked_add((field_balance as i128)).ok_or(ErrorCode::ArithOverflow)?;
+    t.col_balance[slot]=field_balance;
+    t.col_frozen[slot]=field_frozen;
     t.generation[slot]=gen+1;t.occupied_bitmap[slot/64]|=1u64<<(slot%64);
     Ok((((gen+1) as u64)<<5)|slot as u64)}
 fn table_exists_Order(t:&Table_Order,key:u64)->bool {let slot=(key&7) as usize; key>>35==0 && (t.occupied_bitmap[slot/64]>>(slot%64))&1==1 && t.generation[slot]==(key>>3) as u32}
@@ -469,12 +469,12 @@ fn table_set_Order_amount(t:&mut Table_Order,key:u64,value:i64)->Result<(),Error
 fn table_get_Order_state(t:&Table_Order,key:u64)->Result<u8,ErrorCode>{if !table_exists_Order(t,key){return Err(ErrorCode::MissingRow);}Ok(t.col_state[(key&7) as usize])}
 fn table_set_Order_state(t:&mut Table_Order,key:u64,value:u8)->Result<(),ErrorCode>{if !table_exists_Order(t,key){return Err(ErrorCode::MissingRow);}let slot=(key&7) as usize;let old=t.col_state[slot];
     t.col_state[slot]=value;Ok(())}
-fn table_alloc_Order(t:&mut Table_Order, owner:u64, amount:i64, state:u8)->Result<u64,ErrorCode>{
+fn table_alloc_Order(t:&mut Table_Order, field_owner:u64, field_amount:i64, field_state:u8)->Result<u64,ErrorCode>{
     let slot=(0..8).find(|&i|(t.occupied_bitmap[i/64]>>(i%64))&1==0).ok_or(ErrorCode::TableFull)?;
     let gen=t.generation[slot];if gen>=4294967295u32{return Err(ErrorCode::GenerationExhausted);}
-    t.col_owner[slot]=owner;
-    t.col_amount[slot]=amount;
-    t.col_state[slot]=state;
+    t.col_owner[slot]=field_owner;
+    t.col_amount[slot]=field_amount;
+    t.col_state[slot]=field_state;
     t.generation[slot]=gen+1;t.occupied_bitmap[slot/64]|=1u64<<(slot%64);
     Ok((((gen+1) as u64)<<3)|slot as u64)}
 #[derive(Clone, Debug, PartialEq, Eq)] pub struct State {

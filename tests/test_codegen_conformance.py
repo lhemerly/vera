@@ -222,6 +222,48 @@ transition snapshot() reads [] writes [] body {commit;}
     assert "names" in out
 
 
+def test_table_column_pairs_have_distinct_rust_accessors_and_indexes(tmp_path):
+    out = run_rust(
+        tmp_path,
+        """module Names;
+table A capacity 2 {key id:id64<A>;col b_c:u64 [unique];col b_d:i64 [tracked_sum];}
+table A_b capacity 2 {key id:id64<A_b>;col c:u64 [unique];col d:i64 [tracked_sum];}
+transition create() reads [A[*].b_c,A[*].b_d,A_b[*].c,A_b[*].d]
+writes [A[*].b_c,A[*].b_d,A_b[*].c,A_b[*].d]
+body {
+  let %a:id64<A> =table_alloc(A,{b_c:7,b_d:11});
+  let %b:id64<A_b> =table_alloc(A_b,{c:9,d:13});
+  guard(table_exists_unique(A,b_c,7),ERR_MISSING);
+  guard(table_exists_unique(A_b,c,9),ERR_MISSING);
+  let %ka:id64<A> =table_lookup(A,b_c,7);
+  let %kb:id64<A_b> =table_lookup(A_b,c,9);
+  let %va:i64=table_get(A,%ka,b_d);
+  let %vb:i64=table_get(A_b,%kb,d);
+  table_set(A,%a,b_d,%vb);table_set(A_b,%b,d,%va);commit;
+}""",
+        """fn main(){let mut s=State::new();create(&mut s).unwrap();
+assert_eq!(s.a.col_b_d[0],13);assert_eq!(s.a_b.col_d[0],11);
+snapshot(&s,"names.snap").unwrap();assert_eq!(restore("names.snap").unwrap(),s);
+println!("distinct");}""",
+    )
+    assert "distinct" in out
+
+
+def test_allocation_column_names_cannot_shadow_rust_runtime_variables(tmp_path):
+    out = run_rust(
+        tmp_path,
+        """module Names;
+table T capacity 2 {key id:id64<T>;col t:u64;col slot:u64;col gen:u64;}
+transition create() reads [] writes [T[*].t,T[*].slot,T[*].gen]
+body {let %new:id64<T> =table_alloc(T,{t:7,slot:99,gen:123});commit;}""",
+        """fn main(){let mut s=State::new();create(&mut s).unwrap();
+assert_eq!(s.t.col_t[0],7);assert_eq!(s.t.col_slot[0],99);
+assert_eq!(s.t.col_gen[0],123);assert_eq!(s.t.generation[0],1);
+println!("columns");}""",
+    )
+    assert "columns" in out
+
+
 def test_capacity_one_handles_and_soa_alignment(tmp_path):
     out = run_rust(
         tmp_path,

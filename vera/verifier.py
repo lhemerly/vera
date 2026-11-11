@@ -55,7 +55,7 @@ class ModelProjector:
     def param_values(self) -> Dict[str, object]:
         out: Dict[str, object] = {}
         for p in self.encoder.tr.decl.params:
-            name = f"p_{p.name}"
+            name = self.encoder.params[p.name]
             kind = self.encoder.const_kinds.get(name)
             if kind is None:
                 continue
@@ -151,7 +151,7 @@ class ModelProjector:
     def pre_aggregates(self) -> Dict[str, Dict[str, int]]:
         out: Dict[str, Dict[str, int]] = {}
         for (tname, cname), wide_w in self.encoder.agg_wide.items():
-            name = f"{tname}_{cname}_agg_0"
+            name = self.encoder.pre_agg[tname][cname]
             kind = self.encoder.const_kinds.get(name)
             if kind is None:
                 continue
