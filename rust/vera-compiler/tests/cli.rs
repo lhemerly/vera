@@ -84,8 +84,7 @@ fn human_summary_identifies_module_and_declarations() {
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     assert!(text.contains("Native"), "{text}");
-    assert!(text.to_lowercase().contains("table"), "{text}");
-    assert!(text.to_lowercase().contains("transition"), "{text}");
+    assert!(text.to_lowercase().contains("declarations"), "{text}");
     assert!(output.stderr.is_empty(), "{}", stderr(&output));
 }
 
@@ -100,20 +99,18 @@ fn invalid_syntax_reports_a_location_without_partial_json() {
 }
 
 #[test]
-fn unsupported_compiler_commands_fail_explicitly_without_python() {
-    for command in ["check", "verify", "run", "codegen"] {
-        let output = run(&[command, "-"], "module Native;");
-        assert!(!output.status.success(), "{command} unexpectedly succeeded");
+fn malformed_native_commands_fail_without_python() {
+    for args in [
+        vec!["unknown", "-"],
+        vec!["run", "-"],
+        vec!["codegen", "-"],
+        vec!["verify", "-", "--timeout", "0"],
+    ] {
+        let output = run(&args, "module Native;");
+        assert!(!output.status.success(), "{args:?} unexpectedly succeeded");
         assert!(output.stdout.is_empty(), "{}", stdout(&output));
-        let error = stderr(&output).to_lowercase();
-        assert!(
-            error.contains("unsupported")
-                || error.contains("not implemented")
-                || error.contains("not yet")
-                || (error.contains("only") && error.contains("parse")),
-            "{command}: {error}"
-        );
-        assert!(!error.contains("panicked"), "{command}: {error}");
+        assert!(!output.stderr.is_empty());
+        assert!(!stderr(&output).contains("panicked"));
     }
 }
 

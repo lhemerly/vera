@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vera-lang"
 version = "1.1.0"
-description = "VERA: Verified Relational Architecture — language, verifier, and runtime"
+description = "VERA Python reference oracle for development and conformance tests"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -15,7 +15,7 @@ dependencies = ["z3-solver>=4.12"]
 test = ["pytest>=8", "wgpu>=0.19"]
 
 [project.scripts]
-vera = "vera.cli:main"
+vera-reference = "vera.cli:main"
 
 [tool.setuptools]
 packages = ["vera", "vera.templates"]

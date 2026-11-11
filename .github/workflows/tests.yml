@@ -8,6 +8,14 @@ on:
 jobs:
   native-rust:
     runs-on: ubuntu-latest
+    env:
+      EGL_PLATFORM: surfaceless
+      LIBGL_ALWAYS_SOFTWARE: "1"
+      MESA_GL_VERSION_OVERRIDE: "4.6"
+      MESA_GLSL_VERSION_OVERRIDE: "460"
+      VERA_REQUIRE_GPU_TESTS: "1"
+      CARGO_BUILD_JOBS: "2"
+      READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
@@ -17,19 +25,35 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Native frontend formatting and lint
+      - name: Install native backend test tools
         run: |
-          cargo fmt -p vera-compiler -- --check
-          cargo clippy -p vera-compiler --all-targets --locked -- -D warnings
+          sudo apt-get update
+          sudo apt-get install -y build-essential glslang-tools libegl1-mesa-dev libgl-dev libgl1-mesa-dri mesa-utils
+
+      - name: Native formatting and lint
+        run: |
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Native compiler and runtime tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --test-threads=4
 
       - name: Build standalone native CLI
         run: |
-          cargo build -p vera-compiler --release --locked
+          sh tools/package_native.sh
           target/release/vera parse examples/bank.vera
-          target/release/vera parse examples/counter.vera --json
+          target/release/vera check examples/counter.vera --json
+          target/release/vera verify examples/bank.vera
+          env PATH="" target/release/vera verify examples/counter.vera
+
+      - name: Upload native release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: vera-native-linux
+          path: |
+            dist/vera-*.tar.gz
+            dist/vera-*.sha256
+          if-no-files-found: error
 
   test:
     runs-on: ubuntu-latest
@@ -43,6 +67,8 @@ jobs:
       LIBGL_ALWAYS_SOFTWARE: "1"
       MESA_GL_VERSION_OVERRIDE: "4.6"
       MESA_GLSL_VERSION_OVERRIDE: "460"
+      READ_ONLY_GITHUB_TOKEN: ${{ github.token }}
+      CARGO_BUILD_JOBS: "2"
 
     steps:
       - uses: actions/checkout@v4
@@ -70,11 +96,13 @@ jobs:
       - name: Complete language and backend conformance
         run: python -m pytest tests -q -ra
 
-      - name: Rust frontend differential corpus
+      - name: Native differential conformance
         if: matrix.python-version == '3.13'
         run: |
           cargo build -p vera-compiler --locked
           python tools/check_rust_frontend.py --binary target/debug/vera
+          python tools/check_native_semantics.py --binary target/debug/vera
+          python tools/check_native_execution.py --binary target/debug/vera
 
       - name: Rust runtime unit tests
         run: cargo test --manifest-path rust/vera-rt/Cargo.toml --locked

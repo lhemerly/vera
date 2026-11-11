@@ -16,59 +16,46 @@ part of the trusted implementation; cross-backend conformance tests are included
 
 ## Quick start
 
-Requires Python 3.11+, Z3, and Rust 1.89+ for generated Rust/persistence tools.
-
-The compiler is being migrated to Rust. A Python-free native frontend is now
-available for the complete v1.1 syntax:
-
-```bash
-cargo run --bin vera -- parse examples/bank.vera
-cargo run --bin vera -- parse examples/counter.vera --json
-cargo test --workspace --locked
-cargo build -p vera-compiler --release --locked
-```
-
-The native command currently parses syntax; semantic checking, verification,
-execution and code generation still use the established Python toolchain below.
-It explicitly rejects those native commands until their ports are complete.
-See the [Rust migration design and milestones](docs/RUST_MIGRATION.md).
+The production compiler and CLI are native Rust. Building requires Rust 1.89+,
+a C++ standard library, and network access to Cargo and the pinned official Z3
+release archive. Z3 is linked statically; the executable needs neither Python
+nor a solver executable. Linux release builds target x86-64 with glibc 2.39+.
 
 ```bash
 git clone https://github.com/lhemerly/vera.git
 cd vera
-python3 -m venv .venv
-.venv/bin/pip install -e '.[test]'
+cargo build --release --locked
+export PATH="$PWD/target/release:$PATH"
 
-.venv/bin/vera check examples/bank.vera
-.venv/bin/vera verify examples/bank.vera
-.venv/bin/vera verify examples/bank_buggy.vera  # rejected: self-transfer aliasing
-
-.venv/bin/vera run examples/bank.vera --transition transfer \
+vera check examples/bank.vera
+vera verify examples/bank.vera
+vera verify examples/bank_buggy.vera  # rejected: self-transfer aliasing
+vera run examples/bank.vera --transition transfer \
   --param from=32 --param to=33 --param amount=100000000 \
   --setup examples/bank_setup.json
 ```
 
-`run` and `codegen` prove the selected program before executing/emitting it.
-For deliberately broken programs used in development or fuzzing, explicitly
-pass `--unverified`. `check` performs parsing and semantic analysis without proof.
-
-Generate a standalone Rust engine or a library:
+`parse` checks syntax, `check` performs semantic analysis, and `verify` runs all
+three proof obligations. `run`, `replay` and `codegen` prove the selected
+transitions before use. Pass `--unverified` explicitly for development with
+intentionally broken programs. `--json` supplies machine-readable results.
+`--help` lists commands and resource controls.
 
 ```bash
-.venv/bin/vera codegen rust examples/bank.vera --out /tmp/bank.rs
+vera codegen rust examples/bank.vera --out /tmp/bank.rs
 rustc --edition 2021 -O /tmp/bank.rs -o /tmp/bank
 (cd /tmp && ./bank)
-
-.venv/bin/vera codegen rust examples/counter.vera --no-main --out /tmp/counter.rs
+vera codegen rust examples/counter.vera --no-main --out /tmp/counter.rs
+vera project examples/bank.vera --projection AccountView \
+  --param from=32 --setup examples/bank_setup.json
+vera fuzz examples/bank.vera --steps 64 --threads 256
 ```
 
-The generated demo recovers its previous WAL before appending another batch;
-re-running it preserves deterministic replay. Application integrations can use
-`Params::encode/decode`, atomic transition functions, `run_batch`, `snapshot`
-and `restore` directly.
-
-Demo seeds are illustrative and are validated before use. Programs requiring a
-specific nonempty initial state must supply that state in their application.
+Generated Rust engines are standalone and use only the standard library.
+Applications can use typed `Params::encode/decode`, atomic transition functions,
+ordered optimistic `run_batch`, snapshots and replay. The native library also
+exposes the general checked interpreter, projections, persistence and batch API.
+Demo seeds are illustrative; applications must supply a valid initial state.
 
 ## Language
 
@@ -109,7 +96,7 @@ order, error behavior, footprints, folds, effects, projections and persistence.
 | Iteration | Inclusive bounded folds, two nesting levels, maximum bound/product 1024, scoped bindings and no index wrap |
 | Specifications | Named global/row invariants, postconditions, safety, panic freedom and concrete non-vacuity |
 | Boundary | Authorized projection slices, stale-handle checks and configured intent affordances |
-| Execution | Reference interpreter, generated Rust, and shared exact-limb GLSL/WGSL/CUDA compute furnaces |
+| Execution | Native checked interpreter, generated Rust, and shared exact-limb GLSL/WGSL/CUDA compute furnaces |
 | Batches | Safe optimistic snapshots, ordered validation and re-execution for both input-derived and state-dependent footprints |
 | Persistence | Versioned typed intents, program fingerprints, checksummed WAL/snapshots, replay, torn-tail recovery, optional io_uring |
 
@@ -131,13 +118,13 @@ messages. They retain declared table capacities and use a deterministic xoshiro
 PRNG. Furnaces are bounded bug searches, not substitutes for the SMT proofs.
 
 ```bash
-.venv/bin/vera codegen glsl examples/bank.vera --out /tmp/bank.comp
+vera codegen glsl examples/bank.vera --out /tmp/bank.comp
 glslangValidator /tmp/bank.comp
 gcc -O2 tools/furnace_host.c -o /tmp/vera-host -lEGL -lGL
 EGL_PLATFORM=surfaceless /tmp/vera-host /tmp/bank.comp 8
 
-.venv/bin/vera codegen wgsl examples/bank.vera --out /tmp/bank.wgsl
-.venv/bin/vera codegen cuda examples/bank.vera --out /tmp/bank.cu
+vera codegen wgsl examples/bank.vera --out /tmp/bank.wgsl
+vera codegen cuda examples/bank.vera --out /tmp/bank.cu
 ```
 
 Tests compile GLSL, validate and dispatch WGSL with `wgpu`, and execute the CUDA
@@ -152,7 +139,7 @@ optional `rust/vera-rt` crate uses io_uring on supported Linux kernels, with the
 same positional-write persistence protocol when io_uring is unavailable.
 
 ```bash
-.venv/bin/python tools/build_cargo.py examples/bank.vera
+vera codegen rust examples/bank.vera --runtime-crate --no-main --out rust/vera-rt/src/spec.rs
 cargo test --manifest-path rust/vera-rt/Cargo.toml
 cargo run --manifest-path rust/vera-rt/Cargo.toml --bin vera-furnace
 ```
@@ -177,28 +164,47 @@ transactions, fine-grained Block-STM performance, or lock-free shared mutation.
 ## Verification and tests
 
 ```bash
-.venv/bin/python -m pytest tests -q -ra
-cargo test --manifest-path rust/vera-rt/Cargo.toml --locked
+cargo test --workspace --locked
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-The suite covers the reviewed soundness failures, exact scalar boundaries,
-transaction rollback (including indexes/effects), nested folds, projections,
-foreign keys, all backend emitters, generated runtime execution, canonical
-argument codecs, program identity, corrupted records, torn writes and repeated
-restart/replay. Differential arithmetic tests compare Python, generated Rust
-and the shared GPU implementation against independently computed integer results.
+Native tests cover syntax and semantic admission, exact scalar and aggregate
+arithmetic, atomic rollback, unique indexes, folds, old-state evaluation, effects,
+projections, all emitted targets, proof results and concrete replay, batch order,
+historical persistence bytes, corruption and restart recovery. Native CLI
+workflows run with an empty `PATH`, including proof-gated compilation/execution.
 
-CI runs the full test suite on Python 3.11–3.14 with mandatory backend checks.
-Unavailable optional hardware/toolchains are reported explicitly by tests;
-backend failures are not hidden by `continue-on-error`.
+Compute tests need a C++ compiler, EGL/OpenGL development headers, Mesa and
+`glslangValidator`. WGSL tests dispatch through Rust `wgpu`; GLSL tests use the
+included EGL host. Set `VERA_REQUIRE_GPU_TESTS=1` to require those dependencies
+instead of reporting an explicit unavailable-tool skip. CI requires these tests.
+CUDA semantics run in portable C++ host mode; native NVIDIA hardware execution
+and an enabled io_uring kernel require separate target-host validation.
+
+Python remains an optional, independent development oracle. Its console command
+is `vera-reference`; it does not provide the production `vera` command.
+
+```bash
+python -m pip install -e '.[test]'
+python -m pytest tests -q -ra
+python tools/check_rust_frontend.py --binary target/debug/vera
+python tools/check_native_semantics.py --binary target/debug/vera
+python tools/check_native_execution.py --binary target/debug/vera
+```
+
+CI runs the native suite plus the complete reference suite on Python 3.11–3.14.
+See [the native architecture and compatibility notes](docs/RUST_MIGRATION.md).
+Build a local release archive with `sh tools/package_native.sh`; CI uploads the
+same archive and checksum without publishing a tag or GitHub Release.
 
 ## Layout
 
 ```text
 Cargo.toml            native compiler/runtime workspace
-rust/vera-compiler/   native syntax frontend, diagnostics and vera CLI
-vera/                 parser, type checker, verifier, reference engine, backends
-vera/templates/       canonical embedded Rust persistence source
+rust/vera-compiler/   native analyzer, verifier, interpreter, backends and vera CLI
+vera/                 optional Python reference oracle and historical backend tests
+vera/templates/       historical reference templates (wire-compatible native copies)
 rust/vera-rt/         optional Linux io_uring runtime and replay demo
 tools/                crate regeneration and headless GLSL host
 examples/             bank, deliberately broken bank, counter and setup states

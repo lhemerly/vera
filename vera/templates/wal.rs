@@ -1,5 +1,5 @@
 // Canonical VERA intent WAL. This source is embedded by the Rust generator and
-// mirrored into rust/vera-rt/src/wal.rs by tools/build_cargo.py.
+// mirrored between the native compiler, runtime crate and Python test oracle.
 // Requires Rust 1.89 for advisory File::try_lock().
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -222,6 +222,7 @@ pub(crate) fn write_all_at(file: &File, mut bytes: &[u8], mut offset: u64) -> io
 
 /// A single-writer log. append() publishes a complete record in the file;
 /// sync() is the durability boundary, and must precede acknowledging a batch.
+#[allow(clippy::upper_case_acronyms)]
 pub struct WAL {
     file: File,
     path: PathBuf,
@@ -279,8 +280,7 @@ impl WAL {
         F: FnMut(&File, &[u8], u64) -> io::Result<()>,
     {
         if self.poisoned {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
+            return Err(io::Error::other(
                 "WAL has an unresolved I/O failure; reopen to recover",
             ));
         }
@@ -314,10 +314,7 @@ impl WAL {
 
     pub fn sync(&mut self) -> io::Result<()> {
         if self.poisoned {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "WAL has an unresolved I/O failure",
-            ));
+            return Err(io::Error::other("WAL has an unresolved I/O failure"));
         }
         if let Err(error) = self.file.sync_all().and_then(|_| sync_parent(&self.path)) {
             self.poisoned = true;
@@ -482,10 +479,7 @@ mod wal_tests {
         let error = wal
             .append_using(9, b"first", |file, bytes, at| {
                 write_all_at(file, &bytes[..9], at)?;
-                Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "injected write failure",
-                ))
+                Err(io::Error::other("injected write failure"))
             })
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Other);

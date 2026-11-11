@@ -1,0 +1,37 @@
+module PortableCodec;
+
+table T capacity 2 {
+  key id: id64<T>;
+  col flag: bool;
+  col tiny: u8;
+  col small: u16;
+  col word: u32;
+  col big: u64 [unique];
+  col signed: i64 [tracked_sum];
+  col decimal: dec64;
+  col wide: dec128 [tracked_sum];
+  col symbol: sym32;
+  col blob: bytes32;
+  col tag: enum{A,B};
+  col peer: id64<T>;
+}
+
+effect Event(flag:bool, wide:dec128, blob:bytes32, tag:enum{A,B}, peer:id64<T>);
+
+transition create(flag:bool, tiny:u8, small:u16, word:u32, big:u64,
+                  signed:i64, decimal:dec64, wide:dec128, symbol:sym32,
+                  blob:bytes32, tag:enum{A,B}, peer:id64<T>)
+  reads []
+  writes [T[*].flag,T[*].tiny,T[*].small,T[*].word,T[*].big,T[*].signed,
+          T[*].decimal,T[*].wide,T[*].symbol,T[*].blob,T[*].tag,T[*].peer]
+  body {
+    let %id:id64<T> = table_alloc(T, {
+      flag:flag, tiny:tiny, small:small, word:word, big:big, signed:signed,
+      decimal:decimal, wide:wide, symbol:symbol, blob:blob, tag:tag, peer:peer
+    });
+    emit Event(flag,wide,blob,tag,peer);
+    commit;
+  }
+
+transition rejected() reads [] writes []
+  body { guard(false,ERR_REJECTED); commit; }

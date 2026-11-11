@@ -1,7 +1,7 @@
 //! VERA furnace / runtime demo using the io_uring intent WAL.
 //!
 //! The generated specification (state, transitions, batch dispatcher) is
-//! included from `spec.rs`, which `tools/build_cargo.py` writes.
+//! included from `spec.rs`, emitted by native `vera codegen rust --runtime-crate`.
 
 mod spec;
 use spec::*;
@@ -16,7 +16,7 @@ fn main() {
     state.account.col_balance[1] = 300_000000;
     state.account.agg_sum_balance = 800_000000;
 
-    let key0 = (1u64 << KEY_BITS_ACCOUNT) | 0u64;
+    let key0 = 1u64 << KEY_BITS_ACCOUNT;
     let key1 = (1u64 << KEY_BITS_ACCOUNT) | 1u64;
 
     let intents = vec![
