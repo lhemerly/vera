@@ -1,3 +1,0 @@
-module MissingCommit;
-table T capacity 2 {key id:id64<T>;col v:u64;}
-transition missing() reads [] writes [] body {let %x:u64=0;}

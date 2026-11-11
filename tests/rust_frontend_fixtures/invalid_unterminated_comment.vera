@@ -1,2 +1,0 @@
-module Unterminated;
-/* An unfinished comment must be a parse error, never an accepted prefix.

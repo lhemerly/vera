@@ -1,3 +1,0 @@
-[env]
-# Pin the native static solver used by z3-sys's release-archive build.
-Z3_SYS_Z3_VERSION = "5.4.1"

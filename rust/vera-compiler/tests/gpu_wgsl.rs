@@ -1,138 +1,84 @@
-//! Actual native WebGPU dispatch. Software Mesa adapters are sufficient.
-use std::{
-    future::Future,
-    sync::{mpsc, Arc, Mutex, OnceLock},
-    task::{Context, Poll, Wake, Waker},
-    thread,
-    time::Duration,
+//! Parse and validate WGSL, lower with Naga, and execute on a real EGL GPU.
+#[path = "support/gpu_host.rs"]
+mod gpu_host;
+use naga::{
+    back::glsl,
+    proc::{BoundsCheckPolicies, BoundsCheckPolicy},
+    valid::{Capabilities, ValidationFlags, Validator},
+    AddressSpace, ResourceBinding, ShaderStage, StorageAccess, TypeInner,
 };
 use vera_compiler::{codegen_gpu::generate_wgsl, parse_source, semantic::analyze};
 
-struct ThreadWake(thread::Thread);
-impl Wake for ThreadWake {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
-}
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    let mut future = std::pin::pin!(future);
-    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(value) => return value,
-            Poll::Pending => thread::park(),
-        }
-    }
-}
-struct Gpu {
-    device: wgpu::Device,
-    queue: wgpu::Queue,
-    dispatch: Mutex<()>,
-}
-fn required() -> bool {
-    std::env::var("VERA_REQUIRE_GPU_TESTS").is_ok_and(|v| v == "1")
-}
-fn gpu() -> Option<&'static Gpu> {
-    static GPU: OnceLock<Option<Gpu>> = OnceLock::new();
-    GPU.get_or_init(|| {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::GL,
-            ..Default::default()
-        });
-        let adapter = match block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            force_fallback_adapter: true,
-            ..Default::default()
-        })) {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                assert!(!required(), "required WGSL adapter is unavailable: {error}");
-                eprintln!("WGSL execution skipped: no GPU/software adapter: {error}");
-                return None;
-            }
-        };
-        eprintln!("WGSL conformance adapter: {:?}", adapter.get_info());
-        let (device, queue) = block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
-            .expect("WebGPU adapter must create a compute device");
-        Some(Gpu {
-            device,
-            queue,
-            dispatch: Mutex::new(()),
-        })
-    })
-    .as_ref()
-}
 fn run(source: &str, probe: &str, entry: &str) -> Option<[u32; 4]> {
-    let gpu = gpu()?;
-    let _lock = gpu.dispatch.lock().unwrap();
     let program = analyze(parse_source(source).unwrap()).unwrap();
     let code = generate_wgsl(&program, 2).unwrap() + probe;
-    let module = gpu
-        .device
-        .create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("native VERA WGSL"),
-            source: wgpu::ShaderSource::Wgsl(code.into()),
-        });
-    let pipeline = gpu
-        .device
-        .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("VERA conformance"),
-            layout: None,
-            module: &module,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            cache: None,
-        });
-    let output = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("VERA counters"),
-        size: 16,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let readback = gpu.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("VERA readback"),
-        size: 16,
-        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    let group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: None,
-        layout: &pipeline.get_bind_group_layout(0),
-        entries: &[wgpu::BindGroupEntry {
-            binding: 0,
-            resource: output.as_entire_binding(),
-        }],
-    });
-    let mut encoder = gpu
-        .device
-        .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
-    {
-        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor::default());
-        pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &group, &[]);
-        pass.dispatch_workgroups(1, 1, 1);
-    }
-    encoder.copy_buffer_to_buffer(&output, 0, &readback, 0, 16);
-    gpu.queue.submit([encoder.finish()]);
-    let (sender, receiver) = mpsc::sync_channel(1);
-    readback
-        .slice(..)
-        .map_async(wgpu::MapMode::Read, move |result| {
-            sender.send(result).unwrap();
-        });
-    gpu.device.poll(wgpu::PollType::Wait).unwrap();
-    receiver
-        .recv_timeout(Duration::from_secs(60))
-        .expect("GPU readback timed out")
-        .expect("GPU readback failed");
-    let mapped = readback.slice(..).get_mapped_range();
-    let mut values = [0u32; 4];
-    for (value, bytes) in values.iter_mut().zip(mapped.chunks_exact(4)) {
-        *value = u32::from_le_bytes(bytes.try_into().unwrap());
-    }
-    drop(mapped);
-    readback.unmap();
-    Some(values)
+    let module = naga::front::wgsl::parse_str(&code)
+        .unwrap_or_else(|error| panic!("invalid generated WGSL: {}", error.emit_to_string(&code)));
+    let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
+        .validate(&module)
+        .unwrap_or_else(|error| panic!("WGSL validation failed: {error:?}"));
+    // The actual host allocates exactly one 16-byte storage buffer, as did the
+    // WebGPU harness. Check that ABI before dispatch instead of relying on a
+    // graphics API to infer a compatible bind group.
+    let outputs: Vec<_> = module
+        .global_variables
+        .iter()
+        .filter(|(_, global)| global.binding.is_some())
+        .collect();
+    assert_eq!(
+        outputs.len(),
+        1,
+        "shader must have exactly one bound output buffer"
+    );
+    let (_, output) = outputs[0];
+    assert_eq!(
+        output.binding,
+        Some(ResourceBinding {
+            group: 0,
+            binding: 0
+        })
+    );
+    assert_eq!(
+        output.space,
+        AddressSpace::Storage {
+            access: StorageAccess::LOAD | StorageAccess::STORE
+        }
+    );
+    let TypeInner::Struct { span, .. } = module.types[output.ty].inner else {
+        panic!("output must be the counter structure")
+    };
+    assert_eq!(span, 16, "output ABI must contain four u32 counters");
+    let options = glsl::Options {
+        version: glsl::Version::Desktop(460),
+        writer_flags: glsl::WriterFlags::empty(),
+        binding_map: [(
+            ResourceBinding {
+                group: 0,
+                binding: 0,
+            },
+            0,
+        )]
+        .into_iter()
+        .collect(),
+        zero_initialize_workgroup_memory: true,
+    };
+    let pipeline = glsl::PipelineOptions {
+        shader_stage: ShaderStage::Compute,
+        entry_point: entry.into(),
+        multiview: None,
+    };
+    let policies = BoundsCheckPolicies {
+        index: BoundsCheckPolicy::ReadZeroSkipWrite,
+        buffer: BoundsCheckPolicy::ReadZeroSkipWrite,
+        image_load: BoundsCheckPolicy::ReadZeroSkipWrite,
+        binding_array: BoundsCheckPolicy::ReadZeroSkipWrite,
+    };
+    let mut glsl = String::new();
+    glsl::Writer::new(&mut glsl, &module, &info, &options, &pipeline, policies)
+        .expect("validated WGSL must lower to GLSL")
+        .write()
+        .expect("WGSL compute shader must emit complete GLSL");
+    gpu_host::dispatch(&glsl)
 }
 fn expect(source: &str, probe: &str, entry: &str, expected: [u32; 4]) {
     if let Some(result) = run(source, probe, entry) {
