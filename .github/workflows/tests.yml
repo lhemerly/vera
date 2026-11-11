@@ -6,6 +6,31 @@ on:
   pull_request:
 
 jobs:
+  native-rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.89.0
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Native frontend formatting and lint
+        run: |
+          cargo fmt -p vera-compiler -- --check
+          cargo clippy -p vera-compiler --all-targets --locked -- -D warnings
+
+      - name: Native compiler and runtime tests
+        run: cargo test --workspace --locked
+
+      - name: Build standalone native CLI
+        run: |
+          cargo build -p vera-compiler --release --locked
+          target/release/vera parse examples/bank.vera
+          target/release/vera parse examples/counter.vera --json
+
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -31,8 +56,6 @@ jobs:
         uses: dtolnay/rust-toolchain@1.89.0
 
       - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: rust/vera-rt
 
       - name: Install headless shader tools
         run: |
@@ -46,6 +69,12 @@ jobs:
 
       - name: Complete language and backend conformance
         run: python -m pytest tests -q -ra
+
+      - name: Rust frontend differential corpus
+        if: matrix.python-version == '3.13'
+        run: |
+          cargo build -p vera-compiler --locked
+          python tools/check_rust_frontend.py --binary target/debug/vera
 
       - name: Rust runtime unit tests
         run: cargo test --manifest-path rust/vera-rt/Cargo.toml --locked

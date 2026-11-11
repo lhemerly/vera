@@ -1,0 +1,20 @@
+[package]
+name = "vera-compiler"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Native VERA language frontend and compiler toolchain"
+repository = "https://github.com/lhemerly/vera"
+
+[lib]
+name = "vera_compiler"
+
+[[bin]]
+name = "vera"
+path = "src/main.rs"
+
+[dependencies]
+num-bigint = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
