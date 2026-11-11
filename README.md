@@ -89,8 +89,12 @@ transition transfer(from : id64<Account>, to : id64<Account>, amount : dec64)
 | `vera/verifier.py` | Model projection, runtime replay, counterexample lifting, diagnostic packet |
 | `vera/runtime.py` | Reference SoA engine: undo log, checked arithmetic, tracked sums, atomic revert |
 | `vera/projection.py` | State & Affordance Frame with parameter interval bounds |
-| `vera/codegen_rust.py` | Target C: `#[repr(C, align(64))]` SoA structs, checked helpers, commit-after-validate |
+| `vera/codegen_rust.py` | Target C: `#[repr(C, align(64))]` SoA structs, checked helpers, commit-after-validate, intent enum, Tier-1 dispatcher, WAL, snapshot |
+| `vera/codegen_glsl.py` | Target B: OpenGL 4.6 GLSL compute furnace (warp-interleaved sandbox, xoshiro256**, branchless guards) |
 | `vera/codegen_gpu.py` | Target B: CUDA / WGSL emission (warp-interleaved, branchless, xoshiro256**) |
+| `rust/vera-rt` | Production Rust crate: io_uring intent WAL, record encode/decode, replay |
+| `tools/furnace_host.c` | EGL surfaceless host for the GLSL furnace |
+| `tools/build_cargo.py` | Regenerates the Rust crate's `spec.rs` from a VERA source |
 | `vera/fuzz.py` | Reference trajectory furnace (delta shrinking, invariant + postcondition checks) |
 | `vera/cli.py` | `check`, `verify`, `run`, `project`, `fuzz`, `codegen` |
 
@@ -192,26 +196,78 @@ them as follows and documents each choice.
 On a 6-core Linux host, the dual-mode verifier proves the banking core's three
 transitions in ~1.5 s total (capacity 32/8). The exact-sum mode is slower and
 scales with capacity; it is intended for small tables or absolute-sum
-invariants. The reference fuzzer executes ~1000 transitions in well under a
-second; the emitted CUDA/WGSL kernels target the 65 536-thread regime.
+invariants.
+
+The fold/allocation encoding was rewritten for O(1) per-access cost: the
+last-write map (`widx`/`wval` arrays), an occupancy array with symbolic-slot
+stores, a known-slot fast path for `table_get` on an allocation result, and a
+symbolic allocator slot with an O(C) lowest-free constraint. A `fold_bounded<8>`
+with an allocation and a read per iteration verifies in ~0.8 s (previously
+>60 s); `fold_bounded<16>` in ~15 s.
+
+## GPU furnace (OpenGL 4.6 / Target B)
+
+`vera codegen glsl` emits a GLSL 4.6 compute shader implementing the Section 7
+design on a warp-interleaved sandbox (lane `L`'s row `S` at `col[S*32+L]`):
+xoshiro256** PRNG, branchless `select`/`guard`, a D-step trajectory per lane, and
+global-invariant checks after every step. `tools/furnace_host.c` runs it
+headless through EGL surfaceless (no window) and reads back the violation /
+commit counters.
+
+Verified on the local AMD Radeon RX 6600 XT (Mesa radeonsi, GL 4.6 core):
+
+| spec | threads | violations | committed |
+|---|---|---|---|
+| `bank.vera` | 2048 | 0 | 48144 |
+| bound-breaking variant | 2048 | **426** | 38910 |
+
+## Rust production runtime (Target C)
+
+The Python package is the compiler/verifier; the production runtime is Rust.
+
+* `vera codegen rust` emits a zero-allocation `#[repr(C, align(64))]` SoA engine
+  plus the runtime: a `Params` intent enum with `reads()`/`writes()` metadata,
+  `execute()`, and `encode()`.
+* `run_batch` performs conflict analysis (write-write, write-read, and
+  read-write on the same table/column/slot) and executes each conflict-free
+  wave in parallel with `std::thread::scope`; waves are serializable by
+  construction.
+* `rust/vera-rt` is the production crate. `IoUringWAL` appends canonical
+  64-byte `(IntentID, BinaryArgs, TxSequenceNumber)` records with
+  `IORING_OP_WRITE` and waits for the CQE (falling back to `pwrite` if the
+  kernel rejects io_uring). `snapshot` writes copy-on-write packed state bytes,
+  and `replay_file` + `Params::decode` reproduce the live state deterministically.
+
+```
+wal backend: io_uring
+batch committed 4/4
+balance[0] = 450000000  balance[1] = 350000000
+replay matches live state: deterministic
+```
 
 ## Limitations
 
-* The CUDA/WGSL backends are **emission only** — no GPU was available to execute
-  or validate them. The reference fuzzer executes the same semantics on CPU.
-* Secondary unique-key indexes (Section 2.3) are not implemented; the grammar
-  does not declare them.
-* The lock-free Tier-1 scheduler and the MVMemory Tier-2 Block-STM fallback
-  (Section 5) are specified and analysed but not implemented as a runtime; the
-  reference runtime is single-threaded.
-* Persistence (io_uring WAL + copy-on-write snapshots) is out of scope for the
-  reference runtime.
-* Folds containing `table_alloc` are supported by the verifier but unrolled
-  O(N²); large-N folds with allocations should be avoided.
+* The CUDA/WGSL backends are emission-only; the OpenGL backend is the validated
+  GPU target on this host.
+* Secondary unique-key indexes are implemented as bounded linear probing
+  (`P_max = 16`); the spec's Robin Hood variant is not used, and `table_set` on
+  a unique column is forbidden (indexes are insert-only).
+* The lock-free Tier-1 dispatcher and the io_uring WAL are implemented for the
+  generated Rust engine; the MVMemory Tier-2 Block-STM fallback is not.
+* The exact-sum verifier mode remains exponential in the number of rows; the
+  default free-accumulator mode is the practical path.
 
 ## Tests
 
-`tests/test_vera.py` covers parsing, type errors, access footprints, WCET,
-capacity/fold limits, all three obligations (including a vacuous transition and
-a missing-row trap), counterexample lifting, runtime atomicity, projections,
-the fuzzer, Rust codegen compilation/execution, GPU emission, and the CLI.
+33 tests across five files:
+
+* `tests/test_vera.py` — parsing, type errors, access footprints, WCET,
+  capacity/fold limits, all three obligations (including a vacuous transition
+  and a missing-row trap), counterexample lifting, runtime atomicity, projections,
+  the fuzzer, Rust codegen compilation/execution, unique-key indexes, fold/alloc
+  scaling, and the CLI.
+* `tests/test_gpu_backend.py` — GLSL compilation, end-to-end furnace run on the
+  GPU, and violation detection on a bound-breaking spec.
+* `tests/test_rust_runtime.py` — Tier-1 batch dispatch, intent WAL, snapshot, and
+  deterministic replay.
+* `tests/test_io_uring_wal.py` — the io_uring-backed WAL crate end to end.
