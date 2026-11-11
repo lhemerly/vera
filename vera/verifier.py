@@ -66,15 +66,15 @@ class ModelProjector:
         for tname, tinfo in self.prog.tables.items():
             sbits = self.encoder.table_slot_bits[tname]
             gen_bits = min(64 - tinfo.layout.key_bits, 32)
-            occ_fn = z3.Function(self.encoder.pre_occ[tname],
-                                 z3.BitVecSort(sbits), z3.BoolSort())
+            occ_fn = z3.Array(self.encoder.pre_occ[tname],
+                              z3.BitVecSort(sbits), z3.BoolSort())
             gen_fn = z3.Function(self.encoder.pre_gen[tname],
                                  z3.BitVecSort(sbits), z3.BitVecSort(gen_bits))
             rows: List[Dict[str, object]] = []
             for slot in range(tinfo.layout.capacity):
                 if relevant is not None and slot not in relevant.get(tname, set()):
                     continue
-                occ = self.model.eval(occ_fn(z3.BitVecVal(slot, sbits)),
+                occ = self.model.eval(z3.Select(occ_fn, z3.BitVecVal(slot, sbits)),
                                       model_completion=True)
                 if not z3.is_true(occ):
                     continue

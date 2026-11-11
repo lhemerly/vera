@@ -154,6 +154,7 @@ class SmtEncoder:
 
         # pre-state function names
         self.pre_occ: Dict[str, str] = {}
+        self.cur_occ: Dict[str, str] = {}
         self.pre_gen: Dict[str, str] = {}
         self.pre_col: Dict[str, Dict[str, str]] = {}
         self.pre_hkey: Dict[Tuple[str, str], str] = {}
@@ -167,6 +168,11 @@ class SmtEncoder:
 
         # writes / allocations
         self.writes: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+        self.cur_widx: Dict[Tuple[str, str], str] = {}
+        self.cur_wval: Dict[Tuple[str, str], str] = {}
+        self.write_counter: Dict[Tuple[str, str], int] = {}
+        self.alloc_slots: Dict[str, str] = {}
+        self.idx_bits: Dict[Tuple[str, str], int] = {}
         self.alloc_records: Dict[str, List[Tuple[str, str]]] = {}
         self.final_values: Dict[Tuple[str, str], Dict[str, str]] = {}
         self.slot_pre_value: Dict[Tuple[str, str], Dict[str, str]] = {}
@@ -312,12 +318,13 @@ class SmtEncoder:
             sbits = self.table_slot_bits[tname]
             gen_bits = min(64 - tinfo.layout.key_bits, 32)
             occ = f"{tname}_occ"
-            self.declare(occ, f"(declare-fun {occ} ((_ BitVec {sbits})) Bool)",
-                         ("fun", sbits, "bool"))
+            self.declare(occ, f"(declare-const {occ} (Array (_ BitVec {sbits}) Bool))",
+                         ("array", sbits, "bool"))
             gen = f"{tname}_gen"
             self.declare(gen, f"(declare-fun {gen} ((_ BitVec {sbits})) (_ BitVec {gen_bits}))",
                          ("fun", sbits, gen_bits))
             self.pre_occ[tname] = occ
+            self.cur_occ[tname] = occ
             self.pre_gen[tname] = gen
             self.pre_col[tname] = {}
             for cname, cinfo in tinfo.columns.items():
@@ -325,6 +332,28 @@ class SmtEncoder:
                 self.declare(col, f"(declare-fun {col} ((_ BitVec {sbits})) {self._sort_of(cinfo.type)})",
                              ("fun", sbits, "bool" if cinfo.type.is_bool else cinfo.type.width))
                 self.pre_col[tname][cname] = col
+                n_writes = max(1, self.tr.wcet_bound)
+                ib = max(1, n_writes.bit_length())
+                self.idx_bits[(tname, cname)] = ib
+                widx = f"{tname}_{cname}_widx"
+                self.declare(widx,
+                             f"(declare-const {widx} (Array (_ BitVec {sbits}) (_ BitVec {ib})))",
+                             ("array", sbits, ib))
+                wval = f"{tname}_{cname}_wval"
+                self.declare(wval,
+                             f"(declare-const {wval} (Array (_ BitVec {ib}) {self._sort_of(cinfo.type)}))",
+                             ("array", ib, "bool" if cinfo.type.is_bool else cinfo.type.width))
+                self.cur_widx[(tname, cname)] = widx
+                self.cur_wval[(tname, cname)] = wval
+                self.write_counter[(tname, cname)] = 0
+                # The pre-state write maps are empty: widx is the constant zero
+                # array and wval is never read at index zero.
+                self.assert_common(
+                    f"(= {widx} ((as const (Array (_ BitVec {sbits}) (_ BitVec {ib}))) "
+                    f"{self._bv(0, ib)}))")
+                self.assert_common(
+                    f"(= {wval} ((as const (Array (_ BitVec {ib}) "
+                    f"{self._sort_of(cinfo.type)})) {self._zero(cinfo.type)}))")
             for cname, cinfo in tinfo.columns.items():
                 if cinfo.unique:
                     B = tinfo.layout.unique_hashes[cname]
@@ -392,10 +421,7 @@ class SmtEncoder:
 
     # --- state access ------------------------------------------------------
     def _current_occ(self, table: str, slot: str) -> str:
-        terms = [self._apply(self.pre_occ[table], slot)]
-        for alloc_slot, _ in self.alloc_records.get(table, []):
-            terms.append(f"(= {slot} {alloc_slot})")
-        return self._or(*terms)
+        return self._select_arr(self.cur_occ[table], slot)
 
     def _current_gen(self, table: str, slot: str) -> str:
         expr = self._apply(self.pre_gen[table], slot)
@@ -405,11 +431,39 @@ class SmtEncoder:
 
     def _current_col(self, table: str, cname: str, key_expr: str,
                      ctype: ScalarType) -> str:
+        # O(1) last-write-wins lookup: widx[slot] is the last write index (0 =
+        # never written), wval[idx] is the value written there.
         slot = self._slot_of_key(key_expr, table)
-        expr = self._apply(self.pre_col[table][cname], slot)
-        for wslot, wval in reversed(self.writes.get((table, cname), [])):
-            expr = self._ite(f"(= {slot} {wslot})", wval, expr)
-        return expr
+        ib = self.idx_bits[(table, cname)]
+        widx = self._select_arr(self.cur_widx[(table, cname)], slot)
+        wval = self._select_arr(self.cur_wval[(table, cname)], widx)
+        base = self._apply(self.pre_col[table][cname], slot)
+        return self._ite(f"(= {widx} {self._bv(0, ib)})", base, wval)
+
+    def _current_col_slot(self, table: str, cname: str, slot: str,
+                          ctype: ScalarType) -> str:
+        ib = self.idx_bits[(table, cname)]
+        widx = self._select_arr(self.cur_widx[(table, cname)], slot)
+        wval = self._select_arr(self.cur_wval[(table, cname)], widx)
+        base = self._apply(self.pre_col[table][cname], slot)
+        return self._ite(f"(= {widx} {self._bv(0, ib)})", base, wval)
+
+    def _record_write(self, table: str, cname: str, slot: str, value: str) -> None:
+        ib = self.idx_bits[(table, cname)]
+        idx = self.write_counter.get((table, cname), 0) + 1
+        self.write_counter[(table, cname)] = idx
+        base = f"{table}_{cname}_widx"
+        new_widx = self._fresh(base,
+                               f"(declare-const {base}_{self._version.get(base, 0)} (Array (_ BitVec {self.table_slot_bits[table]}) (_ BitVec {ib})))",
+                               ("array", self.table_slot_bits[table], ib))
+        self.assert_common(f"(= {new_widx} {self._store_arr(self.cur_widx[(table, cname)], slot, self._bv(idx, ib))})")
+        self.cur_widx[(table, cname)] = new_widx
+        base = f"{table}_{cname}_wval"
+        new_wval = self._fresh(base,
+                               f"(declare-const {base}_{self._version.get(base, 0)} (Array (_ BitVec {ib}) {self._sort_of(self.prog.tables[table].columns[cname].type)}))",
+                               ("array", ib, "bool" if self.prog.tables[table].columns[cname].type.is_bool else self.prog.tables[table].columns[cname].type.width))
+        self.assert_common(f"(= {new_wval} {self._store_arr(self.cur_wval[(table, cname)], self._bv(idx, ib), value)})")
+        self.cur_wval[(table, cname)] = new_wval
 
     def _current_valid(self, key_expr: str, table: str) -> str:
         slot = self._slot_of_key(key_expr, table)
@@ -430,7 +484,7 @@ class SmtEncoder:
 
     def _pre_valid(self, key_expr: str, table: str) -> str:
         slot = self._slot_of_key(key_expr, table)
-        occ = self._apply(self.pre_occ[table], slot)
+        occ = self._select_arr(self.pre_occ[table], slot)
         gen = self._apply(self.pre_gen[table], slot)
         shift = self.prog.tables[table].layout.key_bits
         gen_bits = min(64 - shift, 32)
@@ -538,7 +592,7 @@ class SmtEncoder:
             sbits = self.table_slot_bits[tname]
             for i in range(cap):
                 slot = self._bv(i, sbits)
-                occ = self._apply(self.pre_occ[tname], slot)
+                occ = self._select_arr(self.pre_occ[tname], slot)
                 for cname, cinfo in tinfo.columns.items():
                     val = self._apply(self.pre_col[tname][cname], slot)
                     self.assert_common(
@@ -555,7 +609,7 @@ class SmtEncoder:
                 for i in range(B):
                     slot = self._select_arr(hkey, self._bv(i, bb))
                     used = self._select_arr(hused, self._bv(i, bb))
-                    occ = self._apply(self.pre_occ[tname], slot)
+                    occ = self._select_arr(self.pre_occ[tname], slot)
                     self.assert_common(f"(=> {used} {occ})")
 
     # --- pre-invariants ----------------------------------------------------
@@ -575,7 +629,7 @@ class SmtEncoder:
             else:
                 slots = self._relevant.get(tname, [])
             for slot in slots:
-                occ = self._apply(self.pre_occ[tname], slot)
+                occ = self._select_arr(self.pre_occ[tname], slot)
                 body = self._encode_forall_body(inv.expr, tname, inv.quant_var,
                                                 slot, "pre")
                 self.assert_common(f"(=> {occ} {body})")
@@ -808,14 +862,19 @@ class SmtEncoder:
         tname = stmt.table
         cinfo = self.prog.tables[tname].columns[stmt.column]
         ctype = cinfo.type
-        key = self._encode_expr(stmt.key, env, "post")
-        slot = self._slot_of_key(key, tname)
-        valid = self._current_valid(key, tname)
-        self._trap_update(self._not(valid))
-        self._pi_update(valid)
+        if isinstance(stmt.key, A.Var) and stmt.key.name in self.alloc_slots:
+            slot = self.alloc_slots[stmt.key.name]
+            valid = "true"
+        else:
+            key = self._encode_expr(stmt.key, env, "post")
+            slot = self._slot_of_key(key, tname)
+            valid = self._current_valid(key, tname)
+            self._trap_update(self._not(valid))
+            self._pi_update(valid)
         val = self._encode_expr(stmt.value, env, "post")
         v_old = self._current_col(tname, stmt.column, key, ctype)
         self.writes.setdefault((tname, stmt.column), []).append((slot, val))
+        self._record_write(tname, stmt.column, slot, val)
         self.modified_slots[tname].append(slot)
         self._record_final(tname, stmt.column, slot, val, None, False)
         if cinfo.tracked_sum:
@@ -866,10 +925,7 @@ class SmtEncoder:
         cap = tinfo.layout.capacity
         sbits = self.table_slot_bits[tname]
         gen_bits = min(64 - tinfo.layout.key_bits, 32)
-        if cap <= self.config.ite_chain_limit:
-            slot = self._lowest_free_ite(tname, cap, sbits)
-        else:
-            slot = self._symbolic_free_slot(tname, cap, sbits)
+        slot = self._symbolic_alloc_slot(tname)
         free_exists = self._not(self._current_occ(tname, slot))
         gen = self._current_gen(tname, slot)
         gen_max = self._bv((1 << gen_bits) - 1, gen_bits)
@@ -883,20 +939,34 @@ class SmtEncoder:
             self._pi_update(f"(=> {active} {alloc_ok})")
         new_gen = f"(bvadd {gen} {self._bv(1, gen_bits)})"
         if tinfo.layout.key_bits == 0:
-            new_id = new_gen
+            raw_id = new_gen
         else:
-            new_id = f"(concat {new_gen} {slot})"
+            raw_id = f"(concat {new_gen} {slot})"
+        id_width = tinfo.layout.generation_bits + tinfo.layout.key_bits
+        new_id = self._extend(raw_id, id_width, 64, False)
         if active is not None:
             new_id = self._ite(active, new_id, self._bv(0, 64))
         env[stmt.name] = new_id
         self.env[stmt.name] = new_id
+        self.alloc_slots[stmt.name] = slot
         self.alloc_records.setdefault(tname, []).append((slot, new_gen))
         self.modified_slots[tname].append(slot)
+        # occupancy array: mark the allocated slot live
+        base = f"{tname}_occ"
+        new_occ_arr = self._fresh(base,
+                                  f"(declare-const {base}_{self._version.get(base, 0)} (Array (_ BitVec {sbits}) Bool))",
+                                  ("array", sbits, "bool"))
+        stored = self._store_arr(self.cur_occ[tname], slot, "true")
+        if active is not None:
+            stored = self._ite(active, stored, self.cur_occ[tname])
+        self.assert_common(f"(= {new_occ_arr} {stored})")
+        self.cur_occ[tname] = new_occ_arr
         for cname, cinfo in tinfo.columns.items():
             fexpr = next((e for n, e in stmt.fields if n == cname), None)
             init = self._zero(cinfo.type) if fexpr is None \
                 else self._encode_expr(fexpr, env, "post", cinfo.type)
             self.writes.setdefault((tname, cname), []).append((slot, init))
+            self._record_write(tname, cname, slot, init)
             self._record_final(tname, cname, slot, init, active, True)
             if cinfo.tracked_sum:
                 self._agg_add(tname, cname, init, cinfo.type, active)
@@ -931,6 +1001,27 @@ class SmtEncoder:
             free = self._not(self._current_occ(table, slot))
             expr = self._ite(free, slot, expr)
         return expr
+
+    def _symbolic_alloc_slot(self, table: str) -> str:
+        """Fresh slot variable constrained to be the lowest free slot.
+
+        The ite-chain over C slots is O(C) nested ites whose equality tests
+        against earlier symbolic slots grow quadratically; a single symbolic
+        slot plus an O(C) lowest-free constraint keeps the slot expression O(1).
+        """
+        tinfo = self.prog.tables[table]
+        cap = tinfo.layout.capacity
+        sbits = self.table_slot_bits[table]
+        base = f"{table}_alloc_slot"
+        name = self._fresh(base,
+                           f"(declare-const {base}_{self._version.get(base, 0)} (_ BitVec {sbits}))",
+                           ("bv", sbits))
+        occ = self.cur_occ[table]
+        self.assert_common(self._not(self._select_arr(occ, name)))
+        for j in range(cap):
+            lit = self._bv(j, sbits)
+            self.assert_common(f"(=> (bvult {lit} {name}) {self._select_arr(occ, lit)})")
+        return name
 
     def _symbolic_free_slot(self, table: str, cap: int, sbits: int) -> str:
         name = self._fresh(f"{table}_alloc_slot",
@@ -981,15 +1072,20 @@ class SmtEncoder:
             tname = stmt.table
             cinfo = self.prog.tables[tname].columns[stmt.column]
             ctype = cinfo.type
-            key = self._encode_expr(stmt.key, env, "post")
-            slot = self._slot_of_key(key, tname)
-            valid = self._current_valid(key, tname)
+            if isinstance(stmt.key, A.Var) and stmt.key.name in self.alloc_slots:
+                slot = self.alloc_slots[stmt.key.name]
+                valid = "true"
+            else:
+                key = self._encode_expr(stmt.key, env, "post")
+                slot = self._slot_of_key(key, tname)
+                valid = self._current_valid(key, tname)
             self._trap_update(self._and(active, self._not(valid)))
             self._pi_update(f"(=> {active} {valid})")
             val = self._encode_expr(stmt.value, env, "post")
             v_old = self._current_col(tname, stmt.column, key, ctype)
-            self.writes.setdefault((tname, stmt.column), []).append(
-                (slot, self._ite(active, val, v_old)))
+            fold_val = self._ite(active, val, v_old)
+            self.writes.setdefault((tname, stmt.column), []).append((slot, fold_val))
+            self._record_write(tname, stmt.column, slot, fold_val)
             self.modified_slots[tname].append(slot)
             self._record_final(tname, stmt.column, slot, val, active, False)
             if cinfo.tracked_sum:
@@ -1045,6 +1141,10 @@ class SmtEncoder:
         if isinstance(expr, A.TableGet):
             cinfo = self.prog.tables[expr.table].columns[expr.column]
             ctype = cinfo.type
+            if isinstance(expr.key, A.Var) and expr.key.name in self.alloc_slots:
+                # Known-slot fast path: the allocation guarantees liveness.
+                slot = self.alloc_slots[expr.key.name]
+                return self._current_col_slot(expr.table, expr.column, slot, ctype)
             key = self._encode_expr(expr.key, env, state)
             if state == "pre":
                 slot = self._slot_of_key(key, expr.table)
@@ -1055,6 +1155,8 @@ class SmtEncoder:
             self._pi_update(valid)
             return self._ite(valid, val, self._zero(ctype))
         if isinstance(expr, A.TableExists):
+            if isinstance(expr.key, A.Var) and expr.key.name in self.alloc_slots:
+                return "true"
             key = self._encode_expr(expr.key, env, state)
             if state == "pre":
                 return self._pre_valid(key, expr.table)

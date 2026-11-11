@@ -165,7 +165,7 @@ def test_smt_script_emission():
     enc.build()
     script = enc.script_full()
     assert "(set-logic QF_ABV)" in script
-    assert "(declare-fun Account_occ" in script
+    assert "(declare-const Account_occ (Array" in script
     assert "check-sat" in script
 
 
@@ -402,3 +402,32 @@ def test_unique_key_rust_codegen_compiles(tmp_path):
     proc = subprocess.run([rustc, "--edition", "2021", "-O", str(out), "-o", str(binary)],
                           capture_output=True, text=True)
     assert proc.returncode == 0, proc.stderr
+
+
+# ---------------------------------------------------------------------------
+# Bounded folds with allocation (indexed write maps + known-slot fast path)
+# ---------------------------------------------------------------------------
+
+def test_fold_alloc_verifies_and_scales():
+    src = """
+module FoldAlloc;
+table Item capacity 64 {
+  key id : id64<Item>;
+  col value : i64;
+  col flag : bool;
+}
+transition build()
+  reads [Item[*].value] writes [Item[*].value, Item[*].flag]
+  body {
+    let %x: i64 = fold_bounded<8>(acc: i64 = 0, i in [0..7]) {
+      let %id: id64<Item> = table_alloc(Item, { value: i, flag: false });
+      let %v: i64 = table_get(Item, %id, value);
+      yield add(acc, %v);
+    };
+    commit;
+  }
+"""
+    prog = analyze(parse_source(src))
+    assert not prog.diags.has_errors()
+    result = verify_transition_dual(prog, "build", SmtConfig(timeout_ms=15000))
+    assert result.ok, result.summary()
