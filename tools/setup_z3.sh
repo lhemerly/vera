@@ -38,5 +38,6 @@ vera_z3_library=$(printf '%s' "$vera_z3_prefix/lib" | sed "s/'/'\\\\''/g")
 {
     printf "export Z3_LIBRARY_PATH_OVERRIDE='%s'\n" "$vera_z3_library"
     printf "export Z3_SYS_Z3_VERSION='%s'\n" "$vera_z3_version"
+    printf "export Z3_NO_PKG_CONFIG='1'\n"
 } > "$vera_z3_root/.deps/z3/env.sh"
 printf '%s\n' "Solver installed. Run: . ./.deps/z3/env.sh"

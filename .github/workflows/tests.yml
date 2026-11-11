@@ -69,6 +69,7 @@ jobs:
           . ./.deps/z3/env.sh
           printf '%s=%s\n' Z3_LIBRARY_PATH_OVERRIDE "$Z3_LIBRARY_PATH_OVERRIDE" >> "$GITHUB_ENV"
           printf '%s=%s\n' Z3_SYS_Z3_VERSION "$Z3_SYS_Z3_VERSION" >> "$GITHUB_ENV"
+          printf '%s=%s\n' Z3_NO_PKG_CONFIG "$Z3_NO_PKG_CONFIG" >> "$GITHUB_ENV"
 
       - name: Formatting and lint
         run: |
