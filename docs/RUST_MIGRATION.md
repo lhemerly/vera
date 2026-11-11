@@ -1,127 +1,100 @@
-# Native Rust toolchain migration
+# Native Rust toolchain
 
-## Problem and current ownership
+VERA 1.2 implements the complete v1.1 language contract in Rust. The production
+`vera` executable supports parsing, checking, verification, execution,
+projections, replay, Rust/GLSL/WGSL/CUDA code generation and bounded fuzzing.
+Python remains an optional independent conformance oracle, exposed separately as
+`vera-reference`. The native compiler never invokes it.
 
-VERA's Python frontend parses syntax, resolves declarations and contextual types,
-and supplies the interpreter, SMT verifier and code generators. The resolved
-types and exact literal values currently live in maps keyed by Python object
-identity. Some consumers reconstruct type context. The existing `vera-rt` crate
-provides execution and persistence infrastructure with a generated concrete
-`spec.rs`; it is not a general-purpose compiler.
+## Representation and ownership
 
-The Rust port will make the compiler and CLI native while preserving the v1.1
-language contract, transaction ordering, checked arithmetic, proof obligations,
-and durable data compatibility. Python remains an independent development
-oracle during migration. The native executable never launches Python.
+The syntax tree preserves exact literals and source spans. `analyze(Module)` is
+the sole constructor of an immutable `CheckedProgram`. Its arena uses stable
+expression, binding, declaration and column IDs. Every expression has a resolved
+scalar and evaluation width; aggregate arithmetic and its operands use explicit
+128/256-bit domains. Assignment, allocation, effects and fold yields check any
+narrowing back to scalars.
 
-## Usage of the first increment
+The interpreter, SMT encoder and all four generators consume that checked
+program directly. Old-state selection applies to entire key subtrees, including
+folds. Lazy selection and eager boolean operators are different IR operations.
+Fold binding IDs remain distinct across sibling scopes. Stateful footprint keys
+conservatively select Tier 2, including dependency through an old-key fold.
 
-```bash
-cargo run --bin vera -- parse examples/bank.vera
-cargo run --bin vera -- parse examples/counter.vera --json
-cargo test --workspace --locked
-cargo build -p vera-compiler --release --locked
-python tools/check_rust_frontend.py --binary target/release/vera
-```
+`runtime` owns validated state, atomic staged transactions, typed effects and
+traces. `projection` uses the same evaluator and types. `batch` uses owned
+candidate snapshots and ordered validation/re-execution; no shared mutable state
+or unsafe optimistic memory access is involved.
 
-```rust
-use vera_compiler::parse_source;
+## Verification
 
-let module = parse_source("module Example;")?;
-let syntax = module.canonical_json();
-# Ok::<(), vera_compiler::Diagnostic>(())
-```
+Z3 runs through native Rust bindings and a statically linked solver. The pinned
+native solver version is recorded in `.cargo/config.toml`; Cargo.lock pins the
+Rust dependencies. Building downloads the official solver archive. This is a
+native C++ dependency, not a Python dependency.
 
-`parse` checks syntax only. It does not establish type correctness, valid
-footprints, invariant preservation, or executable behavior. Native `check`,
-`verify`, `run` and `codegen` are rejected explicitly until their implementations
-are complete. The established Python commands remain available separately.
+The verifier checks partial correctness, evaluated-operation trap freedom, and
+concrete non-vacuity separately. Tables retain their declared capacities. Exact
+finite occupancy, generations, physical columns and aggregate sums constrain the
+initial state. Aggregate SSA updates and ordered write logs avoid repeatedly
+expanding equivalent state expressions. A row-local invariant is rechecked only
+at touched handles when unchanged rows retain its precondition; global and
+cross-row conditions remain exact. Foreign-existence framing requires the target
+occupancy and generations to remain unchanged.
 
-The canonical AST JSON is a development comparison format. Integer values are
-decimal strings inside `{"integer":"..."}`; decimals preserve sign, coefficient
-digits and scale inside `{"decimal":{...}}`. This avoids JSON number rounding and
-does not replace the existing WAL/snapshot program fingerprint format.
+Logical unique lookup overapproximates physical bounded-index execution, allowing
+extra committing paths if an index would saturate. Thus UNSAT remains sound.
+Every SAT safety counterexample, trap or committing witness is reconstructed,
+validated and replayed through the native interpreter. Unreplayable candidates
+are blocked within an explicit attempt limit; exhaustion yields UNKNOWN. Timeout,
+resource exhaustion, invalid models and UNKNOWN never authorize compilation.
 
-## Shape and synthesis decision
+Limits are explicit: the default verifier allows 4096 state cells, 1024 unrolled
+iterations, eight witness attempts and 10000 ms per solver obligation. CLI options
+can change those limits; no capacity is silently reduced. The interpreter limits
+estimated state storage to 256 MiB by default; `State::empty_with_limit` admits a
+larger explicit host budget. Parsing limits nesting to 64 levels.
 
-Use one `vera-compiler` crate with a thin `vera` binary and an existing `vera-rt`
-member in a root Cargo workspace. Parsing owns a recursive syntax AST, exact
-literal representations and UTF-8 byte spans with source line/character column.
-`parse_source` hides tokenization and grammar mechanics behind one fallible
-interface. Canonical serialization excludes source locations.
+## Persistence and CLI recovery
 
-Two designs were considered: a recursively typed tree and an arena of resolved
-typed operations. The syntax tree remains recursive because that matches the
-grammar and gives a small parsing API. Analysis will lower it once to an
-immutable arena-backed checked program. Stable declaration, column, expression
-and binding IDs prevent spelling collisions and object-identity side tables.
-The analyzer will be the sole constructor of that checked program; execution,
-proof and code generation will accept only its resolved representation.
+Canonical source/schema fingerprints retain the historical Python AST identity,
+including exact decimal notation and Unicode escaping; internal arena IDs do not
+enter the wire identity. Native codecs preserve all scalar widths. Golden vectors
+from the previous standalone engine prove exact intent, snapshot and WAL bytes.
+Snapshots validate scalar domains, generations, indexes, sums, effects, checksum
+and invariants. A complete bad WAL is rejected before replay publishes state;
+torn tails recover on reopen. Logged execution stages a transaction, appends and
+syncs its intent, then publishes state. An I/O error never publishes that state.
 
-The planned checked representation has these boundaries:
+`run --wal PATH` replays that log from the supplied original `--setup` baseline
+(or the valid empty state), then durably records the new attempt. Reuse the same
+baseline on subsequent invocations. `replay --wal PATH` recovers without a new
+attempt. `--snapshot-out PATH` checkpoints the resulting state. Snapshot v2 does
+not contain a WAL cursor, so the CLI rejects `--snapshot-in` with `--wal`; callers
+must rotate/checkpoint logs explicitly rather than replaying old intents twice.
+Snapshot output cannot alias the WAL, including existing hard links/symlinks.
+Setup accepts flat rows with an `id` handle or nested
+`{"id": HANDLE, "columns": {"column": VALUE}}` rows. A legal column named `id`
+uses the nested form in CLI output and wildcard projection rows so its value
+cannot overwrite the handle. Ordinary table output retains the historical shape.
 
-```rust,ignore
-fn analyze(syntax: ast::Module) -> Result<CheckedProgram, Vec<Diagnostic>>;
+## Backends and validation
 
-struct TypedExpr {
-    span: Span,
-    domain: ValueDomain,
-    operation: TypedOperation,
-}
+Generated Rust uses only `std`, or optionally `vera-rt` for the shared WAL engine.
+The GPU backends share exact limb arithmetic with 512-bit intermediates and
+retain declared table capacities, sequential evaluation, rollback, checked
+handles, indexes, sums, effects and laws. GPU effects are counted/digested rather
+than delivered to an external consumer.
 
-enum ValueDomain {
-    Scalar(ScalarType),
-    Aggregate { scalar: ScalarType, width: AccumulatorWidth },
-}
-```
+Native tests execute standalone Rust, CUDA's portable C++ mode, WGSL through Rust
+wgpu on Mesa, and GLSL through EGL. The independent Python corpus checks full
+ASTs, semantic admission, fold/WCET metadata and execution at scalar boundaries.
+Three legacy Tier-1 classifications become conservative Tier 2 because their
+keys depend on state. The fixtures remain admitted; the new classification is
+intentional. The full historical language/backend suite is retained.
 
-These are design sketches, not stub APIs in the crate. The implemented syntax
-types must not be mistaken for a checked program. An arithmetic operation's
-domain is distinct from the boolean result of a comparison. Checked handle reads
-and total physical-slot specification reads remain different operations; lazy
-selection remains distinct from eager boolean evaluation. Pre-state reads are
-explicit, including keys computed by pure folds.
-
-We accept a temporary duplicate syntax frontend in exchange for an independent
-behavioral oracle. We accept arbitrary-precision integer parsing through
-`num-bigint`, and `serde`/`serde_json` for deterministic development interchange,
-instead of narrowing literals or implementing a second big-integer library.
-Verifier, interpreter and backend crates will be split out only when they have
-meaningful implementations. A Python subprocess bridge and multiple untyped
-backend-specific semantic models were rejected: both preserve the dependency
-and divergence this migration is intended to remove.
-
-## Verifiable delivery sequence
-
-| Increment | Native behavior | Status |
-|---|---|---|
-| 1 | Cargo workspace, exact literals, complete v1.1 syntax, diagnostics, AST JSON and `parse` CLI | Implemented in this branch |
-| 2 | Full declaration/expression analysis, lexical bindings, footprints, folds, effects, purity and resolved typed IR; `check` | Next |
-| 3 | Checked interpreter, atomic transactions, projections and persistence compatibility | Pending |
-| 4 | Z3 integration, exact/frame proofs, fail-closed verdicts and counterexample replay; `verify` | Pending |
-| 5 | Native Rust/GLSL/WGSL/CUDA emitters, proof-gated CLI, packaged single binary | Pending |
-| 6 | Retire Python production entry points, retain optional differential tests | Pending |
-
-Each increment must pass its native tests and the relevant Python differential
-corpus before the next begins. The first increment compares full normalized
-ASTs against the examples and statically extracted fixtures from the existing
-test suite. Native CLI tests run with an empty `PATH`. The compiler has no
-runtime dependency on the test harness or Python package.
-
-## Compatibility and remaining risks
-
-Parser diagnostics carry source positions; their wording need not match Python.
-The parser enforces a 64-level nesting resource limit with an error rather than allowing
-unbounded call-stack growth. Large integer and decimal syntax is preserved until
-contextual range checking in increment 2; successful parsing does not admit an
-oversized scalar into execution.
-
-Later native code generation must reproduce the current canonical program
-identity or explicitly version it. Arena IDs are internal and must not silently
-become persistent wire identifiers. The existing little-endian argument codecs,
-WAL sequences/checksums, snapshots and restart behavior remain compatibility
-tests for the interpreter/persistence increment.
-
-The standalone runtime retains its own lockfile for existing workflows that copy
-that crate outside this repository. The root `Cargo.lock` is authoritative for
-workspace builds.
+Native NVIDIA compilation/device execution and accelerated io_uring on an
+enabled kernel remain target-host validation, not claims made by Mesa or the
+portable fallback tests. Native Linux release archives require x86-64 glibc 2.39+
+and a compatible C++ standard library. `tools/package_native.sh` creates the
+archive/checksum; CI uploads it without automatically publishing a release.

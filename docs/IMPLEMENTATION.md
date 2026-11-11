@@ -1,7 +1,8 @@
 # VERA implementation contract
 
-This work completes the language admitted by the v1.1 parser and closes the
-semantic differences found in review of upstream commit `84badd1`.
+The native Rust compiler implements the language admitted by the v1.1 parser.
+The optional Python reference completed the original correctness repairs from
+upstream commit `84badd1`; it remains an independent development oracle.
 
 ## Delivery sequence
 
@@ -18,13 +19,13 @@ semantic differences found in review of upstream commit `84badd1`.
 
 ## Architecture decision
 
-Two alternatives were considered: replace every backend with a new common
-operation IR, or retain the existing AST and proven encoding optimizations while
-making resolved expression types and literal values authoritative. The latter
-keeps the implementation reviewable and avoids replacing the verifier and every
-runtime simultaneously. `Program.expr_types` and `Program.literal_values` are the
-shared typed contract. Backends must reject nodes they cannot lower; returning a
-dummy value is never a successful compilation.
+The native implementation lowers the exact syntax AST once to an immutable
+typed arena. Stable declaration, binding, expression and column IDs replace
+object identity and repeated type inference. The interpreter, verifier and all
+four generators consume `CheckedProgram`. Scalar and aggregate evaluation widths
+are explicit, including comparison operands and scalar narrowing boundaries.
+Backends reject resource limits or invalid lowering; returning a dummy value is
+never a successful compilation. See [the native design](RUST_MIGRATION.md).
 
 The Python reference retains an undo log with complete mutation coverage. Rust
 executes against private staged state and publishes only successful outcomes.

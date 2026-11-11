@@ -268,10 +268,7 @@ impl IoUring {
             let head = (*self.sq_head).load(Ordering::Acquire);
             let tail = (*self.sq_tail).load(Ordering::Relaxed);
             if tail.wrapping_sub(head) > self.sq_mask {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    "submission queue is full",
-                ));
+                return Err(io::Error::other("submission queue is full"));
             }
             self.serial = self.serial.wrapping_add(1);
             let serial = self.serial;
