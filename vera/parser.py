@@ -5,6 +5,7 @@ specification layer additionally accepts infix sugar which is normalized to the
 same canonical AST (Law 4: one internal representation per operation).
 """
 
+from decimal import Decimal
 from typing import List, Optional, Tuple
 
 from . import ast_nodes as A
@@ -521,7 +522,11 @@ class Parser:
             if isinstance(operand, A.Literal) and not isinstance(
                 operand.value, (bool, str)
             ):
-                operand.value = -operand.value
+                operand.value = (
+                    operand.value.copy_negate()
+                    if isinstance(operand.value, Decimal)
+                    else -operand.value
+                )
                 return operand
             return A.Unary("neg", operand, tok.line, tok.col)
         if tok.kind == "int":
@@ -778,7 +783,11 @@ class Parser:
                 and isinstance(operand, A.Literal)
                 and not isinstance(operand.value, (bool, str))
             ):
-                operand.value = -operand.value
+                operand.value = (
+                    operand.value.copy_negate()
+                    if isinstance(operand.value, Decimal)
+                    else -operand.value
+                )
                 return operand
             return A.Unary(_PREFIX_UNARY[tok.value], operand, tok.line, tok.col)
         if tok.kind == "keyword" and tok.value in _CANONICAL_UNARY:
