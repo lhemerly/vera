@@ -630,6 +630,15 @@ class RustGenerator:
                 for ap in getattr(ti.decl, which):
                     self.line("                Access::new(" + self._table_const(ap.table) + ", "
                               + self._slot_expr(ap.key, env) + ", \"" + ap.column + "\"),")
+                if which == "writes":
+                    # Spec 5.1: the write set includes the tracked_sum accumulator
+                    # (Agg, T.c). Without it, disjoint-slot transfers run in
+                    # parallel and race on the shared accumulator (lost update).
+                    for wt in {ap.table for ap in ti.decl.writes}:
+                        for cinfo in self.prog.tables[wt].columns.values():
+                            if cinfo.tracked_sum:
+                                self.line("                Access::new(" + self._table_const(wt)
+                                          + ", WILDCARD, \"agg_" + cinfo.name + "\"),")
                 self.line("            ],")
             self.line("        }")
             self.line("    }")

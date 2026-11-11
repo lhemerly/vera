@@ -300,6 +300,11 @@ pub const TABLE_ACCOUNT: u8 = 0;
 pub const TABLE_ORDER: u8 = 1;
 
 pub const WILDCARD: u64 = u64::MAX;
+fn u64_to_bytes32(v: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    out[0..8].copy_from_slice(&v.to_le_bytes());
+    out
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct Access { pub table: u8, pub slot: u64, pub column: &'static str }
@@ -338,9 +343,11 @@ impl Params {
             Params::Transfer { from, to, amount } => vec![
                 Access::new(TABLE_ACCOUNT, ((from) & ((1u64 << KEY_BITS_ACCOUNT) - 1)), "balance"),
                 Access::new(TABLE_ACCOUNT, ((to) & ((1u64 << KEY_BITS_ACCOUNT) - 1)), "balance"),
+                Access::new(TABLE_ACCOUNT, WILDCARD, "agg_balance"),
             ],
             Params::Freeze { acct } => vec![
                 Access::new(TABLE_ACCOUNT, ((acct) & ((1u64 << KEY_BITS_ACCOUNT) - 1)), "frozen"),
+                Access::new(TABLE_ACCOUNT, WILDCARD, "agg_balance"),
             ],
             Params::PlaceOrder { buyer, amount } => vec![
                 Access::new(TABLE_ORDER, WILDCARD, "owner"),

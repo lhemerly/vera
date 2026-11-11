@@ -67,3 +67,36 @@ fn main() {
     assert_eq!(replay.account.col_balance[1], state.account.col_balance[1]);
     println!("replay matches live state: deterministic");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disjoint_transfers_preserve_the_aggregate() {
+        let k = |s: u64| (1u64 << KEY_BITS_ACCOUNT) | s;
+        let mut bad = 0u32;
+        for _ in 0..50000 {
+            let mut state = State::new();
+            state.account.occupied_bitmap[0] |= 0xFFFFu64;
+            for s in 0..16 {
+                state.account.generation[s] = 1;
+                state.account.col_balance[s] = 1_000_000;
+            }
+            state.account.agg_sum_balance = 16_000_000;
+            let mut intents = Vec::new();
+            for s in 0..8u64 {
+                intents.push(Params::Transfer {
+                    from: k(s * 2),
+                    to: k(s * 2 + 1),
+                    amount: 100_000 + s as i64 * 10_000,
+                });
+            }
+            let _ = run_batch(&mut state, &intents);
+            if state.account.agg_sum_balance != 16_000_000 {
+                bad += 1;
+            }
+        }
+        assert_eq!(bad, 0, "lost update on the tracked_sum accumulator in {bad}/50000 runs");
+    }
+}
