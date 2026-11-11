@@ -30,10 +30,31 @@ jobs:
 
       - name: Install native test tools
         run: |
-          ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
-          if ! test -f "$ubuntu_sources"; then ubuntu_sources=/etc/apt/sources.list; fi
-          sudo apt-get -o Dir::Etc::sourcelist="$ubuntu_sources" -o Dir::Etc::sourceparts=- -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
-          sudo apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends build-essential curl unzip glslang-tools libegl-dev libgl-dev libgl1-mesa-dri
+          . /etc/os-release
+          vera_ubuntu_sources="$RUNNER_TEMP/vera-ubuntu.sources"
+          printf '%s\n' \
+            'Types: deb' \
+            'URIs: https://archive.ubuntu.com/ubuntu' \
+            "Suites: $VERSION_CODENAME ${VERSION_CODENAME}-updates ${VERSION_CODENAME}-backports" \
+            'Components: main universe' \
+            'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+            '' \
+            'Types: deb' \
+            'URIs: https://security.ubuntu.com/ubuntu' \
+            "Suites: ${VERSION_CODENAME}-security" \
+            'Components: main universe' \
+            'Signed-By: /usr/share/keyrings/ubuntu-archive-keyring.gpg' \
+            > "$vera_ubuntu_sources"
+          vera_apt_options=(
+            -o "Dir::Etc::sourcelist=$vera_ubuntu_sources"
+            -o Dir::Etc::sourceparts=-
+            -o Acquire::Retries=2
+            -o Acquire::http::Timeout=30
+            -o Acquire::https::Timeout=30
+            -o DPkg::Lock::Timeout=60
+          )
+          sudo apt-get "${vera_apt_options[@]}" -o APT::Update::Error-Mode=any update
+          sudo apt-get "${vera_apt_options[@]}" install -y --no-install-recommends build-essential curl unzip glslang-tools libegl-dev libgl-dev libgl1-mesa-dri
 
       - name: Install static solver
         run: |
