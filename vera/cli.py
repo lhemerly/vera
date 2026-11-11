@@ -264,7 +264,7 @@ def cmd_project(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="vera", description="VERA v1.0 toolchain")
+    parser = argparse.ArgumentParser(prog="vera", description="VERA v1.1.0 toolchain")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("check", help="parse and analyze a VERA module")

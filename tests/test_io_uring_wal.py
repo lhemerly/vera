@@ -24,6 +24,10 @@ def test_io_uring_wal_deterministic_replay(tmp_path):
         generate_rust(prog, use_rt=True, include_main=False))
     build = subprocess.run([cargo, "build", "--offline"], cwd=crate,
                            capture_output=True, text=True)
+    if build.returncode != 0:
+        # Fresh checkouts may not have the libc crate cached; retry online.
+        build = subprocess.run([cargo, "build"], cwd=crate,
+                               capture_output=True, text=True)
     assert build.returncode == 0, build.stderr
     run_dir = tmp_path / "run"
     run_dir.mkdir()

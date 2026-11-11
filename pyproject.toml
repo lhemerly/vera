@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vera-lang"
-version = "1.0.0"
+version = "1.1.0"
 description = "VERA: Verified Relational Architecture — language, verifier, and runtime"
 readme = "README.md"
 requires-python = ">=3.11"
