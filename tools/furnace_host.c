@@ -40,11 +40,19 @@ int main(int argc, char **argv) {
     long src_len = 0;
     char *src = read_file(argv[1], &src_len);
     int workgroups = argc > 2 ? atoi(argv[2]) : 64;
+    if (workgroups <= 0) { fprintf(stderr, "workgroups must be positive\n"); free(src); return 2; }
 
     EGLDisplay dpy = eglGetDisplay(EGL_DEFAULT_DISPLAY);
-    if (dpy == EGL_NO_DISPLAY) { fprintf(stderr, "no EGL display\n"); return 1; }
     EGLint major = 0, minor = 0;
-    if (!eglInitialize(dpy, &major, &minor)) { fprintf(stderr, "eglInitialize failed\n"); return 1; }
+    if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &major, &minor)) {
+        PFNEGLGETPLATFORMDISPLAYEXTPROC platform_display =
+            (PFNEGLGETPLATFORMDISPLAYEXTPROC)eglGetProcAddress("eglGetPlatformDisplayEXT");
+        dpy = platform_display ? platform_display(EGL_PLATFORM_SURFACELESS_MESA,
+                                                  EGL_DEFAULT_DISPLAY, NULL) : EGL_NO_DISPLAY;
+        if (dpy == EGL_NO_DISPLAY || !eglInitialize(dpy, &major, &minor)) {
+            fprintf(stderr, "GPU_UNAVAILABLE: no usable EGL display\n"); free(src); return 77;
+        }
+    }
     printf("EGL %d.%d, vendor=%s\n", major, minor, eglQueryString(dpy, EGL_VENDOR));
 
     EGLint cfg_attribs[] = {
@@ -56,7 +64,7 @@ int main(int argc, char **argv) {
     EGLConfig cfg;
     EGLint num_cfg = 0;
     if (!eglChooseConfig(dpy, cfg_attribs, &cfg, 1, &num_cfg) || num_cfg < 1) {
-        fprintf(stderr, "no EGL config\n"); return 1;
+        fprintf(stderr, "GPU_UNAVAILABLE: no EGL config\n"); eglTerminate(dpy); free(src); return 77;
     }
     eglBindAPI(EGL_OPENGL_API);
     EGLint ctx_attribs[] = {
@@ -66,9 +74,9 @@ int main(int argc, char **argv) {
         EGL_NONE,
     };
     EGLContext ctx = eglCreateContext(dpy, cfg, EGL_NO_CONTEXT, ctx_attribs);
-    if (ctx == EGL_NO_CONTEXT) { fprintf(stderr, "eglCreateContext failed\n"); return 1; }
+    if (ctx == EGL_NO_CONTEXT) { fprintf(stderr, "GPU_UNAVAILABLE: OpenGL 4.6 unavailable\n"); eglTerminate(dpy); free(src); return 77; }
     if (!eglMakeCurrent(dpy, EGL_NO_SURFACE, EGL_NO_SURFACE, ctx)) {
-        fprintf(stderr, "eglMakeCurrent (surfaceless) failed\n"); return 1;
+        fprintf(stderr, "GPU_UNAVAILABLE: surfaceless EGL unavailable\n"); eglDestroyContext(dpy, ctx); eglTerminate(dpy); free(src); return 77;
     }
     printf("GL renderer: %s\n", (const char *)glGetString(GL_RENDERER));
     printf("GL version : %s\n", (const char *)glGetString(GL_VERSION));
@@ -113,7 +121,7 @@ int main(int argc, char **argv) {
     uint32_t *res = (uint32_t *)glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, sizeof(out), GL_MAP_READ_BIT);
     if (!res) { fprintf(stderr, "map failed\n"); return 1; }
     printf("workgroups=%d threads=%d\n", workgroups, workgroups * 32);
-    printf("violations=%u committed=%u\n", res[0], res[1]);
+    printf("violations=%u committed=%u reverted=%u effects=%u\n", res[0], res[1], res[2], res[3]);
     glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 
     glDeleteProgram(program);

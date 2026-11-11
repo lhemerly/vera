@@ -17,6 +17,16 @@ from .runtime import Revert, State, Transaction
 from .semantic import Program
 
 
+def _json_value(value):
+    if isinstance(value, bytes):
+        return "0x" + value.hex()
+    if isinstance(value, dict):
+        return {k: _json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(v) for v in value]
+    return value
+
+
 @dataclass
 class Affordance:
     transition: str
@@ -25,8 +35,12 @@ class Affordance:
     reason: str = ""
 
     def to_json(self) -> dict:
-        return {"transition": self.transition, "enabled": self.enabled,
-                "bounds": self.bounds, "reason": self.reason}
+        return {
+            "transition": self.transition,
+            "enabled": self.enabled,
+            "bounds": _json_value(self.bounds),
+            "reason": self.reason,
+        }
 
 
 @dataclass
@@ -42,23 +56,35 @@ class AffordanceFrame:
             "projection": self.projection,
             "allowed": self.allowed,
             "reason": self.reason,
-            "state_slice": self.state_slice,
+            "state_slice": _json_value(self.state_slice),
             "affordances": [a.to_json() for a in self.affordances],
         }
 
 
-def _eval(prog: Program, state: State, params: Dict[str, object],
-          expr: A.Expr) -> object:
+def _eval(
+    prog: Program, state: State, params: Dict[str, object], expr: A.Expr
+) -> object:
     tx = Transaction(prog, state, "_project", params)
     return tx.value_of(expr, "post")
 
 
-def build_affordance_frame(prog: Program, state: State, projection_name: str,
-                           params: Dict[str, object]) -> AffordanceFrame:
+def build_affordance_frame(
+    prog: Program, state: State, projection_name: str, params: Dict[str, object]
+) -> AffordanceFrame:
     proj = prog.projections.get(projection_name)
     if proj is None:
         raise Revert(D_PROJECTION)
     decl = proj.decl
+    if set(params) != set(proj.param_types):
+        raise Revert("ERR_INVALID_PARAMS")
+    validator = Transaction(prog, state, "_project", {})
+    try:
+        params = {
+            name: validator._coerce(ctype, params[name])
+            for name, ctype in proj.param_types.items()
+        }
+    except Revert:
+        raise Revert("ERR_INVALID_PARAMS") from None
     frame = AffordanceFrame(projection=projection_name, allowed=False)
 
     # allow_if
@@ -88,9 +114,13 @@ def build_affordance_frame(prog: Program, state: State, projection_name: str,
             row = _eval(prog, state, params, sl.row)
             slot = t.slot_of(int(row))
             key = (t.gen[slot] << t.key_bits) | slot
-            value = t.columns[sl.column][slot] if t.occ[slot] else None
+            live = t.valid(row)
+            value = t.columns[sl.column][slot] if live else None
             frame.state_slice[f"{sl.table}.{sl.column}[{row}]"] = {
-                "id": key, "value": value, "live": bool(t.occ[slot])}
+                "id": row,
+                "value": value,
+                "live": live,
+            }
 
     # enable_intents + parameter bounds
     for ig in decl.enable_intents:
@@ -105,8 +135,9 @@ def build_affordance_frame(prog: Program, state: State, projection_name: str,
     return frame
 
 
-def _derive_bounds(prog: Program, state: State, params: Dict[str, object],
-                   transition: str) -> Dict[str, Dict[str, object]]:
+def _derive_bounds(
+    prog: Program, state: State, params: Dict[str, object], transition: str
+) -> Dict[str, Dict[str, object]]:
     ti = prog.transitions[transition]
     bound: Dict[str, Dict[str, object]] = {p.name: {} for p in ti.decl.params}
 
@@ -119,12 +150,21 @@ def _derive_bounds(prog: Program, state: State, params: Dict[str, object],
     return bound
 
 
-def _collect_bound(prog: Program, state: State, params: Dict[str, object],
-                   expr: A.Expr, out: Dict[str, Dict[str, object]]) -> None:
+def _collect_bound(
+    prog: Program,
+    state: State,
+    params: Dict[str, object],
+    expr: A.Expr,
+    out: Dict[str, Dict[str, object]],
+) -> None:
     """Extract simple parameter interval bounds from a require clause."""
     if not isinstance(expr, A.Binary):
         return
     op = expr.op
+    if op == "and":
+        _collect_bound(prog, state, params, expr.left, out)
+        _collect_bound(prog, state, params, expr.right, out)
+        return
     if op not in ("ge", "le", "gt", "lt", "eq"):
         return
     left, right = expr.left, expr.right
@@ -137,13 +177,13 @@ def _collect_bound(prog: Program, state: State, params: Dict[str, object],
             except Revert:
                 return
             if op == "ge":
-                out[pname]["min"] = val
+                out[pname]["min"] = max(out[pname].get("min", val), val)
             elif op == "gt":
-                out[pname]["min"] = val + 1
+                out[pname]["min"] = max(out[pname].get("min", val + 1), val + 1)
             elif op == "le":
-                out[pname]["max"] = val
+                out[pname]["max"] = min(out[pname].get("max", val), val)
             elif op == "lt":
-                out[pname]["max"] = val - 1
+                out[pname]["max"] = min(out[pname].get("max", val - 1), val - 1)
             elif op == "eq":
                 out[pname]["exact"] = val
         return
@@ -156,13 +196,13 @@ def _collect_bound(prog: Program, state: State, params: Dict[str, object],
             except Revert:
                 return
             if op == "ge":
-                out[pname]["max"] = val
+                out[pname]["max"] = min(out[pname].get("max", val), val)
             elif op == "gt":
-                out[pname]["max"] = val - 1
+                out[pname]["max"] = min(out[pname].get("max", val - 1), val - 1)
             elif op == "le":
-                out[pname]["min"] = val
+                out[pname]["min"] = max(out[pname].get("min", val), val)
             elif op == "lt":
-                out[pname]["min"] = val + 1
+                out[pname]["min"] = max(out[pname].get("min", val + 1), val + 1)
             elif op == "eq":
                 out[pname]["exact"] = val
 
@@ -175,8 +215,11 @@ def _contains_var(expr: A.Expr, name: str) -> bool:
     if isinstance(expr, A.Binary):
         return _contains_var(expr.left, name) or _contains_var(expr.right, name)
     if isinstance(expr, A.Select):
-        return (_contains_var(expr.cond, name) or _contains_var(expr.a, name)
-                or _contains_var(expr.b, name))
+        return (
+            _contains_var(expr.cond, name)
+            or _contains_var(expr.a, name)
+            or _contains_var(expr.b, name)
+        )
     if isinstance(expr, A.TableAccess):
         return _contains_var(expr.key, name)
     if isinstance(expr, A.TableGet):

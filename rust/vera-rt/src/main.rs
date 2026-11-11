@@ -20,15 +20,40 @@ fn main() {
     let key1 = (1u64 << KEY_BITS_ACCOUNT) | 1u64;
 
     let intents = vec![
-        Params::Transfer { from: key0, to: key1, amount: 100_000000 },
-        Params::Transfer { from: key1, to: key0, amount: 50_000000 },
+        Params::Transfer {
+            from: key0,
+            to: key1,
+            amount: 100_000000,
+        },
+        Params::Transfer {
+            from: key1,
+            to: key0,
+            amount: 50_000000,
+        },
         Params::Freeze { acct: key0 },
-        Params::PlaceOrder { buyer: key1, amount: 10_000000 },
+        Params::PlaceOrder {
+            buyer: key1,
+            amount: 10_000000,
+        },
     ];
 
     // Intent WAL via io_uring (falls back to pwrite if unavailable).
     let mut wal = ::vera_rt::IoUringWAL::open("vera.wal").unwrap();
-    println!("wal backend: {}", if wal.uses_io_uring() { "io_uring" } else { "pwrite" });
+    // Reconstruct the committed state before accepting another batch. Typed
+    // reverts are deterministic log outcomes and intentionally leave no writes.
+    for record in wal.replay().expect("valid existing WAL") {
+        let intent = Params::decode(record.transition, &record.args)
+            .expect("existing WAL belongs to this program");
+        let _ = intent.execute(&mut state);
+    }
+    println!(
+        "wal backend: {}",
+        if wal.uses_io_uring() {
+            "io_uring"
+        } else {
+            "pwrite"
+        }
+    );
     for intent in &intents {
         let (tid, args) = intent.encode();
         wal.append(tid, args).unwrap();
@@ -36,7 +61,7 @@ fn main() {
     wal.sync().unwrap();
     println!("wal tx_seq = {}", wal.tx_seq);
 
-    // Tier-1 dispatcher: conflict analysis + lock-free waves.
+    // Ordered speculative dispatcher with validation and serial re-execution.
     let results = run_batch(&mut state, &intents);
     let committed = results.iter().filter(|r| r.is_ok()).count();
     println!("batch committed {}/{}", committed, intents.len());
@@ -45,7 +70,10 @@ fn main() {
     println!("agg_sum_balance = {}", state.account.agg_sum_balance);
 
     snapshot(&state, "vera.snap").unwrap();
-    println!("snapshot bytes = {}", std::fs::metadata("vera.snap").unwrap().len());
+    println!(
+        "snapshot bytes = {}",
+        std::fs::metadata("vera.snap").unwrap().len()
+    );
 
     // Replay the WAL deterministically and compare against the live state.
     let records = ::vera_rt::replay_file("vera.wal").unwrap();
@@ -57,14 +85,20 @@ fn main() {
     replay.account.col_balance[1] = 300_000000;
     replay.account.agg_sum_balance = 800_000000;
     for rec in &records {
-        let intent = Params::decode(rec.transition, rec.args);
+        let intent = Params::decode(rec.transition, &rec.args).expect("valid persisted intent");
         let _ = intent.execute(&mut replay);
     }
     println!("replay records = {}", records.len());
     println!("replay balance[0] = {}", replay.account.col_balance[0]);
     println!("replay balance[1] = {}", replay.account.col_balance[1]);
-    assert_eq!(replay.account.col_balance[0], state.account.col_balance[0]);
-    assert_eq!(replay.account.col_balance[1], state.account.col_balance[1]);
+    assert_eq!(
+        replay.encode(),
+        state.encode(),
+        "all tables, generations, indexes, aggregates and effects must replay identically"
+    );
+    let restored =
+        State::decode(std::fs::read("vera.snap").unwrap()).expect("valid portable snapshot");
+    assert_eq!(restored.encode(), state.encode());
     println!("replay matches live state: deterministic");
 }
 
@@ -97,6 +131,9 @@ mod tests {
                 bad += 1;
             }
         }
-        assert_eq!(bad, 0, "lost update on the tracked_sum accumulator in {bad}/50000 runs");
+        assert_eq!(
+            bad, 0,
+            "lost update on the tracked_sum accumulator in {bad}/50000 runs"
+        );
     }
 }

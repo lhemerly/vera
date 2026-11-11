@@ -1,9 +1,11 @@
 """Fixed-width scalar types, binary memory layout, and id64 key semantics."""
 
 from dataclasses import dataclass, field
+from decimal import Decimal
+import hashlib
 from typing import Dict, List, Optional, Tuple
 
-from .errors import D_CAPACITY, D_UNKNOWN_TABLE, VeraError
+from .errors import D_CAPACITY, D_UNKNOWN_COLUMN, D_UNKNOWN_TABLE, VeraError
 
 # Maximum probe sequence length for secondary unique-key indexes (Section 2.3).
 MAX_PROBES = 16
@@ -14,11 +16,11 @@ class ScalarType:
     """A VERA primitive scalar type (Section 2.1)."""
 
     kind: str
-    width: int                      # bit width
-    align: int                      # byte alignment
-    key_table: Optional[str] = None # for id64<T>
+    width: int  # bit width
+    align: int  # byte alignment
+    key_table: Optional[str] = None  # for id64<T>
     enum_tags: Tuple[str, ...] = ()
-    scale: int = 0                  # for dec64/dec128: 10**scale units per integer
+    scale: int = 0  # for dec64/dec128: 10**scale units per integer
 
     # --- derived facts -----------------------------------------------------
     @property
@@ -31,11 +33,23 @@ class ScalarType:
 
     @property
     def is_numeric(self) -> bool:
-        return self.kind in ("u8", "u16", "u32", "u64", "i64", "dec64", "dec128")
+        return self.kind in (
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "u128",
+            "u256",
+            "i64",
+            "i128",
+            "i256",
+            "dec64",
+            "dec128",
+        )
 
     @property
     def is_signed(self) -> bool:
-        return self.kind in ("i64", "dec64", "dec128")
+        return self.kind in ("i64", "i128", "i256", "dec64", "dec128")
 
     @property
     def is_decimal(self) -> bool:
@@ -58,14 +72,14 @@ class ScalarType:
         k = self.kind
         if k == "bool":
             return 0
-        if k in ("u8", "u16", "u32", "u64", "sym32", "bytes32", "id64"):
+        if k in ("u8", "u16", "u32", "u64", "u128", "u256", "sym32", "bytes32", "id64"):
             return 0
-        if k == "i64":
-            return -(2 ** 63)
+        if k in ("i64", "i128", "i256"):
+            return -(2 ** (self.width - 1))
         if k == "dec64":
-            return -(2 ** 63)
+            return -(2 ** (self.width - 1))
         if k == "dec128":
-            return -(2 ** 127)
+            return -(2 ** (self.width - 1))
         if k == "enum":
             return 0
         raise KeyError(k)
@@ -76,21 +90,21 @@ class ScalarType:
         if k == "bool":
             return 1
         if k == "u8":
-            return 2 ** 8 - 1
+            return 2**self.width - 1
         if k == "u16":
-            return 2 ** 16 - 1
+            return 2**self.width - 1
         if k in ("u32", "sym32"):
-            return 2 ** 32 - 1
-        if k in ("u64", "id64"):
-            return 2 ** 64 - 1
-        if k == "i64":
-            return 2 ** 63 - 1
+            return 2**self.width - 1
+        if k in ("u64", "u128", "u256", "id64"):
+            return 2**self.width - 1
+        if k in ("i64", "i128", "i256"):
+            return 2 ** (self.width - 1) - 1
         if k == "dec64":
-            return 2 ** 63 - 1
+            return 2 ** (self.width - 1) - 1
         if k == "dec128":
-            return 2 ** 127 - 1
+            return 2 ** (self.width - 1) - 1
         if k == "bytes32":
-            return 2 ** 256 - 1
+            return 2**256 - 1
         if k == "enum":
             return max(0, len(self.enum_tags) - 1)
         raise KeyError(k)
@@ -106,20 +120,42 @@ class ScalarType:
     def rust_type(self) -> str:
         return {
             "bool": "bool",
-            "u8": "u8", "u16": "u16", "u32": "u32", "u64": "u64",
-            "i64": "i64", "dec64": "i64", "dec128": "i128",
-            "sym32": "u32", "bytes32": "[u8; 32]", "id64": "u64",
+            "u8": "u8",
+            "u16": "u16",
+            "u32": "u32",
+            "u64": "u64",
+            "i64": "i64",
+            "dec64": "i64",
+            "dec128": "i128",
+            "sym32": "u32",
+            "bytes32": "[u8; 32]",
+            "id64": "u64",
             "enum": "u8",
+            "i128": "i128",
+            "u128": "u128",
+            "i256": "I256",
+            "u256": "U256",
         }[self.kind]
 
     @property
     def rust_ctype(self) -> str:
         return {
             "bool": "bool",
-            "u8": "uint8_t", "u16": "uint16_t", "u32": "uint32_t",
-            "u64": "uint64_t", "i64": "int64_t", "dec64": "int64_t",
-            "dec128": "__int128", "sym32": "uint32_t",
-            "bytes32": "uint8_t[32]", "id64": "uint64_t", "enum": "uint8_t",
+            "u8": "uint8_t",
+            "u16": "uint16_t",
+            "u32": "uint32_t",
+            "u64": "uint64_t",
+            "i64": "int64_t",
+            "dec64": "int64_t",
+            "dec128": "__int128",
+            "sym32": "uint32_t",
+            "bytes32": "uint8_t[32]",
+            "id64": "uint64_t",
+            "enum": "uint8_t",
+            "i128": "__int128",
+            "u128": "unsigned __int128",
+            "i256": "vera_i256",
+            "u256": "vera_u256",
         }[self.kind]
 
     def __str__(self) -> str:
@@ -143,8 +179,15 @@ SYM32 = ScalarType("sym32", 32, 4)
 BYTES32 = ScalarType("bytes32", 256, 32)
 
 _PRIMITIVES = {
-    "bool": BOOL, "u8": U8, "u16": U16, "u32": U32, "u64": U64,
-    "i64": I64, "dec64": DEC64, "dec128": DEC128, "sym32": SYM32,
+    "bool": BOOL,
+    "u8": U8,
+    "u16": U16,
+    "u32": U32,
+    "u64": U64,
+    "i64": I64,
+    "dec64": DEC64,
+    "dec128": DEC128,
+    "sym32": SYM32,
     "bytes32": BYTES32,
 }
 
@@ -169,6 +212,74 @@ def enum_type(tags: Tuple[str, ...]) -> ScalarType:
 
 def scalar_from_name(name: str) -> Optional[ScalarType]:
     return _PRIMITIVES.get(name)
+
+
+def symbol_id(text: str) -> int:
+    """Stable symbol encoding shared by all compilation and ingress paths."""
+    return int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:4], "little")
+
+
+def literal_value(value, ctype: ScalarType):
+    """Normalize a source literal without binary floating point or rounding.
+
+    Integer decimal literals already denote scaled units. Fractional literals
+    denote human decimals and must be exactly representable at the type scale.
+    """
+    if ctype.is_bool:
+        if type(value) is not bool:
+            raise ValueError("bool requires a boolean value")
+        return value
+    if isinstance(value, str):
+        if ctype.kind == "sym32":
+            return symbol_id(value)
+        if ctype.kind == "enum" and value in ctype.enum_tags:
+            return ctype.enum_tags.index(value)
+        raise ValueError(f"string is not a value of {ctype}")
+    if ctype.kind == "bytes32":
+        if isinstance(value, (bytes, bytearray)) and len(value) == 32:
+            return bytes(value)
+        if type(value) is int and 0 <= value < (1 << 256):
+            return value.to_bytes(32, "little")
+        raise ValueError(
+            "bytes32 requires exactly 32 bytes or an unsigned 256-bit literal"
+        )
+    if isinstance(value, (Decimal, float)):
+        if not ctype.is_decimal:
+            raise ValueError("fractional literals require a decimal type")
+        d = value if isinstance(value, Decimal) else Decimal(str(value))
+        if not d.is_finite():
+            raise ValueError("decimal must be finite")
+        sign, digits, exponent = d.as_tuple()
+        coefficient = int("".join(map(str, digits)) or "0")
+        shift = exponent + ctype.scale
+        if shift >= 0:
+            value = coefficient * (10**shift)
+        else:
+            divisor = 10 ** (-shift)
+            if coefficient % divisor:
+                raise ValueError(
+                    f"fractional precision exceeds {ctype.scale} digits for {ctype}"
+                )
+            value = coefficient // divisor
+        if sign:
+            value = -value
+    if type(value) is not int or not ctype.min_value <= value <= ctype.max_value:
+        raise ValueError(f"value is outside the domain of {ctype}")
+    return value
+
+
+def accumulator_type(ctype: ScalarType, capacity: int) -> ScalarType:
+    """Physical integer type wide enough for every live-row sum."""
+    needed = ctype.width + max(0, capacity.bit_length() - 1)
+    width = 128 if needed <= 128 else 256
+    if needed > 256:
+        raise VeraError(
+            D_CAPACITY, "tracked sum exceeds the 256-bit accumulator domain"
+        )
+    signed = ctype.is_signed
+    return ScalarType(
+        ("i" if signed else "u") + str(width), width, width // 8, scale=ctype.scale
+    )
 
 
 @dataclass
@@ -237,8 +348,13 @@ def _next_pow2(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
 
-def compute_layout(name: str, capacity: int, columns: List[Tuple[str, ScalarType]],
-                   tracked: List[str], unique: Optional[List[str]] = None) -> TableLayout:
+def compute_layout(
+    name: str,
+    capacity: int,
+    columns: List[Tuple[str, ScalarType]],
+    tracked: List[str],
+    unique: Optional[List[str]] = None,
+) -> TableLayout:
     """Compute the 64-byte-aligned SoA layout for a table.
 
     Every column vector (and the occupancy bitmap / generation array) starts on a
@@ -246,9 +362,11 @@ def compute_layout(name: str, capacity: int, columns: List[Tuple[str, ScalarType
     secondary indexes get a fixed-capacity linear-probing hash table with a
     probe bound ``UERA_MAX_PROBES`` (Section 2.3).
     """
-    if capacity <= 0 or (capacity & (capacity - 1)) != 0:
-        raise VeraError(D_CAPACITY,
-                        f"table {name!r} capacity {capacity} is not a positive power of two")
+    if capacity <= 0 or capacity > (1 << 32) or (capacity & (capacity - 1)) != 0:
+        raise VeraError(
+            D_CAPACITY,
+            f"table {name!r} capacity {capacity} must be a power of two between 1 and 2^32",
+        )
     key_bits = capacity.bit_length() - 1
     layout = TableLayout(name=name, capacity=capacity, key_bits=key_bits)
     offset = 0
@@ -270,16 +388,21 @@ def compute_layout(name: str, capacity: int, columns: List[Tuple[str, ScalarType
         layout.column_types[cname] = ctype
     for cname in tracked:
         if cname not in layout.column_types:
-            raise VeraError(D_UNKNOWN_COLUMN,
-                            f"tracked_sum column {cname!r} is not declared in table {name!r}")
+            raise VeraError(
+                D_UNKNOWN_COLUMN,
+                f"tracked_sum column {cname!r} is not declared in table {name!r}",
+            )
         ctype = layout.column_types[cname]
-        add_field(f"agg_sum_{cname}", ctype.size, ctype.align, ctype)
+        atype = accumulator_type(ctype, capacity)
+        add_field(f"agg_sum_{cname}", atype.size, atype.align, atype)
         layout.agg_offsets[cname] = layout.fields[-1].offset
-        layout.agg_types[cname] = ctype
-    for cname in (unique or []):
+        layout.agg_types[cname] = atype
+    for cname in unique or []:
         if cname not in layout.column_types:
-            raise VeraError(D_UNKNOWN_COLUMN,
-                            f"unique column {cname!r} is not declared in table {name!r}")
+            raise VeraError(
+                D_UNKNOWN_COLUMN,
+                f"unique column {cname!r} is not declared in table {name!r}",
+            )
         # Two buckets per slot keep the load factor <= 0.5 so the probe bound is
         # meaningful; the table never holds more than ``capacity`` rows.
         buckets = _next_pow2(max(2 * capacity, 16))
@@ -295,9 +418,10 @@ def compute_layout(name: str, capacity: int, columns: List[Tuple[str, ScalarType
 
 def slot_bits_for(capacity: int) -> int:
     """SMT bitvector width used to index a table slot."""
-    if capacity <= 0 or (capacity & (capacity - 1)) != 0:
-        raise VeraError(D_CAPACITY,
-                        f"capacity {capacity} is not a positive power of two")
+    if capacity <= 0 or capacity > (1 << 32) or (capacity & (capacity - 1)) != 0:
+        raise VeraError(
+            D_CAPACITY, f"capacity {capacity} must be a power of two between 1 and 2^32"
+        )
     return max(1, capacity.bit_length() - 1)
 
 
@@ -317,9 +441,8 @@ def hash_int(value) -> int:
     if isinstance(value, (bytes, bytearray)):
         return int.from_bytes(bytes(value), "little") & MASK64
     if isinstance(value, str):
-        from .smt_emit import _intern_symbol
-        return _intern_symbol(value)
-    return 0
+        return symbol_id(value)
+    raise ValueError(f"cannot hash scalar value of type {type(value).__name__}")
 
 
 def mix64(z: int) -> int:

@@ -1,4 +1,4 @@
-"""VERA: Verified Relational Architecture (v1.0 implementation).
+"""VERA: Verified Relational Architecture (v1.1 implementation).
 
 A deterministic, transactional language + verifier + runtime.
 
@@ -19,6 +19,6 @@ Sub-packages / modules:
     cli         -- command line interface
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = ["__version__"]

@@ -1,29 +1,38 @@
-"""Target C: AST -> zero-allocation, #[repr(C, align(64))] SoA Rust.
+"""Rust backend with exact scalars, atomic transactions and ordered MVCC execution.
 
-The generated code mirrors the reference runtime semantics:
-
-  * tables are page-aligned SoA structs with a 64-byte-aligned column vector,
-    a u32 generation array, and the tracked-sum accumulator registers;
-  * ``id64`` keys decompose into ``(generation << KEY_BITS) | slot`` with the
-    high bits required to be zero (the physical generation array is u32);
-  * transitions validate every precondition/guard before touching state
-    (commit-after-validate), so a failing guard never dirties memory;
-  * checked arithmetic reverts with ``Err(ErrorCode::ArithOverflow)``.
-
-The emitter produces a single self-contained Rust source file.
+Every transition executes against a private snapshot and publishes its whole
+result only after successful completion.  Concurrent speculative executions
+never share mutable state; ordered validation/re-execution preserves intent
+log semantics for both static and data-dependent footprints.
 """
 
-from typing import Dict, List, Optional, Tuple
+from __future__ import annotations
+
+import hashlib
+import dataclasses
+import json
+from pathlib import Path
+from typing import Dict, Optional
 
 from . import ast_nodes as A
-from .semantic import Program
-from .types import MAX_PROBES, ScalarType
+from .errors import VeraError
+from .semantic import Program, _TypeChecker, _resolve_type_ref
+from .types import BOOL, I64, MAX_PROBES, ScalarType
 
 
-_RUST_BIN = {
-    "add": "+", "sub": "-", "mul": "*", "div": "/", "rem": "%",
-    "eq": "==", "ne": "!=", "lt": "<", "le": "<=", "gt": ">", "ge": ">=",
-}
+_RUST_KEYWORDS = set(
+    "as break const continue crate else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while async await dyn abstract become box do final macro override priv typeof unsized virtual yield try gen".split()
+)
+
+
+def _ident(name: str) -> str:
+    if name in ("self", "Self", "super", "crate"):
+        return "vera_" + name
+    return "r#" + name if name in _RUST_KEYWORDS else name
+
+
+def _const_name(name: str) -> str:
+    return "v_" + name.removeprefix("%") if name.startswith("%") else _ident(name)
 
 
 def _zero_rust(ctype: ScalarType) -> str:
@@ -31,6 +40,8 @@ def _zero_rust(ctype: ScalarType) -> str:
         return "false"
     if ctype.kind == "bytes32":
         return "[0u8; 32]"
+    if ctype.kind in ("i256", "u256"):
+        return ctype.rust_type + "::ZERO"
     return "0"
 
 
@@ -38,898 +49,1610 @@ def _rust_type(ctype: ScalarType) -> str:
     return ctype.rust_type
 
 
-def _const_name(name: str) -> str:
-    """Sanitize an SSA/param name into a Rust identifier."""
-    out = []
-    for ch in name:
-        if ch == "%":
-            out.append("v_")
-        elif ch.isalnum() or ch == "_":
-            out.append(ch)
-        else:
-            out.append("_")
-    text = "".join(out)
-    if not text or text[0].isdigit():
-        text = "v" + text
-    return text
+_WIDE_RUST = r"""
+// Fixed 256-bit integers keep dec128 intermediates and aggregates exact.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[repr(C, align(32))]
+pub struct U256(pub [u64; 4]);
+impl U256 {
+    pub const ZERO: Self = Self([0; 4]);
+    pub fn from_u128(v: u128) -> Self {
+        Self([v as u64, (v >> 64) as u64, 0, 0])
+    }
+    pub fn is_zero(self) -> bool {
+        self == Self::ZERO
+    }
+    fn bit(self, i: usize) -> bool {
+        (self.0[i / 64] >> (i % 64)) & 1 != 0
+    }
+    fn set_bit(&mut self, i: usize) {
+        self.0[i / 64] |= 1u64 << (i % 64);
+    }
+    fn wrapping_add(self, r: Self) -> Self {
+        let mut out = [0; 4];
+        let mut carry = 0u128;
+        for i in 0..4 {
+            let v = self.0[i] as u128 + r.0[i] as u128 + carry;
+            out[i] = v as u64;
+            carry = v >> 64;
+        }
+        Self(out)
+    }
+    pub fn checked_add(self, r: Self) -> Option<Self> {
+        let out = self.wrapping_add(r);
+        if out < self {
+            None
+        } else {
+            Some(out)
+        }
+    }
+    fn wrapping_sub(self, r: Self) -> Self {
+        let mut out = [0; 4];
+        let mut borrow = false;
+        for i in 0..4 {
+            let (a, b) = self.0[i].overflowing_sub(r.0[i]);
+            let (v, c) = a.overflowing_sub(borrow as u64);
+            out[i] = v;
+            borrow = b || c;
+        }
+        Self(out)
+    }
+    pub fn checked_sub(self, r: Self) -> Option<Self> {
+        if self < r {
+            None
+        } else {
+            Some(self.wrapping_sub(r))
+        }
+    }
+    pub fn checked_mul(self, r: Self) -> Option<Self> {
+        let mut out = [0u64; 8];
+        for i in 0..4 {
+            let mut carry = 0u128;
+            for j in 0..4 {
+                let k = i + j;
+                let v = self.0[i] as u128 * r.0[j] as u128 + out[k] as u128 + carry;
+                out[k] = v as u64;
+                carry = v >> 64;
+            }
+            let mut k = i + 4;
+            while carry != 0 && k < 8 {
+                let v = out[k] as u128 + carry;
+                out[k] = v as u64;
+                carry = v >> 64;
+                k += 1;
+            }
+        }
+        if out[4..].iter().any(|&x| x != 0) {
+            None
+        } else {
+            Some(Self(out[..4].try_into().unwrap()))
+        }
+    }
+    pub fn div_rem(self, r: Self) -> Option<(Self, Self)> {
+        if r.is_zero() {
+            return None;
+        }
+        let mut q = Self::ZERO;
+        let mut rem = Self::ZERO;
+        for i in (0..256).rev() {
+            let carry = rem.0[3] >> 63 != 0;
+            for j in (0..4).rev() {
+                rem.0[j] = (rem.0[j] << 1)
+                    | if j > 0 {
+                        rem.0[j - 1] >> 63
+                    } else {
+                        self.bit(i) as u64
+                    };
+            }
+            if carry || rem >= r {
+                rem = rem.wrapping_sub(r);
+                q.set_bit(i);
+            }
+        }
+        Some((q, rem))
+    }
+    pub fn checked_div(self, r: Self) -> Option<Self> {
+        self.div_rem(r).map(|x| x.0)
+    }
+    pub fn checked_rem(self, r: Self) -> Option<Self> {
+        self.div_rem(r).map(|x| x.1)
+    }
+    pub fn to_u128(self) -> Option<u128> {
+        if self.0[2] != 0 || self.0[3] != 0 {
+            None
+        } else {
+            Some(self.0[0] as u128 | ((self.0[1] as u128) << 64))
+        }
+    }
+    pub fn to_le_bytes(self) -> [u8; 32] {
+        let mut b = [0u8; 32];
+        for (i, v) in self.0.iter().enumerate() {
+            b[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+        }
+        b
+    }
+    pub fn from_le_bytes(b: [u8; 32]) -> Self {
+        let mut w = [0; 4];
+        for i in 0..4 {
+            w[i] = u64::from_le_bytes(b[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+        Self(w)
+    }
+}
+impl Ord for U256 {
+    fn cmp(&self, r: &Self) -> std::cmp::Ordering {
+        for i in (0..4).rev() {
+            let c = self.0[i].cmp(&r.0[i]);
+            if c != std::cmp::Ordering::Equal {
+                return c;
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+}
+impl PartialOrd for U256 {
+    fn partial_cmp(&self, r: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(r))
+    }
+}
+impl std::fmt::Display for U256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut n = *self;
+        if n.is_zero() {
+            return write!(f, "0");
+        }
+        let mut digits = Vec::new();
+        while !n.is_zero() {
+            let (q, r) = n.div_rem(Self::from_u128(10)).unwrap();
+            digits.push(b'0' + r.0[0] as u8);
+            n = q;
+        }
+        for d in digits.iter().rev() {
+            write!(f, "{}", *d as char)?;
+        }
+        Ok(())
+    }
+}
+impl std::fmt::Debug for U256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub struct I256(pub U256);
+impl I256 {
+    pub const ZERO: Self = Self(U256::ZERO);
+    pub fn from_i128(v: i128) -> Self {
+        Self(U256([
+            v as u64,
+            (v >> 64) as u64,
+            if v < 0 { u64::MAX } else { 0 },
+            if v < 0 { u64::MAX } else { 0 },
+        ]))
+    }
+    pub fn from_u128(v: u128) -> Self {
+        Self(U256::from_u128(v))
+    }
+    pub fn negative(self) -> bool {
+        self.0 .0[3] >> 63 != 0
+    }
+    fn magnitude(self) -> U256 {
+        if self.negative() {
+            U256::ZERO.wrapping_sub(self.0)
+        } else {
+            self.0
+        }
+    }
+    fn signed_magnitude(m: U256, negative: bool) -> Option<Self> {
+        let high = m.0[3];
+        if (!negative && high >> 63 != 0)
+            || (negative
+                && (high > 0x8000000000000000
+                    || (high == 0x8000000000000000 && m.0[..3].iter().any(|&x| x != 0))))
+        {
+            return None;
+        }
+        Some(Self(if negative {
+            U256::ZERO.wrapping_sub(m)
+        } else {
+            m
+        }))
+    }
+    pub fn checked_add(self, r: Self) -> Option<Self> {
+        let v = Self(self.0.wrapping_add(r.0));
+        if self.negative() == r.negative() && v.negative() != self.negative() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+    pub fn checked_sub(self, r: Self) -> Option<Self> {
+        let v = Self(self.0.wrapping_sub(r.0));
+        if self.negative() != r.negative() && v.negative() != self.negative() {
+            None
+        } else {
+            Some(v)
+        }
+    }
+    pub fn checked_neg(self) -> Option<Self> {
+        Self::ZERO.checked_sub(self)
+    }
+    pub fn checked_mul(self, r: Self) -> Option<Self> {
+        Self::signed_magnitude(
+            self.magnitude().checked_mul(r.magnitude())?,
+            self.negative() != r.negative(),
+        )
+    }
+    pub fn div_rem(self, r: Self) -> Option<(Self, Self)> {
+        let (q, m) = self.magnitude().div_rem(r.magnitude())?;
+        Some((
+            Self::signed_magnitude(q, self.negative() != r.negative())?,
+            Self::signed_magnitude(m, self.negative())?,
+        ))
+    }
+    pub fn checked_div(self, r: Self) -> Option<Self> {
+        self.div_rem(r).map(|x| x.0)
+    }
+    pub fn checked_rem(self, r: Self) -> Option<Self> {
+        self.div_rem(r).map(|x| x.1)
+    }
+    pub fn to_i128(self) -> Option<i128> {
+        let n = self.magnitude().to_u128()?;
+        if self.negative() {
+            if n == (1u128 << 127) {
+                Some(i128::MIN)
+            } else if n <= i128::MAX as u128 {
+                Some(-(n as i128))
+            } else {
+                None
+            }
+        } else if n <= i128::MAX as u128 {
+            Some(n as i128)
+        } else {
+            None
+        }
+    }
+    pub fn to_u128(self) -> Option<u128> {
+        if self.negative() {
+            None
+        } else {
+            self.0.to_u128()
+        }
+    }
+    pub fn to_le_bytes(self) -> [u8; 32] {
+        self.0.to_le_bytes()
+    }
+    pub fn from_le_bytes(b: [u8; 32]) -> Self {
+        Self(U256::from_le_bytes(b))
+    }
+}
+impl Ord for I256 {
+    fn cmp(&self, r: &Self) -> std::cmp::Ordering {
+        if self.negative() != r.negative() {
+            if self.negative() {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        } else {
+            self.0.cmp(&r.0)
+        }
+    }
+}
+impl PartialOrd for I256 {
+    fn partial_cmp(&self, r: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(r))
+    }
+}
+impl std::fmt::Display for I256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.negative() {
+            write!(f, "-")?;
+        }
+        std::fmt::Display::fmt(&self.magnitude(), f)
+    }
+}
+impl std::fmt::Debug for I256 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+fn wide_product(a: U256, b: U256) -> [u64; 8] {
+    let mut out = [0u64; 8];
+    for i in 0..4 {
+        let mut carry = 0u128;
+        for j in 0..4 {
+            let k = i + j;
+            let v = a.0[i] as u128 * b.0[j] as u128 + out[k] as u128 + carry;
+            out[k] = v as u64;
+            carry = v >> 64;
+        }
+        let mut k = i + 4;
+        while carry != 0 && k < 8 {
+            let v = out[k] as u128 + carry;
+            out[k] = v as u64;
+            carry = v >> 64;
+            k += 1;
+        }
+    }
+    out
+}
+fn wide_quotient(n: [u64; 8], d: U256) -> Option<([u64; 8], U256)> {
+    if d.is_zero() {
+        return None;
+    }
+    let mut q = [0u64; 8];
+    let mut rem = U256::ZERO;
+    for i in (0..512).rev() {
+        let carry = rem.0[3] >> 63 != 0;
+        for j in (0..4).rev() {
+            rem.0[j] = (rem.0[j] << 1)
+                | if j > 0 {
+                    rem.0[j - 1] >> 63
+                } else {
+                    (n[i / 64] >> (i % 64)) & 1
+                };
+        }
+        if carry || rem >= d {
+            rem = rem.wrapping_sub(d);
+            q[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    Some((q, rem))
+}
+fn decimal_wide_result(n: [u64; 8], d: U256, negative: bool) -> Result<I256, ErrorCode> {
+    let (q, r) = wide_quotient(n, d).ok_or(ErrorCode::ArithOverflow)?;
+    if !r.is_zero() || q[4..].iter().any(|&x| x != 0) {
+        return Err(ErrorCode::ArithOverflow);
+    }
+    I256::signed_magnitude(U256(q[..4].try_into().unwrap()), negative)
+        .ok_or(ErrorCode::ArithOverflow)
+}
+fn decimal_wide_mul(a: I256, b: I256, scale: u128) -> Result<I256, ErrorCode> {
+    decimal_wide_result(
+        wide_product(a.magnitude(), b.magnitude()),
+        U256::from_u128(scale),
+        a.negative() != b.negative(),
+    )
+}
+fn decimal_wide_div(a: I256, b: I256, scale: u128) -> Result<I256, ErrorCode> {
+    decimal_wide_result(
+        wide_product(a.magnitude(), U256::from_u128(scale)),
+        b.magnitude(),
+        a.negative() != b.negative(),
+    )
+}
+fn decimal_mul(a: i128, b: i128, scale: i128) -> Result<i128, ErrorCode> {
+    decimal_wide_mul(I256::from_i128(a), I256::from_i128(b), scale as u128)?
+        .to_i128()
+        .ok_or(ErrorCode::ArithOverflow)
+}
+fn decimal_div(a: i128, b: i128, scale: i128) -> Result<i128, ErrorCode> {
+    decimal_wide_div(I256::from_i128(a), I256::from_i128(b), scale as u128)?
+        .to_i128()
+        .ok_or(ErrorCode::ArithOverflow)
+}
+"""
 
 
 class RustGenerator:
     def __init__(self, prog: Program):
+        if prog.diags.has_errors():
+            raise VeraError(
+                "D_CODEGEN", "cannot generate Rust for a program with semantic errors"
+            )
         self.prog = prog
-        self.lines: List[str] = []
-        self.error_codes: List[str] = []
+        self.lines = []
         self.type_env: Dict[str, ScalarType] = {}
-        self._collect_error_codes()
+        self.fresh = 0
+        self.table_fields = self._name_map(
+            prog.tables,
+            lambda n: "table_" + n if n.lower() == "outbox" else _ident(n.lower()),
+            "table",
+        )
+        self.table_constants = self._name_map(prog.tables, lambda n: n.upper(), "TABLE")
+        self.transition_variants = self._name_map(
+            prog.transitions, self._base_variant, "Intent"
+        )
+        self.effect_variants = self._name_map(
+            prog.effects, self._base_variant, "Effect"
+        )
+        reserved = {
+            "main",
+            "run_batch",
+            "run_batch_serial",
+            "restore",
+            "snapshot",
+            "mix64",
+            "decimal_mul",
+            "decimal_div",
+            "checksum",
+            "replay_file",
+            "atomic_write",
+            "wide_product",
+            "wide_quotient",
+            "decimal_wide_result",
+            "decimal_wide_mul",
+            "decimal_wide_div",
+        }
+        reserved.update("transition_" + name for name in prog.transitions)
+        reserved.update("project_" + name for name in prog.projections)
+        for tn, ti in prog.tables.items():
+            reserved.update({f"table_exists_{tn}", f"table_alloc_{tn}"})
+            for cn in ti.columns:
+                reserved.update(
+                    {
+                        f"table_get_{tn}_{cn}",
+                        f"table_set_{tn}_{cn}",
+                        f"hash_bucket_{tn}_{cn}",
+                        f"hash_lookup_{tn}_{cn}",
+                        f"hash_exists_{tn}_{cn}",
+                        f"hash_insert_{tn}_{cn}",
+                    }
+                )
+        self.transition_functions = self._name_map(
+            prog.transitions,
+            lambda n: "vera_transition_" + n if n in reserved else _ident(n),
+            "public_transition",
+        )
+        self.error_codes = [
+            "ArithOverflow",
+            "MissingRow",
+            "TableFull",
+            "GenerationExhausted",
+            "Precondition",
+            "DuplicateKey",
+            "IndexSaturated",
+            "InvalidEncoding",
+        ]
+        for node in _walk_stmts(prog.module):
+            if isinstance(node, A.Guard) and node.code not in self.error_codes:
+                self.error_codes.append(node.code)
 
-    def _collect_error_codes(self) -> None:
-        seen = {"ArithOverflow", "MissingRow", "TableFull", "GenerationExhausted",
-                "Precondition", "DuplicateKey", "IndexSaturated"}
-        codes = ["ArithOverflow", "MissingRow", "TableFull", "GenerationExhausted",
-                 "Precondition", "DuplicateKey", "IndexSaturated"]
-        for ti in self.prog.transitions.values():
-            for stmt in ti.decl.body:
-                for s in _walk_stmts(stmt):
-                    if isinstance(s, A.Guard) and s.code not in seen:
-                        seen.add(s.code)
-                        codes.append(s.code)
-        self.error_codes = codes
+    def line(self, text=""):
+        self.lines.append(text)
 
-    def emit(self, use_rt: bool = False, include_main: bool = True) -> str:
-        self.line("// Generated by VERA v1.1.0 -- do not edit.")
-        self.line("#![allow(non_camel_case_types, dead_code, unused_variables,")
-        self.line("         unused_mut, clippy::all)]")
+    def _fresh(self, stem):
+        self.fresh += 1
+        return f"_vera_{stem}_{self.fresh}"
+
+    @staticmethod
+    def _name_map(names, base, prefix):
+        names = list(names)
+        bases = {name: base(name) for name in names}
+        used = set(bases.values())
+        result = {}
+        for name in names:
+            if list(bases.values()).count(bases[name]) == 1:
+                result[name] = bases[name]
+            else:
+                candidate = prefix + "_" + name
+                while candidate in used:
+                    candidate += "_"
+                result[name] = candidate
+                used.add(candidate)
+        return result
+
+    def _field(self, table):
+        return self.table_fields[table]
+
+    @staticmethod
+    def _base_variant(name):
+        return (
+            "V_" + name
+            if name == "Self"
+            else "".join(p[:1].upper() + p[1:] for p in name.split("_"))
+        )
+
+    def _constant(self, table):
+        return self.table_constants[table]
+
+    def _function(self, transition):
+        return self.transition_functions[transition]
+
+    def _variant(self, name):
+        return self.transition_variants.get(name, self._base_variant(name))
+
+    def _program_fingerprint(self):
+        def canonical(value):
+            if dataclasses.is_dataclass(value):
+                return {
+                    "node": type(value).__name__,
+                    **{
+                        f.name: canonical(getattr(value, f.name))
+                        for f in dataclasses.fields(value)
+                        if f.name not in ("line", "col")
+                    },
+                }
+            if isinstance(value, (list, tuple)):
+                return [canonical(x) for x in value]
+            if isinstance(value, bytes):
+                return {"bytes": value.hex()}
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                return value
+            return {"value": str(value)}
+
+        data = {"language": "VERA-1.1.1", "ast": canonical(self.prog.module)}
+        return list(hashlib.sha256(json.dumps(data, sort_keys=True).encode()).digest())
+
+    def _param_field(self, name, params):
+        return self._name_map([p.name for p in params], _ident, "param")[name]
+
+    def _schema(self):
+        schema = {
+            "tables": [
+                (
+                    t,
+                    ti.layout.capacity,
+                    [
+                        (c, str(ci.type), ci.tracked_sum, ci.unique)
+                        for c, ci in ti.columns.items()
+                    ],
+                )
+                for t, ti in self.prog.tables.items()
+            ],
+            "effects": [
+                (n, [(p.name, str(self._resolved(p.type))) for p in e.params])
+                for n, e in self.prog.effects.items()
+            ],
+        }
+        return list(
+            hashlib.sha256(json.dumps(schema, sort_keys=True).encode()).digest()
+        )
+
+    def emit(self, use_rt=False, include_main=True):
+        self.line(
+            "// Generated by VERA 1.1.0. Atomic snapshots; checked arithmetic; canonical codecs."
+        )
+        self.line(
+            "#![allow(non_camel_case_types, non_snake_case, dead_code, unused_variables, unused_mut, unused_parens, clippy::all)]"
+        )
         self.line("use std::io::Write;")
-        self.line()
         self._emit_constants()
-        self._emit_error_code()
-        self._emit_helpers()
-        for tname in self.prog.tables:
-            self._emit_table(tname)
+        self.line("#[derive(Clone, Copy, PartialEq, Eq, Debug)] pub enum ErrorCode {")
+        for code in self.error_codes:
+            self.line(f"    {_ident(code)},")
+        self.line("}")
+        self.line(_WIDE_RUST)
+        self._emit_codec_helpers()
+        self._emit_effects()
+        for table in self.prog.tables:
+            self._emit_table(table)
         self._emit_accessors()
         self._emit_state()
-        for tname in self.prog.transitions:
-            self._emit_transition(tname)
-        self._emit_runtime(use_rt=use_rt)
+        for transition in self.prog.transitions:
+            self._emit_transition(transition)
+        self._emit_runtime(use_rt)
+        self._emit_snapshot()
+        self._emit_projections()
         if include_main:
             self._emit_demo_main()
         return "\n".join(self.lines) + "\n"
 
-    def line(self, text: str = "") -> None:
-        self.lines.append(text)
+    def _emit_constants(self):
+        for tname, ti in self.prog.tables.items():
+            self.line(
+                f"pub const CAP_{self._constant(tname)}: usize = {ti.layout.capacity};"
+            )
+            self.line(
+                f"pub const KEY_BITS_{self._constant(tname)}: u32 = {ti.layout.key_bits};"
+            )
+            self.line(
+                f"pub const GEN_BITS_{self._constant(tname)}: u32 = {ti.layout.generation_bits};"
+            )
+        self.line("pub const STATE_SCHEMA: [u8;32] = " + repr(self._schema()) + ";")
+        self.line(
+            "pub const PROGRAM_FINGERPRINT: [u8;32] = "
+            + repr(self._program_fingerprint())
+            + ";"
+        )
 
-    # --- constants -----------------------------------------------------
-    def _emit_constants(self) -> None:
-        for tname, tinfo in self.prog.tables.items():
-            cap = tinfo.layout.capacity
-            self.line(f"pub const CAP_{tname.upper()}: usize = {cap};")
-            self.line(f"pub const KEY_BITS_{tname.upper()}: u32 = {tinfo.layout.key_bits};")
-            self.line(f"pub const GEN_BITS_{tname.upper()}: u32 = "
-                      f"{tinfo.layout.generation_bits};")
-        self.line()
+    def _emit_codec_helpers(self):
+        self.line(r"""
+struct Reader<'a> { data:&'a [u8], pos:usize }
+impl<'a> Reader<'a> {
+    fn new(data:&'a [u8])->Self {Self{data,pos:0}}
+    fn take<const N:usize>(&mut self)->Result<[u8;N],ErrorCode>{let end=self.pos.checked_add(N).ok_or(ErrorCode::InvalidEncoding)?;let b=self.data.get(self.pos..end).ok_or(ErrorCode::InvalidEncoding)?;self.pos=end;Ok(b.try_into().unwrap())}
+    fn boolean(&mut self)->Result<bool,ErrorCode>{match self.take::<1>()?[0]{0=>Ok(false),1=>Ok(true),_=>Err(ErrorCode::InvalidEncoding)}}
+    fn done(&self)->Result<(),ErrorCode>{if self.pos==self.data.len(){Ok(())}else{Err(ErrorCode::InvalidEncoding)}}
+}
+fn mix64(z:u64)->u64{let z=z^(z>>30);let z=z.wrapping_mul(0xBF58476D1CE4E5B9);let z=z^(z>>27);let z=z.wrapping_mul(0x94D049BB133111EB);z^(z>>31)}
+""")
 
-    def _emit_error_code(self) -> None:
-        self.line("#[derive(Clone, Copy, PartialEq, Eq, Debug)]")
-        self.line("#[repr(u8)]")
-        self.line("pub enum ErrorCode {")
-        for i, code in enumerate(self.error_codes):
-            self.line(f"    {code} = {i},")
-        self.line("}")
-        self.line()
+    def _resolved(self, ref):
+        t = _resolve_type_ref(self.prog, ref, "Rust code generation")
+        if t is None:
+            raise VeraError("D_CODEGEN", "unresolved type in Rust generation")
+        return t
 
-    # --- helpers -------------------------------------------------------
-    def _emit_helpers(self) -> None:
-        self.line("fn dec64_add(a: i64, b: i64) -> Result<i64, ErrorCode> {")
-        self.line("    a.checked_add(b).ok_or(ErrorCode::ArithOverflow)")
+    def _emit_effects(self):
+        self.line("#[derive(Clone, Debug, PartialEq, Eq)] pub enum Effect {")
+        for name, eff in self.prog.effects.items():
+            fields = ", ".join(
+                f"{self._param_field(p.name, eff.params)}: {_rust_type(self._resolved(p.type))}"
+                for p in eff.params
+            )
+            self.line(f"    {self.effect_variants[name]} {{ {fields} }},")
         self.line("}")
-        self.line("fn dec64_sub(a: i64, b: i64) -> Result<i64, ErrorCode> {")
-        self.line("    a.checked_sub(b).ok_or(ErrorCode::ArithOverflow)")
-        self.line("}")
-        self.line("fn dec64_mul(a: i64, b: i64) -> Result<i64, ErrorCode> {")
-        self.line("    let p = (a as i128) * (b as i128);")
-        self.line("    let q = p / 100_000_000;")
-        self.line("    if p % 100_000_000 != 0 { return Err(ErrorCode::ArithOverflow); }")
-        self.line("    if q < i64::MIN as i128 || q > i64::MAX as i128 {")
-        self.line("        return Err(ErrorCode::ArithOverflow);")
-        self.line("    }")
-        self.line("    Ok(q as i64)")
-        self.line("}")
-        self.line("fn mix64(z: u64) -> u64 {")
-        self.line("    let z = z ^ (z >> 30);")
-        self.line("    let z = z.wrapping_mul(0xBF58476D1CE4E5B9);")
-        self.line("    let z = z ^ (z >> 27);")
-        self.line("    let z = z.wrapping_mul(0x94D049BB133111EB);")
-        self.line("    z ^ (z >> 31)")
-        self.line("}")
-        for tname, tinfo in self.prog.tables.items():
-            for cinfo in tinfo.columns.values():
-                if not cinfo.unique:
-                    continue
-                rt = _rust_type(cinfo.type)
-                self.line(f"fn hash_int_{tname}_{cinfo.name}(v: &{rt}) -> u64 {{")
-                if cinfo.type.kind == "bytes32":
-                    self.line("    mix64(u64::from_le_bytes(v[0..8].try_into().unwrap()))")
-                else:
-                    self.line("    mix64(*v as u64)")
-                self.line("}")
-        self.line("fn dec64_div(a: i64, b: i64) -> Result<i64, ErrorCode> {")
-        self.line("    if b == 0 { return Err(ErrorCode::ArithOverflow); }")
-        self.line("    let n = (a as i128) * 100_000_000;")
-        self.line("    let q = n / (b as i128);")
-        self.line("    if n % (b as i128) != 0 { return Err(ErrorCode::ArithOverflow); }")
-        self.line("    if q < i64::MIN as i128 || q > i64::MAX as i128 {")
-        self.line("        return Err(ErrorCode::ArithOverflow);")
-        self.line("    }")
-        self.line("    Ok(q as i64)")
-        self.line("}")
-        self.line()
 
-    # --- tables --------------------------------------------------------
-    def _emit_table(self, tname: str) -> None:
-        tinfo = self.prog.tables[tname]
-        self.line("#[derive(Clone)]")
-        self.line("#[repr(C, align(64))]")
+    def _agg_rust(self, ctype):
+        return "I256" if ctype.width > 64 else ("i128" if ctype.is_signed else "u128")
+
+    def _agg_zero(self, ctype):
+        return "I256::ZERO" if ctype.width > 64 else "0"
+
+    def _agg_cast(self, value, ctype):
+        if ctype.width > 64:
+            return f"I256::from_i128({value})"
+        return f"({value} as {self._agg_rust(ctype)})"
+
+    def _layout_fields(self, tname):
+        ti = self.prog.tables[tname]
+        fields = []
+        for idx, f in enumerate(ti.layout.fields):
+            if f.pad_before:
+                fields.append(
+                    (f"_pad{idx}", f"[u8; {f.pad_before}]", f"[0; {f.pad_before}]")
+                )
+            if f.name == "occupied_bitmap":
+                n = (ti.layout.capacity + 63) // 64
+                rt, init = f"[u64; {n}]", f"[0; {n}]"
+            elif f.name == "generation":
+                rt, init = f"[u32; {ti.layout.capacity}]", f"[0; {ti.layout.capacity}]"
+            elif f.name.startswith("col_"):
+                ci = ti.columns[f.name[4:]]
+                rt, init = (
+                    f"[{_rust_type(ci.type)}; {ti.layout.capacity}]",
+                    f"[{_zero_rust(ci.type)}; {ti.layout.capacity}]",
+                )
+            elif f.name.startswith("agg_sum_"):
+                ci = ti.columns[f.name[8:]]
+                rt, init = self._agg_rust(ci.type), self._agg_zero(ci.type)
+            elif f.name.startswith("hash_") and f.name.endswith("_key"):
+                n = ti.layout.unique_hashes[f.name[5:-4]]
+                rt, init = f"[u64; {n}]", f"[0; {n}]"
+            elif f.name.startswith("hash_") and f.name.endswith("_used"):
+                n = (ti.layout.unique_hashes[f.name[5:-5]] + 63) // 64
+                rt, init = f"[u64; {n}]", f"[0; {n}]"
+            else:
+                raise VeraError("D_CODEGEN", f"unknown physical layout field {f.name}")
+            fields.append((f.name, rt, init))
+        if ti.layout.fields:
+            last = ti.layout.fields[-1]
+            tail = ti.layout.size - last.offset - last.size
+            if tail:
+                fields.append(("_pad_end", f"[u8; {tail}]", f"[0; {tail}]"))
+        return fields
+
+    def _emit_table(self, tname):
+        self.line("#[derive(Clone, Debug, PartialEq, Eq)] #[repr(C, align(64))]")
         self.line(f"pub struct Table_{tname} {{")
-        pad_index = 0
-        for field in tinfo.layout.fields:
-            if field.pad_before > 0:
-                self.line(f"    pub _pad{pad_index}: [u8; {field.pad_before}],")
-                pad_index += 1
-            if field.name == "occupied_bitmap":
-                self.line(f"    pub occupied_bitmap: [u64; {(tinfo.layout.capacity + 63) // 64}],")
-            elif field.name == "generation":
-                self.line(f"    pub generation: [u32; {tinfo.layout.capacity}],")
-            elif field.name.startswith("col_"):
-                cname = field.name[4:]
-                self.line(f"    pub col_{cname}: [{_rust_type(field.type)}; "
-                          f"{tinfo.layout.capacity}],")
-            elif field.name.startswith("agg_sum_"):
-                cname = field.name[8:]
-                self.line(f"    pub agg_sum_{cname}: {_rust_type(field.type)},")
-            elif field.name.startswith("hash_"):
-                rest = field.name[5:]
-                if rest.endswith("_key"):
-                    cname = rest[:-4]
-                    self.line(f"    pub hash_{cname}_key: [u64; {tinfo.layout.unique_hashes[cname]}],")
-                elif rest.endswith("_used"):
-                    cname = rest[:-5]
-                    B = tinfo.layout.unique_hashes[cname]
-                    self.line(f"    pub hash_{cname}_used: [u64; {(B + 63) // 64}],")
-        tail = tinfo.layout.size - (tinfo.layout.fields[-1].offset
-                                    + tinfo.layout.fields[-1].size) \
-            if tinfo.layout.fields else tinfo.layout.size
-        if tail > 0:
-            self.line(f"    pub _pad_end: [u8; {tail}],")
+        for name, rt, init in self._layout_fields(tname):
+            self.line(f"    pub {name}: {rt},")
         self.line("}")
-        self.line()
 
-    def _emit_accessors(self) -> None:
-        for tname, tinfo in self.prog.tables.items():
-            cap = tinfo.layout.capacity
-            up = tname.upper()
-            kb = tinfo.layout.key_bits
-            gb = tinfo.layout.generation_bits
-            gen_max = (1 << gb) - 1
-            self.line(f"const GEN_MAX_{up}: u32 = {gen_max}u32;")
-            self.line(f"fn table_exists_{tname}(t: &Table_{tname}, key: u64) -> bool {{")
-            self.line(f"    let slot = (key & {cap - 1}) as usize;")
-            self.line(f"    let gen = (key >> {kb}) as u32;")
-            self.line(f"    let high = (key >> {kb + gb}) as u64;")
-            self.line("    if high != 0 { return false; }")
-            self.line(f"    let occ = (t.occupied_bitmap[slot / 64] >> (slot % 64)) & 1;")
-            self.line("    occ == 1 && t.generation[slot] == gen")
-            self.line("}")
-            for cname, cinfo in tinfo.columns.items():
-                rt = _rust_type(cinfo.type)
-                self.line(f"fn table_get_{tname}_{cname}(t: &Table_{tname}, key: u64) -> ({rt}, bool) {{")
-                self.line(f"    let slot = (key & {cap - 1}) as usize;")
-                self.line(f"    let gen = (key >> {kb}) as u32;")
-                self.line(f"    let high = (key >> {kb + gb}) as u64;")
-                self.line("    if high == 0 && ((t.occupied_bitmap[slot / 64] >> (slot % 64)) & 1) == 1 && t.generation[slot] == gen {")
-                self.line(f"        (t.col_{cname}[slot], true)")
-                self.line("    } else {")
-                zero = _zero_rust(cinfo.type)
-                self.line(f"        ({zero}, false)")
-                self.line("    }")
-                self.line("}")
-                self.line(f"fn table_set_{tname}_{cname}(t: &mut Table_{tname}, key: u64, value: {rt}) {{")
-                self.line(f"    let slot = (key & {cap - 1}) as usize;")
-                self.line(f"    let old = t.col_{cname}[slot];")
-                self.line(f"    t.col_{cname}[slot] = value;")
-                if cinfo.tracked_sum:
-                    self.line(f"    t.agg_sum_{cname} = t.agg_sum_{cname} - old + value;")
-                self.line("}")
-            for cinfo in tinfo.columns.values():
-                if not cinfo.unique:
-                    continue
-                cname = cinfo.name
-                B = tinfo.layout.unique_hashes[cname]
-                rt = _rust_type(cinfo.type)
-                self.line(f"fn hash_exists_{tname}_{cname}(t: &Table_{tname}, value: &{rt}) -> bool {{")
-                self.line(f"    let buckets = {B}u64;")
-                self.line(f"    let mut pos = (hash_int_{tname}_{cname}(value) & (buckets - 1)) as usize;")
-                self.line(f"    for _ in 0..{MAX_PROBES} {{")
-                self.line(f"        let used = (t.hash_{cname}_used[pos / 64] >> (pos % 64)) & 1;")
-                self.line(f"        if used == 0 {{ return false; }}")
-                self.line(f"        let slot = t.hash_{cname}_key[pos] as usize;")
-                self.line(f"        if t.col_{cname}[slot] == *value {{ return true; }}")
-                self.line(f"        pos = (pos + 1) & (buckets - 1) as usize;")
-                self.line(f"    }}")
-                self.line(f"    false")
-                self.line(f"}}")
-                self.line(f"fn hash_lookup_{tname}_{cname}(t: &Table_{tname}, value: &{rt}) -> Option<usize> {{")
-                self.line(f"    let buckets = {B}u64;")
-                self.line(f"    let mut pos = (hash_int_{tname}_{cname}(value) & (buckets - 1)) as usize;")
-                self.line(f"    for _ in 0..{MAX_PROBES} {{")
-                self.line(f"        let used = (t.hash_{cname}_used[pos / 64] >> (pos % 64)) & 1;")
-                self.line(f"        if used == 0 {{ return None; }}")
-                self.line(f"        let slot = t.hash_{cname}_key[pos] as usize;")
-                self.line(f"        if t.col_{cname}[slot] == *value {{ return Some(slot); }}")
-                self.line(f"        pos = (pos + 1) & (buckets - 1) as usize;")
-                self.line(f"    }}")
-                self.line(f"    None")
-                self.line(f"}}")
-                self.line(f"fn hash_insert_{tname}_{cname}(t: &mut Table_{tname}, value: &{rt}, slot: usize) -> Result<(), ErrorCode> {{")
-                self.line(f"    let buckets = {B}u64;")
-                self.line(f"    let mut pos = (hash_int_{tname}_{cname}(value) & (buckets - 1)) as usize;")
-                self.line(f"    for _ in 0..{MAX_PROBES} {{")
-                self.line(f"        let used = (t.hash_{cname}_used[pos / 64] >> (pos % 64)) & 1;")
-                self.line(f"        if used == 0 {{")
-                self.line(f"            t.hash_{cname}_used[pos / 64] |= 1u64 << (pos % 64);")
-                self.line(f"            t.hash_{cname}_key[pos] = slot as u64;")
-                self.line(f"            return Ok(());")
-                self.line(f"        }}")
-                self.line(f"        let ex = t.hash_{cname}_key[pos] as usize;")
-                self.line(f"        if t.col_{cname}[ex] == *value {{ return Err(ErrorCode::DuplicateKey); }}")
-                self.line(f"        pos = (pos + 1) & (buckets - 1) as usize;")
-                self.line(f"    }}")
-                self.line(f"    Err(ErrorCode::IndexSaturated)")
-                self.line(f"}}")
-            # allocator
-            params = ", ".join(f"{c.name}: {_rust_type(c.type)}"
-                               for c in tinfo.columns.values())
-            self.line(f"fn table_alloc_{tname}(t: &mut Table_{tname}, {params}) "
-                      "-> Result<u64, ErrorCode> {")
-            self.line(f"    let mut slot = {cap};")
-            self.line(f"    for i in 0..{cap} {{")
-            self.line("        if ((t.occupied_bitmap[i / 64] >> (i % 64)) & 1) == 0 { slot = i; break; }")
-            self.line("    }")
-            self.line(f"    if slot == {cap} {{ return Err(ErrorCode::TableFull); }}")
-            self.line("    let gen = t.generation[slot];")
-            self.line("    if gen >= GEN_MAX_" + up + " { return Err(ErrorCode::GenerationExhausted); }")
-            self.line("    let new_gen = gen + 1;")
-            self.line("    t.occupied_bitmap[slot / 64] |= 1u64 << (slot % 64);")
-            self.line("    t.generation[slot] = new_gen;")
-            for c in tinfo.columns.values():
-                self.line(f"    let old_{c.name} = t.col_{c.name}[slot];")
-                self.line(f"    t.col_{c.name}[slot] = {c.name};")
-                if c.tracked_sum:
-                    self.line(f"    t.agg_sum_{c.name} = t.agg_sum_{c.name} - old_{c.name} + {c.name};")
-            self.line(f"    Ok(((new_gen as u64) << {kb}) | (slot as u64))")
-            self.line("}")
-        self.line()
+    def _emit_accessors(self):
+        for tn, ti in self.prog.tables.items():
+            cap, kb, gb = (
+                ti.layout.capacity,
+                ti.layout.key_bits,
+                ti.layout.generation_bits,
+            )
+            high_check = f"key>>{kb + gb}==0 && " if kb + gb < 64 else ""
+            self.line(
+                f"fn table_exists_{tn}(t:&Table_{tn},key:u64)->bool {{let slot=(key&{cap - 1}) as usize; {high_check}(t.occupied_bitmap[slot/64]>>(slot%64))&1==1 && t.generation[slot]==(key>>{kb}) as u32}}"
+            )
+            for cn, ci in ti.columns.items():
+                rt = _rust_type(ci.type)
+                self.line(
+                    f"fn table_get_{tn}_{cn}(t:&Table_{tn},key:u64)->Result<{rt},ErrorCode>{{if !table_exists_{tn}(t,key){{return Err(ErrorCode::MissingRow);}}Ok(t.col_{cn}[(key&{cap - 1}) as usize])}}"
+                )
+                self.line(
+                    f"fn table_set_{tn}_{cn}(t:&mut Table_{tn},key:u64,value:{rt})->Result<(),ErrorCode>{{if !table_exists_{tn}(t,key){{return Err(ErrorCode::MissingRow);}}let slot=(key&{cap - 1}) as usize;let old=t.col_{cn}[slot];"
+                )
+                if ci.tracked_sum:
+                    self.line(
+                        f"    t.agg_sum_{cn}=t.agg_sum_{cn}.checked_sub({self._agg_cast('old', ci.type)}).and_then(|n|n.checked_add({self._agg_cast('value', ci.type)})).ok_or(ErrorCode::ArithOverflow)?;"
+                    )
+                self.line(f"    t.col_{cn}[slot]=value;Ok(())}}")
+                if ci.unique:
+                    self._emit_hash(tn, cn, ci)
+            fields = ", ".join(
+                f"{_ident(cn)}:{_rust_type(ci.type)}" for cn, ci in ti.columns.items()
+            )
+            self.line(
+                f"fn table_alloc_{tn}(t:&mut Table_{tn}{', ' + fields if fields else ''})->Result<u64,ErrorCode>{{"
+            )
+            self.line(
+                f"    let slot=(0..{cap}).find(|&i|(t.occupied_bitmap[i/64]>>(i%64))&1==0).ok_or(ErrorCode::TableFull)?;"
+            )
+            self.line(
+                f"    let gen=t.generation[slot];if gen>={(1 << gb) - 1}u32{{return Err(ErrorCode::GenerationExhausted);}}"
+            )
+            for cn, ci in ti.columns.items():
+                if ci.tracked_sum:
+                    self.line(
+                        f"    t.agg_sum_{cn}=t.agg_sum_{cn}.checked_add({self._agg_cast(_ident(cn), ci.type)}).ok_or(ErrorCode::ArithOverflow)?;"
+                    )
+                self.line(f"    t.col_{cn}[slot]={_ident(cn)};")
+            self.line(
+                "    t.generation[slot]=gen+1;t.occupied_bitmap[slot/64]|=1u64<<(slot%64);"
+            )
+            for cn, ci in ti.columns.items():
+                if ci.unique:
+                    self.line(f"    hash_insert_{tn}_{cn}(t,&{_ident(cn)},slot)?;")
+            self.line(f"    Ok((((gen+1) as u64)<<{kb})|slot as u64)}}")
 
-    def _emit_state(self) -> None:
-        self.line("#[derive(Clone)]")
-        self.line("pub struct State {")
-        for tname in self.prog.tables:
-            self.line(f"    pub {tname.lower()}: Table_{tname},")
-        self.line("}")
-        self.line()
-        self.line("impl State {")
-        self.line("    pub fn new() -> State {")
-        self.line("        State {")
-        for tname, tinfo in self.prog.tables.items():
-            self.line(f"            {tname.lower()}: Table_{tname} {{")
-            pad_index = 0
-            for field in tinfo.layout.fields:
-                if field.pad_before > 0:
-                    self.line(f"                _pad{pad_index}: [0u8; {field.pad_before}],")
-                    pad_index += 1
-                if field.name == "occupied_bitmap":
-                    self.line("                occupied_bitmap: [0u64; "
-                              f"{(tinfo.layout.capacity + 63) // 64}],")
-                elif field.name == "generation":
-                    self.line(f"                generation: [0u32; {tinfo.layout.capacity}],")
-                elif field.name.startswith("col_"):
-                    cname = field.name[4:]
-                    cinfo = tinfo.columns[cname]
-                    init = _zero_rust(cinfo.type)
-                    self.line(f"                col_{cname}: [{init}; "
-                              f"{tinfo.layout.capacity}],")
-                elif field.name.startswith("agg_sum_"):
-                    self.line(f"                agg_sum_{field.name[8:]}: 0,")
-                elif field.name.startswith("hash_"):
-                    rest = field.name[5:]
-                    if rest.endswith("_key"):
-                        cname = rest[:-4]
-                        B = tinfo.layout.unique_hashes[cname]
-                        self.line(f"                hash_{cname}_key: [0u64; {B}],")
-                    elif rest.endswith("_used"):
-                        cname = rest[:-5]
-                        B = tinfo.layout.unique_hashes[cname]
-                        self.line(f"                hash_{cname}_used: [0u64; {(B + 63) // 64}],")
-            tail = tinfo.layout.size - (tinfo.layout.fields[-1].offset
-                                        + tinfo.layout.fields[-1].size)                 if tinfo.layout.fields else tinfo.layout.size
-            if tail > 0:
-                self.line(f"                _pad_end: [0u8; {tail}],")
-            self.line("            },")
-        self.line("        }")
-        self.line("    }")
-        self.line("}")
-        self.line()
+    def _emit_hash(self, tn, cn, ci):
+        ti = self.prog.tables[tn]
+        B = ti.layout.unique_hashes[cn]
+        rt = _rust_type(ci.type)
+        if ci.type.kind == "bytes32":
+            hash_expr = "u64::from_le_bytes(value[..8].try_into().unwrap())"
+        else:
+            hash_expr = "*value as u64"
+        self.line(
+            f"fn hash_bucket_{tn}_{cn}(value:&{rt})->usize{{(mix64({hash_expr})&{B - 1}) as usize}}"
+        )
+        self.line(
+            f"fn hash_lookup_{tn}_{cn}(t:&Table_{tn},value:&{rt})->Option<usize>{{let mut pos=hash_bucket_{tn}_{cn}(value);for _ in 0..{MAX_PROBES}{{if (t.hash_{cn}_used[pos/64]>>(pos%64))&1==0{{return None;}}let slot=t.hash_{cn}_key[pos] as usize;if slot<{ti.layout.capacity}&&(t.occupied_bitmap[slot/64]>>(slot%64))&1==1&&t.col_{cn}[slot]==*value{{return Some(slot);}}pos=(pos+1)&{B - 1};}}None}}"
+        )
+        self.line(
+            f"fn hash_exists_{tn}_{cn}(t:&Table_{tn},value:&{rt})->bool{{hash_lookup_{tn}_{cn}(t,value).is_some()}}"
+        )
+        self.line(
+            f"fn hash_insert_{tn}_{cn}(t:&mut Table_{tn},value:&{rt},slot:usize)->Result<(),ErrorCode>{{"
+        )
+        self.line(
+            f"    if hash_exists_{tn}_{cn}(t,value){{return Err(ErrorCode::DuplicateKey);}}let mut incoming=slot;let mut pos=hash_bucket_{tn}_{cn}(value);let mut distance=0usize;"
+        )
+        self.line(
+            f"    for _ in 0..{MAX_PROBES}{{if (t.hash_{cn}_used[pos/64]>>(pos%64))&1==0{{t.hash_{cn}_used[pos/64]|=1u64<<(pos%64);t.hash_{cn}_key[pos]=incoming as u64;return Ok(());}}"
+        )
+        self.line(
+            f"        let resident=t.hash_{cn}_key[pos] as usize;let home=hash_bucket_{tn}_{cn}(&t.col_{cn}[resident]);let resident_distance=(pos+{B}-home)&{B - 1};if resident_distance<distance{{t.hash_{cn}_key[pos]=incoming as u64;incoming=resident;distance=resident_distance;}}pos=(pos+1)&{B - 1};distance+=1;}}Err(ErrorCode::IndexSaturated)}}"
+        )
 
-    # --- transitions ---------------------------------------------------
-    def _emit_transition(self, tname: str) -> None:
-        ti = self.prog.transitions[tname]
-        params = ", ".join(f"{p.name}: {_rust_type(ti.param_types[p.name])}"
-                           for p in ti.decl.params)
-        self.line(f"pub fn {tname}(state: &mut State, {params}) -> Result<(), ErrorCode> {{")
-        env: Dict[str, str] = {}
+    def _emit_state(self):
+        self.line("#[derive(Clone, Debug, PartialEq, Eq)] pub struct State {")
+        for tn in self.prog.tables:
+            self.line(f"    pub {self._field(tn)}: Table_{tn},")
+        self.line("    pub outbox: Vec<Effect>,\n}")
+        self.line("impl Default for State {fn default()->Self{Self::new()}}")
+        self.line("impl State {pub fn new()->Self {Self {")
+        for tn in self.prog.tables:
+            self.line(f"    {self._field(tn)}: Table_{tn}{{")
+            for name, rt, init in self._layout_fields(tn):
+                self.line(f"        {name}:{init},")
+            self.line("    },")
+        self.line("    outbox:Vec::new(),\n}}}")
+
+    def _emit_transition(self, name):
+        ti = self.prog.transitions[name]
+        params = ", ".join(
+            f"p_{p.name}:{_rust_type(ti.param_types[p.name])}" for p in ti.decl.params
+        )
+        suffix = ", " + params if params else ""
+        args = ", ".join("p_" + p.name for p in ti.decl.params)
+        checks = "".join(
+            f"if (p_{p.name} as usize)>={len(ti.param_types[p.name].enum_tags)}{{return Err(ErrorCode::InvalidEncoding);}}"
+            for p in ti.decl.params
+            if ti.param_types[p.name].kind == "enum"
+        )
+        self.line(
+            f"pub fn {self._function(name)}(state:&mut State{suffix})->Result<(),ErrorCode>{{{checks}let mut staged=state.clone();let outcome=transition_{name}(&mut staged,state{', ' + args if args else ''});if outcome.is_ok(){{*state=staged;}}outcome}}"
+        )
+        self.line(
+            f"fn transition_{name}(state:&mut State,pre:&State{suffix})->Result<(),ErrorCode>{{"
+        )
         self.type_env = dict(ti.param_types)
-        for p in ti.decl.params:
-            env[p.name] = _const_name(p.name)
-        # preconditions
-        for rname, rexpr in ti.decl.requires:
-            expr = self._expr(rexpr, env, "pre")
-            self.line(f"    // require {rname}")
-            self.line(f"    if !({expr}) {{ return Err(ErrorCode::Precondition); }}")
-        # body
+        env = {p.name: "p_" + p.name for p in ti.decl.params}
+        for _, req in ti.decl.requires:
+            self.line(
+                f"    if !({self._expr(req, env, 'pre', BOOL)}){{return Err(ErrorCode::Precondition);}}"
+            )
         for stmt in ti.decl.body:
             self._stmt(stmt, env)
-        self.line("    Ok(())")
-        self.line("}")
-        self.line()
+        self.line("    Ok(())\n}")
 
-    def _stmt(self, stmt: A.Stmt, env: Dict[str, str]) -> None:
+    def _stmt(self, stmt, env, state="post"):
         if isinstance(stmt, A.Let):
-            if isinstance(stmt.value, A.Fold):
-                self._fold(stmt, env)
-            else:
-                value = self._expr(stmt.value, env, "post")
-                name = _const_name(stmt.name)
-                rtype = _rust_type(self._type_of_let(stmt))
-                self.line(f"    let {name}: {rtype} = {value};")
-                env[stmt.name] = name
-                self.type_env[stmt.name] = self._type_of_let(stmt)
-        elif isinstance(stmt, A.Guard):
-            cond = self._expr(stmt.cond, env, "post")
-            self.line(f"    if !({cond}) {{ return Err(ErrorCode::{stmt.code}); }}")
-        elif isinstance(stmt, A.TableSet):
-            key = self._expr(stmt.key, env, "post")
-            value = self._expr(stmt.value, env, "post")
-            self.line(f"    table_set_{stmt.table}_{stmt.column}(&mut state.{stmt.table.lower()},"
-                      f" {key}, {value});")
-        elif isinstance(stmt, A.TableAlloc):
-            tinfo = self.prog.tables[stmt.table]
-            field_map = dict(stmt.fields)
-            args = []
-            for cname in tinfo.column_order:
-                if cname in field_map:
-                    args.append(self._expr(field_map[cname], env, "post"))
-                else:
-                    cinfo = tinfo.columns[cname]
-                    args.append("false" if cinfo.type.is_bool else "0")
+            ct = self._resolved(stmt.type)
+            value = self._expr(stmt.value, env, state, ct)
+            if self._has_agg(stmt.value):
+                value = self._narrow_wide(value, ct)
             name = _const_name(stmt.name)
-            self.line(f"    let {name}: u64 = table_alloc_{stmt.table}(&mut state.{stmt.table.lower()}, "
-                      + ", ".join(args) + ")?;")
-            for cname, cinfo in self.prog.tables[stmt.table].columns.items():
-                if cinfo.unique:
-                    fexpr = dict(stmt.fields).get(cname)
-                    if fexpr is not None:
-                        v = self._expr(fexpr, env, "post")
-                        up = stmt.table.upper()
-                        self.line(f"    hash_insert_{stmt.table}_{cname}(&mut state.{stmt.table.lower()}, "
-                                  f"&({v}), (({name}) & ((1u64 << KEY_BITS_{up}) - 1)) as usize)?;")
+            self.line(f"    let {name}:{_rust_type(ct)}={value};")
             env[stmt.name] = name
-            self.type_env[stmt.name] = ScalarType("id64", 64, 8, key_table=stmt.table)
+            self.type_env[stmt.name] = ct
+        elif isinstance(stmt, A.Guard):
+            self.line(
+                f"    if !({self._expr(stmt.cond, env, state, BOOL)}){{return Err(ErrorCode::{_ident(stmt.code)});}}"
+            )
+        elif isinstance(stmt, A.TableSet):
+            ct = self.prog.tables[stmt.table].columns[stmt.column].type
+            value = self._expr(stmt.value, env, state, ct)
+            if self._has_agg(stmt.value):
+                value = self._narrow_wide(value, ct)
+            key = self._expr(stmt.key, env, state)
+            kt, vt = self._fresh("key"), self._fresh("value")
+            self.line(
+                f"    let {kt}={key};let {vt}={value};table_set_{stmt.table}_{stmt.column}(&mut state.{self._field(stmt.table)},{kt},{vt})?;"
+            )
+        elif isinstance(stmt, A.TableAlloc):
+            ti = self.prog.tables[stmt.table]
+            fields = dict(stmt.fields)
+            field_temps = {}
+            for cn, expression in stmt.fields:
+                ci = ti.columns[cn]
+                value = self._expr(expression, env, state, ci.type)
+                if self._has_agg(expression):
+                    value = self._narrow_wide(value, ci.type)
+                temp = self._fresh("field")
+                self.line(f"    let {temp}:{_rust_type(ci.type)}={value};")
+                field_temps[cn] = temp
+            temps = [field_temps[cn] for cn in ti.columns]
+            name = _const_name(stmt.name)
+            self.line(
+                f"    let {name}=table_alloc_{stmt.table}(&mut state.{self._field(stmt.table)}{', ' + ', '.join(temps) if temps else ''})?;"
+            )
+            env[stmt.name] = name
+            self.type_env[stmt.name] = ti.key_type
         elif isinstance(stmt, A.Emit):
-            args = ", ".join(self._expr(a, env, "post") for a in stmt.args)
-            self.line(f"    let _ = ({args}); // emit {stmt.effect}")
+            fields = []
+            for arg, param in zip(stmt.args, self.prog.effects[stmt.effect].params):
+                ct = self._resolved(param.type)
+                v = self._expr(arg, env, state, ct)
+                if self._has_agg(arg):
+                    v = self._narrow_wide(v, ct)
+                temp = self._fresh("effect")
+                self.line(f"    let {temp}:{_rust_type(ct)}={v};")
+                fields.append(
+                    f"{self._param_field(param.name, self.prog.effects[stmt.effect].params)}:{temp}"
+                )
+            self.line(
+                f"    state.outbox.push(Effect::{self.effect_variants[stmt.effect]}{{{', '.join(fields)}}});"
+            )
+        elif isinstance(stmt, A.Yield):
+            self.line(f"    let _={self._expr(stmt.value, env, state)};")
         elif isinstance(stmt, A.Commit):
             pass
+        else:
+            raise VeraError(
+                "D_CODEGEN",
+                f"unsupported Rust statement {type(stmt).__name__}",
+                stmt.line,
+                stmt.col,
+            )
 
-    def _fold(self, stmt: A.Let, env: Dict[str, str]) -> None:
-        fold = stmt.value
-        acc = _const_name(stmt.name)
-        rtype = _rust_type(self._type_of_let(stmt))
-        init = self._expr(fold.init, env, "post")
-        lo = self._expr(fold.lo, env, "post")
-        hi = self._expr(fold.hi, env, "post")
-        self.line(f"    let mut {acc}: {rtype} = {init};")
-        self.line(f"    let mut {fold.index_name} = {lo};")
-        self.line(f"    let _fold_hi = {hi};")
-        self.line(f"    for _step in 0..{fold.n} {{")
-        self.line(f"        if {fold.index_name} > _fold_hi {{ break; }}")
-        inner = dict(env)
-        inner[fold.acc_name] = acc
-        inner[fold.index_name] = fold.index_name
-        for s in fold.body:
-            self._stmt(s, inner)
-        y = self._expr(fold.yield_expr, inner, "post")
-        self.line(f"        {acc} = {y};")
-        self.line(f"        {fold.index_name} += 1;")
-        self.line("    }")
-        env[stmt.name] = acc
+    def _type(self, expr, expected=None):
+        inferred = getattr(self.prog, "expr_types", {}).get(id(expr))
+        if expected is not None and isinstance(expr, A.Literal):
+            return expected
+        if inferred is not None:
+            return inferred
+        return _TypeChecker(self.prog, dict(self.type_env)).type_of(expr, expected)
 
-    def _type_of_let(self, stmt: A.Let) -> ScalarType:
-        from .semantic import _resolve_type_ref
-        return _resolve_type_ref(self.prog, stmt.type, "let") or ScalarType("i64", 64, 8)
+    def _has_agg(self, expr):
+        if isinstance(expr, A.SumAgg):
+            return True
+        if isinstance(expr, A.Binary):
+            return expr.op not in (
+                "eq",
+                "ne",
+                "lt",
+                "le",
+                "gt",
+                "ge",
+                "and",
+                "or",
+                "xor",
+            ) and (self._has_agg(expr.left) or self._has_agg(expr.right))
+        if isinstance(expr, A.Unary):
+            return expr.op != "not" and self._has_agg(expr.operand)
+        if isinstance(expr, A.Select):
+            return self._has_agg(expr.a) or self._has_agg(expr.b)
+        return False
 
-    def _expr(self, expr: A.Expr, env: Dict[str, str], state: str) -> str:
+    def _aggregate_width(self, expr):
+        if isinstance(expr, A.SumAgg):
+            return (
+                256
+                if self.prog.tables[expr.table].columns[expr.column].type.width > 64
+                else 128
+            )
+        if isinstance(expr, A.Binary):
+            return max(
+                self._aggregate_width(expr.left), self._aggregate_width(expr.right)
+            )
+        if isinstance(expr, A.Unary):
+            return self._aggregate_width(expr.operand)
+        if isinstance(expr, A.Select):
+            return max(self._aggregate_width(expr.a), self._aggregate_width(expr.b))
+        return 0
+
+    def _check_carrier(self, value, expr, ctype):
+        if self._aggregate_width(expr) == 128:
+            native = "i128" if ctype.is_signed else "u128"
+            return f"{{let v={value};I256::from_{native}(v.to_{native}().ok_or(ErrorCode::ArithOverflow)?)}}"
+        return value
+
+    def _wide(self, expr, env, state, ctype):
+        value = self._expr(expr, env, state, ctype)
+        if self._has_agg(expr):
+            return value
+        return f"I256::from_{'i128' if ctype.is_signed else 'u128'}(({value}) as {'i128' if ctype.is_signed else 'u128'})"
+
+    def _narrow_wide(self, value, ct):
+        base = f"({value}).to_{'i128' if ct.is_signed else 'u128'}().ok_or(ErrorCode::ArithOverflow)?"
+        return (
+            f"{_rust_type(ct)}::try_from({base}).map_err(|_|ErrorCode::ArithOverflow)?"
+        )
+
+    def _expr(self, expr, env, state, expected: Optional[ScalarType] = None):
+        current = "pre" if state == "pre" else "state"
         if isinstance(expr, A.Literal):
-            return self._literal(expr)
+            return self._literal(expr, self._type(expr, expected))
         if isinstance(expr, A.Var):
             if expr.name in env:
                 return env[expr.name]
-            if expr.name in self._enum_tags():
-                return str(self._enum_tags()[expr.name])
-            return _const_name(expr.name)
-        if isinstance(expr, A.TableExistsUnique):
+            ct = self._type(expr, expected)
+            if ct.kind == "enum" and expr.name in ct.enum_tags:
+                return f"{ct.enum_tags.index(expr.name)}u8"
+            raise VeraError(
+                "D_CODEGEN", f"unknown Rust variable {expr.name}", expr.line, expr.col
+            )
+        if isinstance(expr, (A.TableGet, A.TableAccess)):
             key = self._expr(expr.key, env, state)
-            return f"hash_exists_{expr.table}_{expr.key_column}(&state.{expr.table.lower()}, &({key}))"
-        if isinstance(expr, A.TableLookup):
-            tinfo = self.prog.tables[expr.table]
-            key = self._expr(expr.key, env, state)
-            kb = tinfo.layout.key_bits
-            return (f"match hash_lookup_{expr.table}_{expr.key_column}(&state.{expr.table.lower()}, "
-                    f"&({key})) {{ Some(slot) => {{ let gen = state.{expr.table.lower()}.generation[slot]; "
-                    f"((gen as u64) << {kb}) | (slot as u64) }}, None => return Err(ErrorCode::MissingRow) }}")
-        if isinstance(expr, A.TableGet):
-            return (f"match table_get_{expr.table}_{expr.column}(&state.{expr.table.lower()}, "
-                    f"{self._expr(expr.key, env, state)}) "
-                    "{ (v, true) => v, _ => return Err(ErrorCode::MissingRow) }")
+            temp = self._fresh("read_key")
+            if isinstance(expr, A.TableAccess):
+                cap = self.prog.tables[expr.table].layout.capacity
+                return f"{{let {temp}={key};{current}.{self._field(expr.table)}.col_{expr.column}[({temp}&{cap - 1}) as usize]}}"
+            return f"{{let {temp}={key};table_get_{expr.table}_{expr.column}(&{current}.{self._field(expr.table)},{temp})?}}"
         if isinstance(expr, A.TableExists):
-            return (f"table_exists_{expr.table}(&state.{expr.table.lower()}, "
-                    f"{self._expr(expr.key, env, state)})")
-        if isinstance(expr, A.TableAccess):
-            return (f"match table_get_{expr.table}_{expr.column}(&state.{expr.table.lower()}, "
-                    f"{self._expr(expr.key, env, state)}) "
-                    "{ (v, true) => v, _ => return Err(ErrorCode::Precondition) }")
+            temp = self._fresh("exists_key")
+            return f"{{let {temp}={self._expr(expr.key, env, state)};table_exists_{expr.table}(&{current}.{self._field(expr.table)},{temp})}}"
+        if isinstance(expr, (A.TableLookup, A.TableExistsUnique)):
+            ct = self.prog.tables[expr.table].columns[expr.key_column].type
+            k = self._expr(expr.key, env, state, ct)
+            temp = self._fresh("unique_value")
+            lookup = f"hash_lookup_{expr.table}_{expr.key_column}(&{current}.{self._field(expr.table)},&{temp})"
+            if isinstance(expr, A.TableExistsUnique):
+                return f"{{let {temp}:{_rust_type(ct)}={k};{lookup}.is_some()}}"
+            kb = self.prog.tables[expr.table].layout.key_bits
+            return f"{{let {temp}:{_rust_type(ct)}={k};let slot={lookup}.ok_or(ErrorCode::MissingRow)?;(({current}.{self._field(expr.table)}.generation[slot] as u64)<<{kb})|slot as u64}}"
         if isinstance(expr, A.Old):
-            return self._read_column(expr.access.table, expr.access.column,
-                                     expr.access.key, env, "pre")
+            cap = self.prog.tables[expr.access.table].layout.capacity
+            key = self._expr(expr.access.key, env, "pre")
+            return f"pre.{self._field(expr.access.table)}.col_{expr.access.column}[(({key})&{cap - 1}) as usize]"
         if isinstance(expr, A.SumAgg):
-            return self._read_agg(expr.table, expr.column, expr.old)
+            ct = self.prog.tables[expr.table].columns[expr.column].type
+            obj = "pre" if expr.old or state == "pre" else "state"
+            value = f"{obj}.{self._field(expr.table)}.agg_sum_{expr.column}"
+            if ct.width > 64:
+                return value
+            return f"I256::from_{'i128' if ct.is_signed else 'u128'}({value})"
         if isinstance(expr, A.KeyOf):
-            return f"({self._expr(expr.expr, env, state)} as u64)"
+            value = self._expr(expr.expr, env, state)
+            return f"(({value}) as u64)"
         if isinstance(expr, A.Select):
-            cond = self._expr(expr.cond, env, state)
-            a = self._expr(expr.a, env, state)
-            b = self._expr(expr.b, env, state)
-            return f"if {cond} {{ {a} }} else {{ {b} }}"
+            ct = self._type(expr, expected)
+            a = (
+                self._wide(expr.a, env, state, ct)
+                if self._has_agg(expr)
+                else self._expr(expr.a, env, state, ct)
+            )
+            b = (
+                self._wide(expr.b, env, state, ct)
+                if self._has_agg(expr)
+                else self._expr(expr.b, env, state, ct)
+            )
+            return f"(if {self._expr(expr.cond, env, state, BOOL)}{{{a}}}else{{{b}}})"
         if isinstance(expr, A.Unary):
-            operand = self._expr(expr.operand, env, state)
+            ct = self._type(expr, expected)
+            v = self._expr(expr.operand, env, state, ct)
             if expr.op == "not":
-                return f"!({operand})"
+                return f"!({v})"
             if expr.op == "neg":
-                return f"(-({operand}))"
+                result = f"({v}).checked_neg().ok_or(ErrorCode::ArithOverflow)?"
+                return (
+                    self._check_carrier(result, expr, ct)
+                    if self._has_agg(expr)
+                    else result
+                )
         if isinstance(expr, A.Binary):
             op = expr.op
-            left = self._expr(expr.left, env, state)
-            right = self._expr(expr.right, env, state)
             if op in ("and", "or", "xor"):
-                sym = {"and": "&&", "or": "||", "xor": "^"}[op]
-                return f"(({left}) {sym} ({right}))"
-            if op in _RUST_BIN:
-                ctype = self._infer_type(expr)
-                if op in ("add", "sub", "mul", "div") and ctype.is_decimal:
-                    fn = {"add": "dec64_add", "sub": "dec64_sub",
-                          "mul": "dec64_mul", "div": "dec64_div"}[op]
-                    return f"{fn}({left}, {right})?"
-                return f"(({left}) {_RUST_BIN[op]} ({right}))"
-        return "0"
+                a = self._expr(expr.left, env, state, BOOL)
+                b = self._expr(expr.right, env, state, BOOL)
+                sym = {"and": "&", "or": "|", "xor": "^"}[op]
+                return f"(({a}){sym}({b}))"
+            comparison = op in ("eq", "ne", "lt", "le", "gt", "ge")
+            ct = (
+                _TypeChecker(self.prog, dict(self.type_env))._infer_equality_target(
+                    expr, None
+                )
+                if comparison
+                else self._type(expr, expected)
+            )
+            if ct is None:
+                ct = self._type(expr.left)
+            wide = self._has_agg(expr.left) or self._has_agg(expr.right)
+            a = (
+                self._wide(expr.left, env, state, ct)
+                if wide
+                else self._expr(expr.left, env, state, ct)
+            )
+            b = (
+                self._wide(expr.right, env, state, ct)
+                if wide
+                else self._expr(expr.right, env, state, ct)
+            )
+            at, bt = self._fresh("a"), self._fresh("b")
+            rt = "I256" if wide else _rust_type(ct)
+            prefix = f"{{let {at}:{rt}={a};let {bt}:{rt}={b};"
+            if comparison:
+                sym = {
+                    "eq": "==",
+                    "ne": "!=",
+                    "lt": "<",
+                    "le": "<=",
+                    "gt": ">",
+                    "ge": ">=",
+                }[op]
+                return prefix + f"{at}{sym}{bt}}}"
+            if op in ("min", "max"):
+                return prefix + f"std::cmp::{op}({at},{bt})}}"
+            if op in ("add", "sub", "mul", "div", "rem"):
+                if ct.is_decimal and op in ("mul", "div"):
+                    if wide:
+                        calc = f"decimal_wide_{op}({at},{bt},{10**ct.scale}u128)?"
+                        result = prefix + calc + "}"
+                        return self._check_carrier(result, expr, ct)
+                    calc = (
+                        f"decimal_{op}({at} as i128,{bt} as i128,{10**ct.scale}i128)?"
+                    )
+                    return (
+                        prefix
+                        + f"{rt}::try_from({calc}).map_err(|_|ErrorCode::ArithOverflow)?}}"
+                    )
+                result = (
+                    prefix
+                    + f"{at}.checked_{op}({bt}).ok_or(ErrorCode::ArithOverflow)?}}"
+                )
+                return self._check_carrier(result, expr, ct) if wide else result
+        if isinstance(expr, A.Fold):
+            return self._fold_expr(expr, env, state)
+        raise VeraError(
+            "D_CODEGEN",
+            f"unsupported Rust expression {type(expr).__name__}",
+            getattr(expr, "line", 0),
+            getattr(expr, "col", 0),
+        )
 
-    def _literal(self, expr: A.Literal) -> str:
-        val = expr.value
-        if isinstance(val, bool):
-            return "true" if val else "false"
-        if isinstance(val, str):
-            return str(_symbol_id(val))
-        if isinstance(val, float):
-            return str(int(round(val * 100_000_000)))
-        return str(val)
+    def _literal(self, expr, ct):
+        from .types import literal_value
 
-    def _enum_tags(self) -> Dict[str, int]:
-        out: Dict[str, int] = {}
-        for tinfo in self.prog.tables.values():
-            for cinfo in tinfo.columns.values():
-                if cinfo.type.kind == "enum":
-                    for i, tag in enumerate(cinfo.type.enum_tags):
-                        out[tag] = i
-        return out
+        value = getattr(self.prog, "literal_values", {}).get(id(expr), None)
+        if value is None:
+            value = literal_value(expr.value, ct)
+        if ct.is_bool:
+            return "true" if value else "false"
+        if ct.kind == "bytes32":
+            return "[" + ",".join(f"{x}u8" for x in value) + "]"
+        return str(value) + _rust_type(ct)
 
-    def _read_column(self, table: str, column: str, key: A.Expr,
-                     env: Dict[str, str], state: str) -> str:
-        k = self._expr(key, env, state)
-        return f"table_get_{table}_{column}(&state.{table.lower()}, {k}).map(|x| x.0)"
-
-    def _read_agg(self, table: str, column: str, old: bool) -> str:
-        # The production engine keeps the accumulator in a register; the
-        # generated demo exposes it directly.  ``old`` is only meaningful in
-        # postconditions, which the verifier checks rather than the runtime.
-        return f"state.{table.lower()}.agg_sum_{column}"
-
-    def _infer_type(self, expr: A.Expr) -> ScalarType:
-        from .semantic import _TypeChecker
-        tc = _TypeChecker(self.prog, dict(self.type_env))
-        try:
-            return tc.type_of(expr)
-        except Exception:
-            return ScalarType("i64", 64, 8)
-
-    # --- demo ----------------------------------------------------------
-    # --- runtime: intent batch, conflict analysis, WAL, snapshot ---------
-    def _table_const(self, tname: str) -> str:
-        return f"TABLE_{tname.upper()}"
-
-    def _slot_expr(self, key, env: Dict[str, str]) -> str:
-        if key is None:
-            return "WILDCARD"
-        expr = self._expr(key, env, "post")
-        return f"(({expr}) & ((1u64 << KEY_BITS_{self._key_table(key).upper()}) - 1))"
-
-    def _key_table(self, key) -> str:
-        # the key's table is inferred from the key's type; for params we look up
-        # which transition parameter carries an id64 type.
-        if isinstance(key, A.Var):
-            for ti in self.prog.transitions.values():
-                pt = ti.param_types.get(key.name)
-                if pt is not None and pt.kind == "id64":
-                    return pt.key_table
-        for tinfo in self.prog.tables.values():
-            return tinfo.name
-        return ""
-
-    def _variant(self, tname: str) -> str:
-        return "".join(part.capitalize() for part in tname.split("_"))
-
-    def _emit_runtime(self, use_rt: bool = False) -> None:
-        for idx, tname in enumerate(self.prog.tables):
-            self.line(f"pub const {self._table_const(tname)}: u8 = {idx};")
-        self.line()
-        self.line("pub const WILDCARD: u64 = u64::MAX;")
-        self.line("fn u64_to_bytes32(v: u64) -> [u8; 32] {")
-        self.line("    let mut out = [0u8; 32];")
-        self.line("    out[0..8].copy_from_slice(&v.to_le_bytes());")
-        self.line("    out")
+    def _fold_expr(self, fold, env, state):
+        saved_lines, saved_types = self.lines, dict(self.type_env)
+        self.lines = []
+        acc, idx, hi = self._fresh("acc"), self._fresh("idx"), self._fresh("hi")
+        ct = self._resolved(fold.acc_type)
+        it = self._type(fold.lo)
+        self.line("{")
+        init = self._expr(fold.init, env, state, ct)
+        if self._has_agg(fold.init):
+            init = self._narrow_wide(init, ct)
+        self.line(f"let mut {acc}:{_rust_type(ct)}={init};")
+        lo_value = self._expr(fold.lo, env, state, it)
+        hi_value = self._expr(fold.hi, env, state, it)
+        if self._has_agg(fold.lo):
+            lo_value = self._narrow_wide(lo_value, it)
+        if self._has_agg(fold.hi):
+            hi_value = self._narrow_wide(hi_value, it)
+        self.line(
+            f"let mut {idx}:{_rust_type(it)}={lo_value};let {hi}:{_rust_type(it)}={hi_value};"
+        )
+        inner = dict(env)
+        inner[fold.acc_name], inner[fold.index_name] = acc, idx
+        self.type_env[fold.acc_name], self.type_env[fold.index_name] = ct, it
+        self.line(f"for _ in 0..{fold.n}{{if {idx}>{hi}{{break;}}")
+        for stmt in fold.body:
+            self._stmt(stmt, inner, state)
+        value = self._expr(fold.yield_expr, inner, state, ct)
+        if self._has_agg(fold.yield_expr):
+            value = self._narrow_wide(value, ct)
+        self.line(f"{acc}={value};")
+        self.line(f"match {idx}.checked_add(1){{Some(next)=>{idx}=next,None=>break,}}")
         self.line("}")
-        self.line()
-        self.line("#[derive(Clone, Copy, Debug)]")
-        self.line("pub struct Access { pub table: u8, pub slot: u64, pub column: &'static str }")
-        self.line("impl Access {")
-        self.line("    pub fn new(table: u8, slot: u64, column: &'static str) -> Self {")
-        self.line("        Self { table, slot, column }")
-        self.line("    }")
-        self.line("}")
-        self.line()
-        # Params enum
-        self.line("#[derive(Clone, Debug)]")
-        self.line("pub enum Params {")
-        for tname, ti in self.prog.transitions.items():
-            params = ", ".join(f"{p.name}: {_rust_type(ti.param_types[p.name])}"
-                               for p in ti.decl.params)
-            if params:
-                self.line(f"    {self._variant(tname)} {{ {params} }},")
-            else:
-                self.line(f"    {self._variant(tname)},")
-        self.line("}")
-        self.line()
-        # reads / writes / execute
-        self.line("impl Params {")
-        for which in ("reads", "writes"):
-            self.line(f"    pub fn {which}(&self) -> Vec<Access> {{")
-            self.line("        match self {")
-            for tname, ti in self.prog.transitions.items():
-                env = {p.name: p.name for p in ti.decl.params}
-                binds = ", ".join(p.name for p in ti.decl.params) or "_"
-                if ti.decl.params:
-                    self.line("            Params::" + self._variant(tname) + " { " + binds + " } => vec![")
-                else:
-                    self.line("            Params::" + self._variant(tname) + " => vec![")
-                for ap in getattr(ti.decl, which):
-                    self.line("                Access::new(" + self._table_const(ap.table) + ", "
-                              + self._slot_expr(ap.key, env) + ", \"" + ap.column + "\"),")
-                if which == "writes":
-                    # Spec 5.1: the write set includes the tracked_sum accumulator
-                    # (Agg, T.c). Without it, disjoint-slot transfers run in
-                    # parallel and race on the shared accumulator (lost update).
-                    for wt in {ap.table for ap in ti.decl.writes}:
-                        for cinfo in self.prog.tables[wt].columns.values():
-                            if cinfo.tracked_sum:
-                                self.line("                Access::new(" + self._table_const(wt)
-                                          + ", WILDCARD, \"agg_" + cinfo.name + "\"),")
-                self.line("            ],")
-            self.line("        }")
-            self.line("    }")
-        self.line("    pub fn execute(&self, state: &mut State) -> Result<(), ErrorCode> {")
-        self.line("        match self {")
-        for tname, ti in self.prog.transitions.items():
-            if ti.decl.params:
-                binds = ", ".join(p.name for p in ti.decl.params)
-                args = ", ".join("*" + p.name for p in ti.decl.params)
-                self.line("            Params::" + self._variant(tname) + " { " + binds + " } => " + tname + "(state, " + args + "),")
-            else:
-                self.line("            Params::" + self._variant(tname) + " => " + tname + "(state),")
-        self.line("        }")
-        self.line("    }")
-        self.line("    pub fn encode(&self) -> (u8, [u64; 4]) {")
-        self.line("        match self {")
-        for idx, tname in enumerate(self.prog.transitions):
-            ti = self.prog.transitions[tname]
-            if ti.decl.params:
-                binds = ", ".join(p.name for p in ti.decl.params)
-                vals = []
-                for p in ti.decl.params:
-                    pt = ti.param_types[p.name]
-                    if pt.kind == "bytes32":
-                        vals.append(f"u64::from_le_bytes({p.name}[0..8].try_into().unwrap())")
-                    else:
-                        vals.append(f"*{p.name} as u64")
-                vals += ["0u64"] * (4 - len(vals))
-                self.line("            Params::" + self._variant(tname) + " { " + binds + " } => ("
-                          + str(idx) + ", [" + ", ".join(vals) + "]),")
-            else:
-                self.line("            Params::" + self._variant(tname) + " => ("
-                          + str(idx) + ", [0u64; 4]),")
-        self.line("        }")
-        self.line("    }")
-        self.line("    pub fn decode(transition: u8, args: [u64; 4]) -> Params {")
-        self.line("        match transition {")
-        for idx, tname in enumerate(self.prog.transitions):
-            ti = self.prog.transitions[tname]
-            fields = ", ".join(
-                (f"{p.name}: u64_to_bytes32(args[{i}])"
-                 if ti.param_types[p.name].kind == "bytes32"
-                 else f"{p.name}: args[{i}] as {_rust_type(ti.param_types[p.name])}")
-                for i, p in enumerate(ti.decl.params))
-            if fields:
-                self.line("            " + str(idx) + " => Params::" + self._variant(tname)
-                          + " { " + fields + " },")
-            else:
-                self.line("            " + str(idx) + " => Params::" + self._variant(tname) + ",")
-        self.line("            _ => panic!(\"unknown transition id\"),")
-        self.line("        }")
-        self.line("    }")
-        self.line("}")
-        self.line()
-        # conflict analysis + lock-free waves
-        self.line("fn conflicts(a: &[Access], b: &[Access]) -> bool {")
-        self.line("    for x in a {")
-        self.line("        for y in b {")
-        self.line("            if x.table == y.table && x.column == y.column &&")
-        self.line("               (x.slot == WILDCARD || y.slot == WILDCARD || x.slot == y.slot) {")
-        self.line("                return true;")
-        self.line("            }")
-        self.line("        }")
-        self.line("    }")
-        self.line("    false")
-        self.line("}")
-        self.line()
-        self.line("/// Two intents conflict when one writes an item the other reads or writes.")
-        self.line("fn intents_conflict(a: &Params, b: &Params) -> bool {")
-        self.line("    let aw = a.writes(); let ar = a.reads();")
-        self.line("    let bw = b.writes(); let br = b.reads();")
-        self.line("    conflicts(&aw, &bw) || conflicts(&aw, &br) || conflicts(&ar, &bw)")
-        self.line("}")
-        self.line()
-        self.line("/// Tier-1 dispatcher: conflict analysis + lock-free parallel waves.")
-        self.line("/// Safety: `conflicts` partitions intents into waves whose write sets are")
-        self.line("/// disjoint, so the raw-pointer aliasing of `state` never races.")
-        self.line("pub fn run_batch(state: &mut State, intents: &[Params]) -> Vec<Result<(), ErrorCode>> {")
-        self.line("    let n = intents.len();")
-        self.line("    let mut results: Vec<Result<(), ErrorCode>> = (0..n).map(|_| Ok(())).collect();")
-        self.line("    let mut waves: Vec<Vec<usize>> = Vec::new();")
-        self.line("    for i in 0..n {")
-        self.line("        let mut placed = false;")
-        self.line("        for wave in waves.iter_mut() {")
-        self.line("            if !wave.iter().any(|&j| intents_conflict(&intents[j], &intents[i])) {")
-        self.line("                wave.push(i); placed = true; break;")
-        self.line("            }")
-        self.line("        }")
-        self.line("        if !placed { waves.push(vec![i]); }")
-        self.line("    }")
-        self.line("    let state_ptr = state as *mut State as usize;")
-        self.line("    let res_ptr = results.as_mut_ptr() as usize;")
-        self.line("    for wave in waves {")
-        self.line("        std::thread::scope(|s| {")
-        self.line("            for &i in &wave {")
-        self.line("                let intent = &intents[i];")
-        self.line("                let sp = state_ptr;")
-        self.line("                let rp = res_ptr;")
-        self.line("                unsafe {")
-        self.line("                    s.spawn(move || {")
-        self.line("                        let st = &mut *(sp as *mut State);")
-        self.line("                        *(rp as *mut Result<(), ErrorCode>).add(i) = intent.execute(st);")
-        self.line("                    });")
-        self.line("                }")
-        self.line("            }")
-        self.line("        });")
-        self.line("    }")
-        self.line("    results")
-        self.line("}")
-        self.line()
-        self._emit_wal(use_rt=use_rt)
-        self.line()
-        self._emit_snapshot()
+        self.line(acc + "}")
+        result = "\n".join(self.lines)
+        self.lines, self.type_env = saved_lines, saved_types
+        return result
 
-    def _emit_wal(self, use_rt: bool = False) -> None:
-        if use_rt:
-            self.line("/// Intent WAL record + durable log backed by io_uring.")
-            self.line("pub use ::vera_rt::{IoUringWAL as WAL, IntentRecord};")
-            self.line("pub use ::vera_rt::replay_file;")
+    def _encode_scalar(self, value, ct, out="out"):
+        if ct.is_bool:
+            return f"{out}.push(({value}) as u8);"
+        if ct.kind == "bytes32":
+            return f"{out}.extend_from_slice(&({value}));"
+        return f"{out}.extend_from_slice(&({value}).to_le_bytes());"
+
+    def _decode_scalar(self, ct, reader="r"):
+        if ct.is_bool:
+            return f"{reader}.boolean()?"
+        if ct.kind == "bytes32":
+            return f"{reader}.take::<32>()?"
+        rt = _rust_type(ct)
+        val = f"{rt}::from_le_bytes({reader}.take::<{ct.size}>()?)"
+        if ct.kind == "enum":
+            return f"{{let v={val};if (v as usize)>={len(ct.enum_tags)}{{return Err(ErrorCode::InvalidEncoding);}}v}}"
+        return val
+
+    def _projection_value(self, expr, env, ctype=None):
+        ct = ctype or self._type(expr)
+        value = self._expr(expr, env, "post", ct)
+        if ct.is_bool:
+            return f"ProjectionValue::Bool({value})"
+        if ct.kind == "bytes32":
+            return f"ProjectionValue::Bytes32({value})"
+        if self._has_agg(expr):
+            return f"ProjectionValue::Integer({value})"
+        return f"ProjectionValue::Integer(I256::from_{'i128' if ct.is_signed else 'u128'}(({value}) as {'i128' if ct.is_signed else 'u128'}))"
+
+    def _free_vars(self, expr):
+        if isinstance(expr, A.Var):
+            ct = getattr(self.prog, "expr_types", {}).get(id(expr))
+            return (
+                set()
+                if ct is not None and ct.kind == "enum" and expr.name in ct.enum_tags
+                else {expr.name}
+            )
+        if dataclasses.is_dataclass(expr):
+            out = set()
+            for f in dataclasses.fields(expr):
+                v = getattr(expr, f.name)
+                if dataclasses.is_dataclass(v):
+                    out.update(self._free_vars(v))
+                elif isinstance(v, list):
+                    for item in v:
+                        if dataclasses.is_dataclass(item):
+                            out.update(self._free_vars(item))
+            return out
+        return set()
+
+    def _projection_bounds(self, expr, transition, env):
+        if not isinstance(expr, A.Binary):
             return
-        self.line("/// Intent WAL record: (IntentID, BinaryArgs, TxSequenceNumber).")
-        self.line("/// Canonical little-endian layout, 24 + pad to 64 bytes.")
-        self.line("#[repr(C)]")
-        self.line("pub struct IntentRecord {")
-        self.line("    pub intent_id: u64,")
-        self.line("    pub tx_seq: u64,")
-        self.line("    pub transition: u8,")
-        self.line("    pub pad: [u8; 7],")
-        self.line("    pub args: [u64; 4],")
-        self.line("}")
-        self.line("impl IntentRecord {")
-        self.line("    pub const BYTES: usize = std::mem::size_of::<IntentRecord>();")
-        self.line("    pub fn encode(&self) -> [u8; 64] {")
-        self.line("        let mut out = [0u8; 64];")
-        self.line("        out[0..8].copy_from_slice(&self.intent_id.to_le_bytes());")
-        self.line("        out[8..16].copy_from_slice(&self.tx_seq.to_le_bytes());")
-        self.line("        out[16] = self.transition;")
-        self.line("        for i in 0..4 {")
-        self.line("            out[24 + i * 8..32 + i * 8].copy_from_slice(&self.args[i].to_le_bytes());")
-        self.line("        }")
-        self.line("        out")
-        self.line("    }")
-        self.line("}")
-        self.line()
-        self.line("pub struct WAL { file: std::fs::File, pub tx_seq: u64 }")
-        self.line("impl WAL {")
-        self.line("    pub fn open(path: &str) -> std::io::Result<Self> {")
-        self.line("        let file = std::fs::OpenOptions::new().create(true).append(true).open(path)?;")
-        self.line("        let tx_seq = file.metadata()?.len() / 64;")
-        self.line("        Ok(Self { file, tx_seq })")
-        self.line("    }")
-        self.line("    pub fn append(&mut self, transition: u8, args: [u64; 4]) -> std::io::Result<()> {")
-        self.line("        self.tx_seq += 1;")
-        self.line("        let rec = IntentRecord { intent_id: self.tx_seq, tx_seq: self.tx_seq,")
-        self.line("                              transition, pad: [0u8; 7], args };")
-        self.line("        self.file.write_all(&rec.encode())?;")
-        self.line("        Ok(())")
-        self.line("    }")
-        self.line("    pub fn sync(&mut self) -> std::io::Result<()> { self.file.sync_all() }")
-        self.line("}")
+        if expr.op == "and":
+            self._projection_bounds(expr.left, transition, env)
+            self._projection_bounds(expr.right, transition, env)
+            return
+        if expr.op not in ("ge", "gt", "le", "lt", "eq"):
+            return
+        ti = self.prog.transitions[transition]
+        pname = None
+        value_expr = None
+        key = None
+        offset = 0
+        if (
+            isinstance(expr.left, A.Var)
+            and expr.left.name in ti.param_types
+            and expr.left.name not in self._free_vars(expr.right)
+        ):
+            pname, value_expr = expr.left.name, expr.right
+            key = {"ge": "min", "gt": "min", "le": "max", "lt": "max", "eq": "exact"}[
+                expr.op
+            ]
+            offset = {"gt": 1, "lt": -1}.get(expr.op, 0)
+        elif (
+            isinstance(expr.right, A.Var)
+            and expr.right.name in ti.param_types
+            and expr.right.name not in self._free_vars(expr.left)
+        ):
+            pname, value_expr = expr.right.name, expr.left
+            key = {"ge": "max", "gt": "max", "le": "min", "lt": "min", "eq": "exact"}[
+                expr.op
+            ]
+            offset = {"gt": -1, "lt": 1}.get(expr.op, 0)
+        if pname is None or not self._free_vars(value_expr) <= set(env):
+            return
+        value = self._projection_value(value_expr, env, ti.param_types[pname])
+        self.line(
+            f"if let Ok(value)=(||->Result<ProjectionValue,ErrorCode>{{Ok({value})}})(){{if let Some(value)=value.offset({offset}){{projection_bound(&mut bounds,{json.dumps(pname)},{json.dumps(key)},value);}}}}"
+        )
 
-    def _emit_snapshot(self) -> None:
-        self.line("/// Copy-on-write snapshot: writes the packed State bytes to `path`.")
-        self.line("pub fn snapshot(state: &State, path: &str) -> std::io::Result<()> {")
-        self.line("    let bytes = unsafe {")
-        self.line("        std::slice::from_raw_parts(state as *const State as *const u8,")
-        self.line("                                  std::mem::size_of::<State>())")
-        self.line("    };")
-        self.line("    std::fs::write(path, bytes)")
-        self.line("}")
-        self.line()
+    def _emit_projections(self):
+        self.line(r"""
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ProjectionValue { Bool(bool), Integer(I256), Bytes32([u8;32]) }
+impl ProjectionValue {fn offset(self,n:i128)->Option<Self>{match self{Self::Integer(v)=>v.checked_add(I256::from_i128(n)).map(Self::Integer),v if n==0=>Some(v),_=>None}}}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionCell {pub table:&'static str,pub column:&'static str,pub requested:Option<u64>,pub id:u64,pub live:bool,pub value:Option<ProjectionValue>}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParameterBound {pub parameter:&'static str,pub min:Option<ProjectionValue>,pub max:Option<ProjectionValue>,pub exact:Option<ProjectionValue>}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Affordance {pub transition:&'static str,pub enabled:bool,pub bounds:Vec<ParameterBound>}
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionFrame {pub projection:&'static str,pub allowed:bool,pub reason:&'static str,pub cells:Vec<ProjectionCell>,pub affordances:Vec<Affordance>}
+fn projection_bound(bounds:&mut[ParameterBound],parameter:&str,kind:&str,value:ProjectionValue){if let Some(b)=bounds.iter_mut().find(|b|b.parameter==parameter){match kind{"min"=>if b.min.as_ref().map_or(true,|v|*v<value){b.min=Some(value)},"max"=>if b.max.as_ref().map_or(true,|v|*v>value){b.max=Some(value)},"exact"=>b.exact=Some(value),_=>{}}}}
+""")
+        for name, pi in self.prog.projections.items():
+            self.type_env = dict(pi.param_types)
+            env = {p.name: "p_" + p.name for p in pi.decl.params}
+            params = ",".join(
+                f"p_{p.name}:{_rust_type(pi.param_types[p.name])}"
+                for p in pi.decl.params
+            )
+            self.line(
+                f'pub fn project_{name}(state:&State{"," + params if params else ""})->Result<ProjectionFrame,ErrorCode>{{let pre=state;let mut frame=ProjectionFrame{{projection:{json.dumps(name)},allowed:false,reason:"",cells:Vec::new(),affordances:Vec::new()}};'
+            )
+            if pi.decl.allow_if is not None:
+                cond = self._expr(pi.decl.allow_if, env, "post", BOOL)
+                self.line(
+                    f'if !(||->Result<bool,ErrorCode>{{Ok({cond})}})().unwrap_or(false){{frame.reason="allow_if evaluated to false";return Ok(frame);}}'
+                )
+            self.line("frame.allowed=true;")
+            for sl in pi.decl.expose:
+                ti = self.prog.tables[sl.table]
+                ci = ti.columns[sl.column]
+                obj = "state." + self._field(sl.table)
+                if sl.row is None:
+                    self.line(
+                        f"for slot in 0..{ti.layout.capacity}{{if ({obj}.occupied_bitmap[slot/64]>>(slot%64))&1==1{{let id=(({obj}.generation[slot] as u64)<<{ti.layout.key_bits})|slot as u64;"
+                    )
+                    access = A.TableAccess(sl.table, A.Var("_projection_id"), sl.column)
+                    inner = dict(env)
+                    inner["_projection_id"] = "id"
+                    value = self._projection_value(access, inner, ci.type)
+                    self.line(
+                        f"frame.cells.push(ProjectionCell{{table:{json.dumps(sl.table)},column:{json.dumps(sl.column)},requested:None,id,live:true,value:Some({value})}});}}}}"
+                    )
+                else:
+                    key = self._expr(sl.row, env, "post", ti.key_type)
+                    self.line(
+                        f"{{let requested={key};let slot=(requested&{ti.layout.capacity - 1}) as usize;let id=(({obj}.generation[slot] as u64)<<{ti.layout.key_bits})|slot as u64;let live=table_exists_{sl.table}(&{obj},requested);"
+                    )
+                    access = A.TableAccess(sl.table, A.Var("_projection_id"), sl.column)
+                    inner = dict(env)
+                    inner["_projection_id"] = "id"
+                    value = self._projection_value(access, inner, ci.type)
+                    self.line(
+                        f"frame.cells.push(ProjectionCell{{table:{json.dumps(sl.table)},column:{json.dumps(sl.column)},requested:Some(requested),id,live,value:if live{{Some({value})}}else{{None}}}});}}"
+                    )
+            for intent in pi.decl.enable_intents:
+                condition = self._expr(intent.condition, env, "post", BOOL)
+                self.line(
+                    f"{{let enabled=(||->Result<bool,ErrorCode>{{Ok({condition})}})().unwrap_or(false);let mut bounds=Vec::new();if enabled{{"
+                )
+                ti = self.prog.transitions[intent.transition]
+                for p in ti.decl.params:
+                    self.line(
+                        f"bounds.push(ParameterBound{{parameter:{json.dumps(p.name)},min:None,max:None,exact:None}});"
+                    )
+                for _, req in ti.decl.requires:
+                    self._projection_bounds(req, intent.transition, env)
+                self.line(
+                    f"}}frame.affordances.push(Affordance{{transition:{json.dumps(intent.transition)},enabled,bounds}});}}"
+                )
+            self.line("Ok(frame)}")
 
-    def _emit_demo_main(self) -> None:
-        self.line("fn main() {")
-        self.line("    let mut state = State::new();")
-        # Seed two rows in the first table that has a numeric balance-like column.
+    def _emit_runtime(self, use_rt):
+        self.line("#[derive(Clone, Debug, PartialEq, Eq)] pub enum Params {")
+        for name, ti in self.prog.transitions.items():
+            fields = ",".join(
+                f"{self._param_field(p.name, ti.decl.params)}:{_rust_type(ti.param_types[p.name])}"
+                for p in ti.decl.params
+            )
+            self.line(f"    {self._variant(name)}{{{fields}}},")
+        self.line("}")
+        target = "self" if self.prog.transitions else "*self"
+        self.line(
+            "impl Params {pub fn execute(&self,state:&mut State)->Result<(),ErrorCode>{match "
+            + target
+            + "{"
+        )
+        for name, ti in self.prog.transitions.items():
+            binds = ",".join(
+                self._param_field(p.name, ti.decl.params) for p in ti.decl.params
+            )
+            args = ",".join(
+                "*" + self._param_field(p.name, ti.decl.params) for p in ti.decl.params
+            )
+            self.line(
+                f"    Params::{self._variant(name)}{{{binds}}}=>{self._function(name)}(state{',' + args if args else ''}),"
+            )
+        self.line("}}")
+        self.line(
+            "pub fn encode(&self)->(u32,Vec<u8>){let mut out=Vec::new();out.extend_from_slice(&PROGRAM_FINGERPRINT);let transition=match "
+            + target
+            + "{"
+        )
+        for ident, (name, ti) in enumerate(self.prog.transitions.items()):
+            binds = ",".join(
+                self._param_field(p.name, ti.decl.params) for p in ti.decl.params
+            )
+            self.line(f"    Params::{self._variant(name)}{{{binds}}}=>{{")
+            for p in ti.decl.params:
+                self.line(
+                    self._encode_scalar(
+                        "*" + self._param_field(p.name, ti.decl.params),
+                        ti.param_types[p.name],
+                    )
+                )
+            self.line(f"    {ident}u32}},")
+        self.line("};(transition,out)}")
+        self.line(
+            "pub fn decode(transition:u32,args:impl AsRef<[u8]>)->Result<Self,ErrorCode>{let mut r=Reader::new(args.as_ref());if r.take::<32>()?!=PROGRAM_FINGERPRINT{return Err(ErrorCode::InvalidEncoding);}let value=match transition{"
+        )
+        for ident, (name, ti) in enumerate(self.prog.transitions.items()):
+            self.line(f"    {ident}=>Self::{self._variant(name)}{{")
+            for p in ti.decl.params:
+                self.line(
+                    f"        {self._param_field(p.name, ti.decl.params)}:{self._decode_scalar(ti.param_types[p.name])},"
+                )
+            self.line("    },")
+        self.line(
+            "    _=>return Err(ErrorCode::InvalidEncoding),};r.done()?;Ok(value)}\n}"
+        )
+        self.line(r"""
+/// Ordered serial execution, also the fallback for speculative conflicts.
+pub fn run_batch_serial(state:&mut State,intents:&[Params])->Vec<Result<(),ErrorCode>>{intents.iter().map(|p|p.execute(state)).collect()}
+/// Speculate on immutable snapshots; validate the full pre-state at ordered commit.
+/// Conservative validation covers data-dependent reads, indexes, occupancy,
+/// aggregates and effects. A stale speculation is re-executed against the
+/// committed state, exactly preserving sequential intent-log semantics.
+pub fn run_batch(state:&mut State,intents:&[Params])->Vec<Result<(),ErrorCode>>{
+    let mut results=Vec::with_capacity(intents.len());
+    let workers=std::thread::available_parallelism().map(|n|n.get()).unwrap_or(1).min(32);
+    for chunk in intents.chunks(workers.max(1)){
+        let base=state.clone();
+        let candidates=std::thread::scope(|scope|{
+            let handles:Vec<_>=chunk.iter().map(|intent|{let pre=&base;scope.spawn(move||{let mut staged=pre.clone();let result=intent.execute(&mut staged);(staged,result)})}).collect();
+            handles.into_iter().map(|h|h.join().expect("VERA speculative worker failed")).collect::<Vec<_>>()
+        });
+        for (intent,(staged,result)) in chunk.iter().zip(candidates){
+            if *state==base {if result.is_ok(){*state=staged;}results.push(result);}else{results.push(intent.execute(state));}
+        }
+    }results
+}
+""")
+        if use_rt:
+            self.line(
+                "pub use ::vera_rt::{IoUringWAL as WAL,IntentRecord,replay_file,atomic_write,checksum};"
+            )
+        else:
+            source = (
+                Path(__file__).with_name("templates").joinpath("wal.rs").read_text()
+            )
+            self.line(
+                "mod wal {\n"
+                + source
+                + "\n}\npub use wal::{WAL,IntentRecord,replay_file,atomic_write,checksum};"
+            )
+
+    def _emit_snapshot(self):
+        self.line(
+            'impl State {pub fn encode(&self)->Vec<u8>{let mut out=Vec::new();out.extend_from_slice(b"VERASNP2");out.extend_from_slice(&STATE_SCHEMA);'
+        )
+        for tn, ti in self.prog.tables.items():
+            obj = "self." + self._field(tn)
+            self.line(
+                f"for value in &{obj}.occupied_bitmap{{out.extend_from_slice(&value.to_le_bytes());}}for value in &{obj}.generation{{out.extend_from_slice(&value.to_le_bytes());}}"
+            )
+            for cn, ci in ti.columns.items():
+                self.line(
+                    f"for value in &{obj}.col_{cn}{{{self._encode_scalar('*value', ci.type)}}}"
+                )
+                if ci.tracked_sum:
+                    self.line(
+                        f"out.extend_from_slice(&{obj}.agg_sum_{cn}.to_le_bytes());"
+                    )
+                if ci.unique:
+                    self.line(
+                        f"for value in &{obj}.hash_{cn}_key{{out.extend_from_slice(&value.to_le_bytes());}}for value in &{obj}.hash_{cn}_used{{out.extend_from_slice(&value.to_le_bytes());}}"
+                    )
+        self.line(
+            "out.extend_from_slice(&(self.outbox.len() as u64).to_le_bytes());for effect in &self.outbox{match effect{"
+        )
+        for idx, (name, eff) in enumerate(self.prog.effects.items()):
+            binds = ",".join(self._param_field(p.name, eff.params) for p in eff.params)
+            self.line(
+                f"Effect::{self.effect_variants[name]}{{{binds}}}=>{{out.extend_from_slice(&{idx}u32.to_le_bytes());"
+            )
+            for p in eff.params:
+                self.line(
+                    self._encode_scalar(
+                        "*" + self._param_field(p.name, eff.params),
+                        self._resolved(p.type),
+                    )
+                )
+            self.line("},")
+        if not self.prog.effects:
+            self.line('_=>unreachable!("uninhabited effect"),')
+        self.line(
+            "}}let crc=checksum(&out);out.extend_from_slice(&crc.to_le_bytes());out}"
+        )
+        self.line(
+            'pub fn decode(data:impl AsRef<[u8]>)->Result<Self,ErrorCode>{let data=data.as_ref();let end=data.len().checked_sub(4).ok_or(ErrorCode::InvalidEncoding)?;if checksum(&data[..end])!=u32::from_le_bytes(data[end..].try_into().unwrap()){return Err(ErrorCode::InvalidEncoding);}let mut r=Reader::new(&data[..end]);if r.take::<8>()?!=*b"VERASNP2"||r.take::<32>()?!=STATE_SCHEMA{return Err(ErrorCode::InvalidEncoding);}let mut state=Self::new();'
+        )
+        for tn, ti in self.prog.tables.items():
+            obj = "state." + self._field(tn)
+            self.line(
+                f"for value in &mut {obj}.occupied_bitmap{{*value=u64::from_le_bytes(r.take::<8>()?);}}for value in &mut {obj}.generation{{*value=u32::from_le_bytes(r.take::<4>()?);}}"
+            )
+            if ti.layout.capacity % 64:
+                self.line(
+                    f"if {obj}.occupied_bitmap[{(ti.layout.capacity + 63) // 64 - 1}]>>{ti.layout.capacity % 64}!=0{{return Err(ErrorCode::InvalidEncoding);}}"
+                )
+            for cn, ci in ti.columns.items():
+                self.line(
+                    f"for value in &mut {obj}.col_{cn}{{*value={self._decode_scalar(ci.type)};}}"
+                )
+                if ci.tracked_sum:
+                    rt = self._agg_rust(ci.type)
+                    size = 32 if rt == "I256" else 16
+                    self.line(
+                        f"{obj}.agg_sum_{cn}={rt}::from_le_bytes(r.take::<{size}>()?);"
+                    )
+                if ci.unique:
+                    self.line(
+                        f"for value in &mut {obj}.hash_{cn}_key{{*value=u64::from_le_bytes(r.take::<8>()?);}}for value in &mut {obj}.hash_{cn}_used{{*value=u64::from_le_bytes(r.take::<8>()?);}}"
+                    )
+        self.line(
+            "let count=u64::from_le_bytes(r.take::<8>()?);if count>r.data.len() as u64{return Err(ErrorCode::InvalidEncoding);}for _ in 0..count{let tag=u32::from_le_bytes(r.take::<4>()?);let effect=match tag{"
+        )
+        for idx, (name, eff) in enumerate(self.prog.effects.items()):
+            self.line(f"{idx}=>Effect::{self.effect_variants[name]}{{")
+            for p in eff.params:
+                self.line(
+                    f"{self._param_field(p.name, eff.params)}:{self._decode_scalar(self._resolved(p.type))},"
+                )
+            self.line("},")
+        self.line(
+            "_=>return Err(ErrorCode::InvalidEncoding),};state.outbox.push(effect);}r.done()?;state.validate()?;Ok(state)}"
+        )
+        self.line(
+            "pub fn validate(&self)->Result<(),ErrorCode>{let state=self;let pre=self;"
+        )
+        for tn, ti in self.prog.tables.items():
+            obj = "self." + self._field(tn)
+            if ti.layout.capacity % 64:
+                self.line(
+                    f"if {obj}.occupied_bitmap[{(ti.layout.capacity + 63) // 64 - 1}]>>{ti.layout.capacity % 64}!=0{{return Err(ErrorCode::InvalidEncoding);}}"
+                )
+            for cn, ci in ti.columns.items():
+                self.line(
+                    f"for i in 0..{ti.layout.capacity}{{if ({obj}.occupied_bitmap[i/64]>>(i%64))&1==0 && {obj}.col_{cn}[i]!={_zero_rust(ci.type)}{{return Err(ErrorCode::InvalidEncoding);}}}}"
+                )
+                if ci.type.kind == "enum" and len(ci.type.enum_tags) < 256:
+                    self.line(
+                        f"if {obj}.col_{cn}.iter().any(|&value|value>={len(ci.type.enum_tags)}u8){{return Err(ErrorCode::InvalidEncoding);}}"
+                    )
+                if ci.tracked_sum:
+                    rt = self._agg_rust(ci.type)
+                    self.line(
+                        f"let mut total:{rt}={self._agg_zero(ci.type)};for i in 0..{ti.layout.capacity}{{if ({obj}.occupied_bitmap[i/64]>>(i%64))&1==1{{total=total.checked_add({self._agg_cast(f'{obj}.col_{cn}[i]', ci.type)}).ok_or(ErrorCode::InvalidEncoding)?;}}}}if total!={obj}.agg_sum_{cn}{{return Err(ErrorCode::InvalidEncoding);}}"
+                    )
+                if ci.unique:
+                    self.line(
+                        f"let mut check={obj}.clone();check.hash_{cn}_key.fill(0);check.hash_{cn}_used.fill(0);for i in 0..{ti.layout.capacity}{{if (check.occupied_bitmap[i/64]>>(i%64))&1==1{{let value=check.col_{cn}[i];hash_insert_{tn}_{cn}(&mut check,&value,i).map_err(|_|ErrorCode::InvalidEncoding)?;}}}}if check.hash_{cn}_key!={obj}.hash_{cn}_key||check.hash_{cn}_used!={obj}.hash_{cn}_used{{return Err(ErrorCode::InvalidEncoding);}}"
+                    )
+        for inv in self.prog.invariants.values():
+            if inv.quant_table is None:
+                self.type_env = {}
+                self.line(
+                    f"if !({self._expr(inv.expr, {}, 'post', BOOL)}){{return Err(ErrorCode::InvalidEncoding);}}"
+                )
+            else:
+                tn = inv.quant_table
+                ti = self.prog.tables[tn]
+                self.type_env = {inv.quant_var: ti.key_type}
+                key = "_vera_quant_key"
+                self.line(
+                    f"for i in 0..{ti.layout.capacity}{{if (self.{self._field(tn)}.occupied_bitmap[i/64]>>(i%64))&1==1{{let {key}=((self.{self._field(tn)}.generation[i] as u64)<<{ti.layout.key_bits})|i as u64;"
+                )
+                self.line(
+                    f"if !({self._expr(inv.expr, {inv.quant_var: key}, 'post', BOOL)}){{return Err(ErrorCode::InvalidEncoding);}}}}}}"
+                )
+        self.line("for effect in &self.outbox {match effect {")
+        for name, eff in self.prog.effects.items():
+            binds = ",".join(self._param_field(p.name, eff.params) for p in eff.params)
+            self.line(f"Effect::{self.effect_variants[name]}{{{binds}}}=>{{")
+            for p in eff.params:
+                ct = self._resolved(p.type)
+                if ct.kind == "enum" and len(ct.enum_tags) < 256:
+                    field = self._param_field(p.name, eff.params)
+                    self.line(
+                        f"if *{field}>={len(ct.enum_tags)}u8{{return Err(ErrorCode::InvalidEncoding);}}"
+                    )
+            self.line("},")
+        if not self.prog.effects:
+            self.line('_=>unreachable!("uninhabited effect"),')
+        self.line("}}Ok(())}}")
+        self.line(r"""
+pub fn snapshot(state:&State,path:&str)->std::io::Result<()>{state.validate().map_err(|_|std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid VERA state"))?;atomic_write(path,&state.encode())}
+
+pub fn restore(path:&str)->std::io::Result<State>{State::decode(std::fs::read(path)?).map_err(|_|std::io::Error::new(std::io::ErrorKind::InvalidData,"invalid VERA snapshot"))}
+""")
+
+    def _emit_demo_main(self):
+        self.line("fn main(){let mut initial=State::new();")
         seeded = False
-        for tname, tinfo in self.prog.tables.items():
-            if seeded:
-                break
-            numeric = [c for c in tinfo.columns.values()
-                       if c.type.kind in ("i64", "dec64", "u64")]
-            if not numeric:
+        for tn, ti in self.prog.tables.items():
+            numeric = [
+                ci
+                for ci in ti.columns.values()
+                if ci.type.kind in ("i64", "dec64", "u64")
+            ]
+            if seeded or ti.layout.capacity < 2 or not numeric:
                 continue
             seeded = True
-            col = numeric[0]
-            self.line(f"    // Seed two rows in {tname} (generation 1).")
-            self.line(f"    state.{tname.lower()}.occupied_bitmap[0] |= 0b11u64;")
-            self.line(f"    state.{tname.lower()}.generation[0] = 1;")
-            self.line(f"    state.{tname.lower()}.generation[1] = 1;")
-            self.line(f"    state.{tname.lower()}.col_{col.name}[0] = 500_000000;")
-            self.line(f"    state.{tname.lower()}.col_{col.name}[1] = 300_000000;")
-            if col.tracked_sum:
-                self.line(f"    state.{tname.lower()}.agg_sum_{col.name} = 800_000000;")
-        # Build a batch of intents.
-        self.line("    let intents = vec![")
-        transitions = list(self.prog.transitions.items())
-        for idx in range(min(6, max(1, len(transitions)))):
-            tname, ti = transitions[idx % len(transitions)]
-            args = []
+            ci = numeric[0]
+            obj = "initial." + self._field(tn)
+            self.line(
+                f"{obj}.occupied_bitmap[0]=3;{obj}.generation[0]=1;{obj}.generation[1]=1;{obj}.col_{ci.name}[0]=500000000;{obj}.col_{ci.name}[1]=300000000;"
+            )
+            if ci.tracked_sum:
+                self.line(f"{obj}.agg_sum_{ci.name}=800000000;")
+        self.line(
+            'if initial.validate().is_err(){initial=State::new();}initial.validate().expect("program requires an application-supplied valid initial state");'
+        )
+        self.line("let mut state=initial.clone();let intents=vec![")
+        for name, ti in list(self.prog.transitions.items())[:6]:
+            fields = []
             for p in ti.decl.params:
-                pt = ti.param_types[p.name]
-                if pt.kind == "id64":
-                    args.append(f"(1u64 << KEY_BITS_{pt.key_table.upper()}) | 0u64")
-                elif pt.is_bool:
-                    args.append("false")
-                elif pt.kind == "bytes32":
-                    args.append("[0u8; 32]")
+                ct = ti.param_types[p.name]
+                if ct.kind == "id64":
+                    value = f"1u64<<KEY_BITS_{self._constant(ct.key_table)}"
+                elif ct.is_bool:
+                    value = "false"
+                elif ct.kind == "bytes32":
+                    value = "[0u8;32]"
+                elif ct.kind == "enum":
+                    value = "0"
+                elif ct.kind in ("u8", "u16"):
+                    value = "1"
                 else:
-                    args.append("100_000000")
-            fields = ", ".join(f"{p.name}: {v}" for p, v in zip(ti.decl.params, args))
-            self.line(f"        Params::{self._variant(tname)} {{ {fields} }},")
-        self.line("    ];")
-        self.line("    // Intent WAL: append every intent, then fsync.")
-        self.line('    let mut wal = WAL::open("vera.wal").unwrap();')
-        self.line("    for intent in &intents {")
-        self.line("        let (tid, args) = intent.encode();")
-        self.line("        wal.append(tid, args).unwrap();")
-        self.line("    }")
-        self.line("    wal.sync().unwrap();")
-        self.line('    println!("wal tx_seq = {}", wal.tx_seq);')
-        self.line("    // Tier-1 dispatcher: conflict analysis + lock-free waves.")
-        self.line("    let results = run_batch(&mut state, &intents);")
-        self.line("    let committed = results.iter().filter(|r| r.is_ok()).count();")
-        self.line('    println!("batch committed {}/{}", committed, intents.len());')
-        for tname, tinfo in self.prog.tables.items():
-            numeric = [c for c in tinfo.columns.values()
-                       if c.type.kind in ("i64", "dec64", "u64")]
-            if not numeric:
-                continue
-            col = numeric[0]
-            self.line(f'    println!("{tname}.{col.name}[0] = {{}}", state.{tname.lower()}.col_{col.name}[0]);')
-            self.line(f'    println!("{tname}.{col.name}[1] = {{}}", state.{tname.lower()}.col_{col.name}[1]);')
-            if col.tracked_sum:
-                self.line(f'    println!("{tname}.agg_sum_{col.name} = {{}}", state.{tname.lower()}.agg_sum_{col.name});')
-        self.line("    // Snapshot (copy-on-write).")
-        self.line('    snapshot(&state, "vera.snap").unwrap();')
-        self.line('    println!("snapshot bytes = {}", std::fs::metadata("vera.snap").unwrap().len());')
-        self.line("    // Deterministic replay from the intent log.")
-        self.line("    let mut replay = State::new();")
-        replay_seeded = False
-        for tname, tinfo in self.prog.tables.items():
-            if replay_seeded:
-                break
-            numeric = [c for c in tinfo.columns.values()
-                       if c.type.kind in ("i64", "dec64", "u64")]
-            if not numeric:
-                continue
-            replay_seeded = True
-            col = numeric[0]
-            self.line(f"    replay.{tname.lower()}.occupied_bitmap[0] |= 0b11u64;")
-            self.line(f"    replay.{tname.lower()}.generation[0] = 1;")
-            self.line(f"    replay.{tname.lower()}.generation[1] = 1;")
-            self.line(f"    replay.{tname.lower()}.col_{col.name}[0] = 500_000000;")
-            self.line(f"    replay.{tname.lower()}.col_{col.name}[1] = 300_000000;")
-            if col.tracked_sum:
-                self.line(f"    replay.{tname.lower()}.agg_sum_{col.name} = 800_000000;")
-        self.line("    for intent in &intents { let _ = intent.execute(&mut replay); }")
-        for tname, tinfo in self.prog.tables.items():
-            numeric = [c for c in tinfo.columns.values()
-                       if c.type.kind in ("i64", "dec64", "u64")]
-            if not numeric:
-                continue
-            col = numeric[0]
-            self.line(f'    println!("replay {tname}.{col.name}[0] = {{}}", replay.{tname.lower()}.col_{col.name}[0]);')
-            self.line(f'    println!("replay {tname}.{col.name}[1] = {{}}", replay.{tname.lower()}.col_{col.name}[1]);')
-            self.line(f'    assert_eq!(replay.{tname.lower()}.col_{col.name}[0], state.{tname.lower()}.col_{col.name}[0]);')
-            self.line(f'    assert_eq!(replay.{tname.lower()}.col_{col.name}[1], state.{tname.lower()}.col_{col.name}[1]);')
-        self.line('    println!("replay matches live state: deterministic");')
-        self.line("}")
-        self.line()
+                    value = "100000000"
+                fields.append(f"{self._param_field(p.name, ti.decl.params)}:{value}")
+            self.line(f"Params::{self._variant(name)}{{{','.join(fields)}}},")
+        self.line(
+            '];let mut wal=WAL::open("vera.wal").unwrap();for rec in replay_file("vera.wal").unwrap(){let intent=Params::decode(rec.transition,rec.args).unwrap();let _=intent.execute(&mut state);}for intent in &intents{let(id,args)=intent.encode();wal.append(id,args).unwrap();}wal.sync().unwrap();println!("wal tx_seq = {}",wal.tx_seq);'
+        )
+        self.line(
+            'let results=run_batch(&mut state,&intents);println!("batch committed {}/{}",results.iter().filter(|r|r.is_ok()).count(),intents.len());snapshot(&state,"vera.snap").unwrap();'
+        )
+        self.line(
+            'let records=replay_file("vera.wal").unwrap();let mut replay=initial;for rec in records{let intent=Params::decode(rec.transition,rec.args).unwrap();let _=intent.execute(&mut replay);}assert_eq!(replay,state);println!("replay matches live state: deterministic");}'
+        )
 
 
-def _walk_stmts(stmt: A.Stmt):
-    yield stmt
-    if isinstance(stmt, A.Let) and isinstance(stmt.value, A.Fold):
-        for s in stmt.value.body:
-            yield from _walk_stmts(s)
-    if isinstance(stmt, A.TableAlloc):
-        for _, e in stmt.fields:
-            pass
+def _walk_stmts(node):
+    """Visit statements nested anywhere in the expression/declaration tree.
+
+    Folds can occur inside old keys, allocation fields, selects and pure
+    specification expressions, so statement-only recursion misses guards.
+    """
+    if dataclasses.is_dataclass(node):
+        yield node
+        for field in dataclasses.fields(node):
+            yield from _walk_stmts(getattr(node, field.name))
+    elif isinstance(node, (list, tuple)):
+        for item in node:
+            yield from _walk_stmts(item)
 
 
-_SYMBOLS: Dict[str, int] = {}
-
-
-def _symbol_id(text: str) -> int:
-    if text not in _SYMBOLS:
-        _SYMBOLS[text] = len(_SYMBOLS)
-    return _SYMBOLS[text]
-
-
-def generate_rust(prog: Program, use_rt: bool = False, include_main: bool = True) -> str:
-    return RustGenerator(prog).emit(use_rt=use_rt, include_main=include_main)
+def generate_rust(
+    prog: Program, use_rt: bool = False, include_main: bool = True
+) -> str:
+    return RustGenerator(prog).emit(use_rt, include_main)
