@@ -1,4 +1,4 @@
-"""VERA: Verified Relational Architecture (v1.0 implementation).
+"""VERA: Verified Relational Architecture (v1.1 implementation).
 
 A deterministic, transactional language + verifier + runtime.
 
@@ -9,7 +9,7 @@ Sub-packages / modules:
     lexer       -- tokenizer
     parser      -- recursive-descent parser
     semantic    -- symbol tables, type checking, access sets, WCET
-    smt_emit    -- AST -> SMT-LIB 2.6 (QF_ABV) lowering
+    smt_emit    -- AST -> SMT-LIB 2.6 (QF_AUFBV) lowering
     verifier    -- three-proof-obligation driver + counterexample lifting
     runtime     -- reference SoA execution engine
     projection  -- State & Affordance Frame construction
@@ -19,6 +19,6 @@ Sub-packages / modules:
     cli         -- command line interface
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 __all__ = ["__version__"]

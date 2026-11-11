@@ -21,6 +21,7 @@ def _generate(tmp_path, spec, name):
     from vera.parser import parse_file
     from vera.semantic import analyze
     from vera.codegen_glsl import generate_glsl
+
     prog = analyze(parse_file(os.path.join(ROOT, spec)))
     path = tmp_path / name
     path.write_text(generate_glsl(prog))
@@ -39,18 +40,30 @@ def test_furnace_runs_on_gpu(tmp_path):
     """End-to-end: compile the EGL host, run the shader, check the counters."""
     if glslang is None or gcc is None:
         pytest.skip("glslangValidator/gcc not available")
-    if shutil_which("glxinfo") is None:
-        pytest.skip("no GL stack")
     shader = _generate(tmp_path, "examples/bank.vera", "bank.comp")
     host = tmp_path / "furnace_host"
-    proc = subprocess.run([gcc, "-O2", os.path.join(ROOT, "tools", "furnace_host.c"),
-                           "-o", str(host), "-lEGL", "-lGL"],
-                          capture_output=True, text=True)
+    proc = subprocess.run(
+        [
+            gcc,
+            "-O2",
+            os.path.join(ROOT, "tools", "furnace_host.c"),
+            "-o",
+            str(host),
+            "-lEGL",
+            "-lGL",
+        ],
+        capture_output=True,
+        text=True,
+    )
     assert proc.returncode == 0, proc.stderr
-    run = subprocess.run([str(host), shader, "8"], capture_output=True, text=True,
-                         timeout=120)
+    run = subprocess.run(
+        [str(host), shader, "8"], capture_output=True, text=True, timeout=120
+    )
+    if run.returncode == 77:
+        pytest.skip(run.stderr.strip())
     assert run.returncode == 0, run.stderr
-    assert "AMD" in run.stdout or "Radeon" in run.stdout or "OpenGL" in run.stdout
+    assert "GL renderer:" in run.stdout and "GL version" in run.stdout
+    assert int(run.stdout.split("committed=")[1].split()[0]) > 0
     assert "violations=0" in run.stdout
 
 
@@ -60,18 +73,35 @@ def test_furnace_detects_violation(tmp_path):
         pytest.skip("glslangValidator/gcc not available")
     src = open(os.path.join(ROOT, "examples", "bank.vera")).read()
     buggy = src.replace(
-        "  require no_bound_breach : le(amount, sub(1000000000, Account[to].balance));\n", "")
+        "  require no_bound_breach : le(amount, sub(1000000000, Account[to].balance));\n",
+        "",
+    )
     buggy_path = tmp_path / "bound_buggy.vera"
     buggy_path.write_text(buggy)
     from vera.parser import parse_source
     from vera.semantic import analyze
     from vera.codegen_glsl import generate_glsl
+
     shader = tmp_path / "bound_buggy.comp"
     shader.write_text(generate_glsl(analyze(parse_source(buggy))))
     host = tmp_path / "furnace_host"
-    subprocess.run([gcc, "-O2", os.path.join(ROOT, "tools", "furnace_host.c"),
-                    "-o", str(host), "-lEGL", "-lGL"], capture_output=True, text=True)
-    run = subprocess.run([str(host), str(shader), "64"], capture_output=True, text=True,
-                         timeout=180)
+    subprocess.run(
+        [
+            gcc,
+            "-O2",
+            os.path.join(ROOT, "tools", "furnace_host.c"),
+            "-o",
+            str(host),
+            "-lEGL",
+            "-lGL",
+        ],
+        capture_output=True,
+        text=True,
+    )
+    run = subprocess.run(
+        [str(host), str(shader), "64"], capture_output=True, text=True, timeout=180
+    )
+    if run.returncode == 77:
+        pytest.skip(run.stderr.strip())
     assert run.returncode == 0, run.stderr
     assert "violations=0" not in run.stdout

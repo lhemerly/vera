@@ -61,8 +61,14 @@ class Diagnostic:
 class VeraError(Exception):
     """A fatal compilation/verification error carrying a Diagnostic."""
 
-    def __init__(self, code: str, message: str, line: int = 0, col: int = 0,
-                 details: Optional[List[str]] = None):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        line: int = 0,
+        col: int = 0,
+        details: Optional[List[str]] = None,
+    ):
         super().__init__(message)
         self.diag = Diagnostic(SEV_ERROR, code, message, line, col, details or [])
 
@@ -73,16 +79,35 @@ class DiagnosticBag:
     def __init__(self):
         self.items: List[Diagnostic] = []
 
-    def add(self, severity: str, code: str, message: str, line: int = 0,
-            col: int = 0, details: Optional[List[str]] = None) -> None:
+    def add(
+        self,
+        severity: str,
+        code: str,
+        message: str,
+        line: int = 0,
+        col: int = 0,
+        details: Optional[List[str]] = None,
+    ) -> None:
         self.items.append(Diagnostic(severity, code, message, line, col, details or []))
 
-    def error(self, code: str, message: str, line: int = 0, col: int = 0,
-              details: Optional[List[str]] = None) -> None:
+    def error(
+        self,
+        code: str,
+        message: str,
+        line: int = 0,
+        col: int = 0,
+        details: Optional[List[str]] = None,
+    ) -> None:
         self.add(SEV_ERROR, code, message, line, col, details)
 
-    def warning(self, code: str, message: str, line: int = 0, col: int = 0,
-                details: Optional[List[str]] = None) -> None:
+    def warning(
+        self,
+        code: str,
+        message: str,
+        line: int = 0,
+        col: int = 0,
+        details: Optional[List[str]] = None,
+    ) -> None:
         self.add(SEV_WARNING, code, message, line, col, details)
 
     @property

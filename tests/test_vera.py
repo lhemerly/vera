@@ -16,8 +16,12 @@ sys.path.insert(0, ROOT)
 
 from vera.parser import parse_file, parse_source
 from vera.semantic import analyze
-from vera.smt_emit import (SmtConfig, SmtEncoder, verify_transition,
-                           verify_transition_dual)
+from vera.smt_emit import (
+    SmtConfig,
+    SmtEncoder,
+    verify_transition,
+    verify_transition_dual,
+)
 from vera.verifier import attach_counterexample
 from vera.runtime import Machine, Revert
 from vera.fuzz import fuzz_module
@@ -33,13 +37,17 @@ def load(path):
 # Front-end / semantics
 # ---------------------------------------------------------------------------
 
+
 def test_parse_bank():
     prog = load("examples/bank.vera")
     assert not prog.diags.has_errors()
     assert set(prog.tables) == {"Account", "Order"}
     assert set(prog.transitions) == {"transfer", "freeze", "place_order"}
-    assert set(prog.invariants) == {"non_negative_balance", "balance_bounded",
-                                    "order_owner_live"}
+    assert set(prog.invariants) == {
+        "non_negative_balance",
+        "balance_bounded",
+        "order_owner_live",
+    }
     assert len(prog.projections) == 1
 
 
@@ -96,13 +104,15 @@ def test_fold_depth_and_bound():
       }
     """
     prog = analyze(parse_source(src))
-    assert any("N_max" in d.message or "exceeds" in d.message
-               for d in prog.diags.errors)
+    assert any(
+        "N_max" in d.message or "exceeds" in d.message for d in prog.diags.errors
+    )
 
 
 # ---------------------------------------------------------------------------
 # Verification
 # ---------------------------------------------------------------------------
+
 
 def test_correct_bank_verifies():
     prog = load("examples/bank.vera")
@@ -123,7 +133,9 @@ def test_buggy_transfer_violates_conservation():
     assert "conservation_of_funds" in text
     assert "from = " in text and "to = " in text
     # the counterexample must exhibit the self-transfer aliasing
-    assert result.counterexample.params.get("from") == result.counterexample.params.get("to")
+    assert result.counterexample.params.get("from") == result.counterexample.params.get(
+        "to"
+    )
 
 
 def test_vacuous_transition_rejected():
@@ -161,18 +173,30 @@ def test_missing_row_trap_detected():
 
 
 def test_smt_script_emission():
+    import z3
+
     prog = load("examples/bank.vera")
     enc = SmtEncoder(prog, "freeze", SmtConfig())
     enc.build()
     script = enc.script_full()
-    assert "(set-logic QF_ABV)" in script
-    assert "(declare-const Account_occ (Array" in script
-    assert "check-sat" in script
+    assert "(set-logic QF_AUFBV)" in script
+    z3.parse_smt2_string(script)
+    assert script.count("(check-sat)") == 3
+    for name, expected in (
+        ("safety", z3.unsat),
+        ("panic", z3.unsat),
+        ("liveness", z3.sat),
+    ):
+        solver = z3.Solver()
+        solver.set(timeout=10000)
+        solver.from_string(enc.script_for(name))
+        assert solver.check() == expected
 
 
 # ---------------------------------------------------------------------------
 # Runtime
 # ---------------------------------------------------------------------------
+
 
 def _seeded_machine():
     prog = load("examples/bank.vera")
@@ -237,6 +261,7 @@ def test_runtime_alloc_and_generation():
 # Projection
 # ---------------------------------------------------------------------------
 
+
 def test_affordance_frame():
     prog, machine, k0, _ = _seeded_machine()
     frame = build_affordance_frame(prog, machine.state, "AccountView", {"from": k0})
@@ -251,6 +276,7 @@ def test_affordance_frame():
 # ---------------------------------------------------------------------------
 # Fuzzer
 # ---------------------------------------------------------------------------
+
 
 def test_fuzzer_clean_on_correct_spec():
     prog = load("examples/bank.vera")
@@ -268,20 +294,24 @@ def test_fuzzer_finds_buggy_spec():
 # Code generation
 # ---------------------------------------------------------------------------
 
+
 def test_rust_codegen_compiles_and_runs(tmp_path):
     rustc = shutil_which("rustc")
     if rustc is None:
         pytest.skip("rustc not available")
     from vera.codegen_rust import generate_rust
+
     prog = load("examples/bank.vera")
     out = tmp_path / "bank.rs"
     out.write_text(generate_rust(prog))
     binary = tmp_path / "bank"
-    proc = subprocess.run([rustc, "--edition", "2021", "-O", str(out),
-                           "-o", str(binary)], capture_output=True, text=True)
+    proc = subprocess.run(
+        [rustc, "--edition", "2021", "-O", str(out), "-o", str(binary)],
+        capture_output=True,
+        text=True,
+    )
     assert proc.returncode == 0, proc.stderr
-    run = subprocess.run([str(binary)], capture_output=True, text=True,
-                         cwd=tmp_path)
+    run = subprocess.run([str(binary)], capture_output=True, text=True, cwd=tmp_path)
     assert run.returncode == 0, run.stderr
     assert "batch committed" in run.stdout
     assert "replay matches live state: deterministic" in run.stdout
@@ -291,17 +321,21 @@ def test_rust_codegen_compiles_and_runs(tmp_path):
 
 def test_gpu_codegen_emits():
     from vera.codegen_gpu import generate_cuda, generate_wgsl
+
     prog = load("examples/bank.vera")
     cu = generate_cuda(prog)
     wgsl = generate_wgsl(prog)
-    assert "xoshiro256" in cu or "xoshiro" in cu
-    assert "vera_guard" in cu
+    # These are the public host integration entry points. Detailed execution
+    # tests cover arithmetic, guards, atomicity and actual GPU dispatch.
+    assert "__global__ void vera_furnace_kernel" in cu
+    assert "@group(0) @binding(0)" in wgsl
     assert "workgroup_size(32)" in wgsl
     assert "fn furnace" in wgsl
 
 
 def shutil_which(name):
     import shutil
+
     return shutil.which(name)
 
 
@@ -309,18 +343,28 @@ def shutil_which(name):
 # CLI
 # ---------------------------------------------------------------------------
 
+
 def test_cli_check_and_verify():
     env = dict(os.environ)
     env["PYTHONPATH"] = ROOT
     py = os.path.join(ROOT, ".venv", "bin", "python")
     if not os.path.exists(py):
         py = sys.executable
-    check = subprocess.run([py, "-m", "vera", "check", "examples/bank.vera"],
-                           cwd=ROOT, capture_output=True, text=True, env=env)
+    check = subprocess.run(
+        [py, "-m", "vera", "check", "examples/bank.vera"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
     assert check.returncode == 0, check.stderr
-    verify = subprocess.run([py, "-m", "vera", "verify", "examples/bank.vera",
-                             "--timeout", "20000"],
-                            cwd=ROOT, capture_output=True, text=True, env=env)
+    verify = subprocess.run(
+        [py, "-m", "vera", "verify", "examples/bank.vera", "--timeout", "20000"],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
     assert verify.returncode == 0, verify.stderr
     assert verify.stdout.count("VERDICT: VERIFIED") == 3
 
@@ -398,18 +442,23 @@ def test_unique_key_rust_codegen_compiles(tmp_path):
     if rustc is None:
         pytest.skip("rustc not available")
     from vera.codegen_rust import generate_rust
+
     prog = analyze(parse_source(UNIQUE_SRC))
     out = tmp_path / "unique.rs"
     out.write_text(generate_rust(prog))
     binary = tmp_path / "unique"
-    proc = subprocess.run([rustc, "--edition", "2021", "-O", str(out), "-o", str(binary)],
-                          capture_output=True, text=True)
+    proc = subprocess.run(
+        [rustc, "--edition", "2021", "-O", str(out), "-o", str(binary)],
+        capture_output=True,
+        text=True,
+    )
     assert proc.returncode == 0, proc.stderr
 
 
 # ---------------------------------------------------------------------------
 # Bounded folds with allocation (indexed write maps + known-slot fast path)
 # ---------------------------------------------------------------------------
+
 
 def test_fold_alloc_verifies_and_scales():
     src = """
@@ -440,6 +489,7 @@ transition build()
 # Frame-decomposed tracked_sum aggregates (Spec 6.2)
 # ---------------------------------------------------------------------------
 
+
 def _big_deposit(cap: int) -> str:
     return f"""
 module Big;
@@ -466,6 +516,7 @@ transition deposit(k: id64<Account>, amount: i64)
 
 def test_frame_sum_is_used_and_scales():
     from vera.smt_emit import SmtEncoder
+
     prog = analyze(parse_source(_big_deposit(1024)))
     enc = SmtEncoder(prog, "deposit", SmtConfig(timeout_ms=30000))
     enc.build()
@@ -482,6 +533,7 @@ def test_frame_sum_beats_exact_sum_at_scale():
     sum times out."""
     from dataclasses import replace
     from vera.smt_emit import SmtEncoder
+
     prog = analyze(parse_source(_big_deposit(256)))
     t0 = time.perf_counter()
     frame = SmtEncoder(prog, "deposit", SmtConfig(timeout_ms=30000))
@@ -501,6 +553,8 @@ table Ledger capacity 8 {
 }
 invariant assets_nonneg { forall k in Ledger : ge(Ledger[k].assets, 0); }
 invariant liab_nonneg { forall k in Ledger : ge(Ledger[k].liabilities, 0); }
+invariant assets_bounded { forall k in Ledger : le(Ledger[k].assets, 1000000000); }
+invariant liab_bounded { forall k in Ledger : le(Ledger[k].liabilities, 1000000000); }
 transition revalue(k: id64<Ledger>, delta : i64)
   reads [Ledger[k].assets, Ledger[k].liabilities]
   writes [Ledger[k].assets, Ledger[k].liabilities]
@@ -509,6 +563,8 @@ transition revalue(k: id64<Ledger>, delta : i64)
   require delta_not_small : ge(delta, -100000000);
   require assets_ok : ge(add(Ledger[k].assets, delta), 0);
   require liab_ok : ge(sub(Ledger[k].liabilities, delta), 0);
+  require assets_new_bounded : le(add(Ledger[k].assets, delta), 1000000000);
+  require liab_new_bounded : le(sub(Ledger[k].liabilities, delta), 1000000000);
   ensure assets_increased : eq(sum(Ledger.assets), add(old_sum(Ledger.assets), delta));
   body {
     let %a : i64 = table_get(Ledger, k, assets);
@@ -524,6 +580,7 @@ def test_frame_sum_two_dependent_columns():
     prog = analyze(parse_source(FRAME_TWO_COL))
     assert not prog.diags.has_errors()
     from vera.smt_emit import SmtEncoder
+
     enc = SmtEncoder(prog, "revalue", SmtConfig(timeout_ms=20000))
     enc.build()
     assert enc.frame_ok.get(("Ledger", "assets")) is True

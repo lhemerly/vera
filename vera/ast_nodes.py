@@ -8,6 +8,7 @@ from typing import List, Optional, Tuple
 # Module / declarations
 # ---------------------------------------------------------------------------
 
+
 @dataclass
 class Module:
     name: Optional[str]
@@ -17,6 +18,7 @@ class Module:
 @dataclass
 class TypeRef:
     """Syntactic type reference, resolved to a ScalarType during analysis."""
+
     name: str
     type_args: List["TypeRef"] = field(default_factory=list)
     enum_tags: List[str] = field(default_factory=list)
@@ -102,7 +104,7 @@ class EffectDecl:
 @dataclass
 class AccessPath:
     table: str
-    key: Optional["Expr"]   # None means '*'
+    key: Optional["Expr"]  # None means '*'
     column: str
     line: int = 0
     col: int = 0
@@ -127,6 +129,7 @@ Decl = object  # union alias for readability
 # ---------------------------------------------------------------------------
 # Expressions (spec-layer logic and canonical synthesis-plane pure exprs)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Var:
@@ -189,6 +192,7 @@ class TableExists:
 @dataclass
 class TableExistsUnique:
     """Existence probe for a declared unique secondary key."""
+
     table: str
     key_column: str
     key: "Expr"
@@ -202,6 +206,7 @@ class TableLookup:
 
     Returns ``id64<T>`` and reverts with ``ERR_MISSING_ROW`` when absent.
     """
+
     table: str
     key_column: str
     key: "Expr"
@@ -212,6 +217,7 @@ class TableLookup:
 @dataclass
 class TableAccess:
     """`Table[key].column` in the human specification layer."""
+
     table: str
     key: "Expr"
     column: str
@@ -238,6 +244,7 @@ class SumAgg:
 @dataclass
 class KeyOf:
     """Explicit `id64<T>(expr)` key constructor (canonical, non-implicit)."""
+
     table: str
     expr: "Expr"
     line: int = 0
@@ -265,6 +272,7 @@ Expr = object  # union alias
 # ---------------------------------------------------------------------------
 # Statements (canonical SSA synthesis IR)
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class Let:

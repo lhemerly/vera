@@ -1,375 +1,194 @@
 # VERA — Verified Relational Architecture
 
-[![Tests](https://img.shields.io/badge/tests-37%20passing-brightgreen)](https://github.com/lhemerly/vera/actions)
+[![Tests](https://github.com/lhemerly/vera/actions/workflows/tests.yml/badge.svg)](https://github.com/lhemerly/vera/actions/workflows/tests.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-%3E%3D3.11-blue.svg)](https://www.python.org)
-[![Rust](https://img.shields.io/badge/Rust-production%20runtime-orange.svg)](rust/vera-rt)
 
-> **A programming language where the compiler proves your state machine correct
-> before it ever runs.**
+VERA is a language for finite transactional state machines: ledgers, order
+books, registries, access control and governance. You declare invariants and
+transitions; the verifier checks that every committed transition preserves
+those invariants, that evaluated operations do not trap, and that a concrete
+committing input exists.
 
-VERA is a language for writing transactional state machines: ledger systems,
-order books, governance protocols, access control, auctions — any program whose
-correctness depends on invariants over data that must hold across every possible
-sequence of updates.
-
-You write *what must stay true*. VERA proves it *does*.
-
----
-
-## Why VERA?
-
-Most software bugs are invariant violations: a balance goes negative, an account
-is frozen twice, a user can withdraw funds they never deposited. The usual
-defences — unit tests, code review, runtime checks — are all *sampling*. They
-check a handful of the paths and hope the rest behave.
-
-VERA replaces sampling with **proof**:
-
-* **You declare invariants once**, as ordinary boolean expressions over your
-  tables (`forall k in Account : ge(Account[k].balance, 0)`).
-* **The compiler proves every transition preserves them** using an SMT solver.
-  Not tests. A mathematical proof, for every input, forever.
-* **If a transition is wrong, the compiler hands you the exact input that
-  breaks it**, together with the pre-state and a step-by-step execution trace.
-
-Because the language is deliberately small — no loops, no pointers, no
-undefined behaviour, no hidden I/O — the proof is always reachable. The
-compiler rejects code it cannot prove, rather than shipping it.
-
----
-
-## Features
-
-| | |
-|---|---|
-| **Formal verification** | Three machine-checked proof obligations per transition: safety, panic-freedom, and non-vacuity. |
-| **Three targets from one source** | SMT-LIB proofs, GPU fuzzing kernels, and zero-allocation SoA Rust. |
-| **Deterministic by construction** | No clocks, no entropy, no hidden I/O. Same input, same state, everywhere. |
-| **Total termination** | All iteration is bounded. The halting problem is trivially decidable. |
-| **Hardware-scale fuzzing** | The same program compiles to a GPU compute kernel that explores millions of trajectories. |
-| **LLM-friendly IR** | Prefix-canonical operators, no precedence, no branching — designed for grammar-constrained code generation. |
-| **Production runtime** | Lock-free conflict analysis, io_uring write-ahead log, copy-on-write snapshots, deterministic replay. |
-
----
+The compiler rejects proof errors, unsupported lowering, solver timeouts and
+unknown results. Its guarantee is relative to the declared invariants and a
+valid initial state. The compiler's encodings and execution backends remain
+part of the trusted implementation; cross-backend conformance tests are included.
 
 ## Quick start
 
-VERA's compiler is a Python package; the generated runtime is Rust.
+Requires Python 3.11+, Z3, and Rust 1.89+ for generated Rust/persistence tools.
 
 ```bash
-# 1. Create an environment and install the toolchain
+git clone https://github.com/lhemerly/vera.git
+cd vera
 python3 -m venv .venv
-.venv/bin/pip install z3-solver pytest
+.venv/bin/pip install -e '.[test]'
 
-# 2. Check the example
-.venv/bin/python -m vera check  examples/bank.vera
+.venv/bin/vera check examples/bank.vera
+.venv/bin/vera verify examples/bank.vera
+.venv/bin/vera verify examples/bank_buggy.vera  # rejected: self-transfer aliasing
 
-# 3. Prove it
-.venv/bin/python -m vera verify examples/bank.vera
-
-# 4. Run it
-.venv/bin/python -m vera run examples/bank.vera --transition transfer \
-        --param from=32 --param to=33 --param amount=100000000 \
-        --setup examples/bank_setup.json
+.venv/bin/vera run examples/bank.vera --transition transfer \
+  --param from=32 --param to=33 --param amount=100000000 \
+  --setup examples/bank_setup.json
 ```
 
-Then generate a production Rust engine:
+`run` and `codegen` prove the selected program before executing/emitting it.
+For deliberately broken programs used in development or fuzzing, explicitly
+pass `--unverified`. `check` performs parsing and semantic analysis without proof.
+
+Generate a standalone Rust engine or a library:
 
 ```bash
-.venv/bin/python -m vera codegen rust examples/bank.vera --out /tmp/bank.rs
-rustc --edition 2021 -O /tmp/bank.rs -o /tmp/bank && /tmp/bank
+.venv/bin/vera codegen rust examples/bank.vera --out /tmp/bank.rs
+rustc --edition 2021 -O /tmp/bank.rs -o /tmp/bank
+(cd /tmp && ./bank)
+
+.venv/bin/vera codegen rust examples/counter.vera --no-main --out /tmp/counter.rs
 ```
 
-Or blast it on the GPU (OpenGL 4.6, headless):
+The generated demo recovers its previous WAL before appending another batch;
+re-running it preserves deterministic replay. Application integrations can use
+`Params::encode/decode`, atomic transition functions, `run_batch`, `snapshot`
+and `restore` directly.
 
-```bash
-.venv/bin/python -m vera codegen glsl examples/bank.vera > /tmp/bank.comp
-gcc tools/furnace_host.c -o /tmp/host -lEGL -lGL && /tmp/host /tmp/bank.comp 64
-```
+Demo seeds are illustrative and are validated before use. Programs requiring a
+specific nonempty initial state must supply that state in their application.
 
----
-
-## A tour of the language
-
-### Tables are Structure-of-Arrays
-
-A `table` declares a fixed capacity and fixed-width columns. Memory is laid out
-as 64-byte-aligned column vectors, so a warp of GPU threads reads a whole row
-with one coalesced transaction.
+## Language
 
 ```vera
-table Account capacity 32 {
-  key id      : id64<Account>;      // (generation << 5) | slot
-  col balance : dec64 [tracked_sum]; // fixed-point, scale 10^-8, summed in hardware
-  col frozen  : bool;
+table Counter capacity 4 {
+  key id : id64<Counter>;
+  col value : u64 [tracked_sum];
 }
-```
+invariant bounded {
+  forall k in Counter : le(Counter[k].value, 1000000000);
+}
+effect Updated(counter : id64<Counter>, before : u64, after : u64);
 
-`id64<Account>` is a strongly-typed handle: the low bits index a slot, the upper
-bits are a generation counter that makes stale handles fail safely.
-
-### Invariants are ordinary expressions
-
-```vera
-invariant non_negative_balance { forall k in Account : ge(Account[k].balance, 0); }
-invariant balance_bounded       { forall k in Account : le(Account[k].balance, 1000000000); }
-invariant order_owner_live      { forall k in Order : table_exists(Account, Order[k].owner); }
-```
-
-`forall` reads like mathematics, but the compiler does not trust it literally. It
-instantiates the invariant over the **footprint** — the finite set of rows a
-transition actually touches — turning an infinite universal quantifier into a
-finite conjunction the solver can decide.
-
-### Transitions are total functions
-
-Every transition takes the state and an input intent, and returns a new state or
-a typed revert. Nothing else. All iteration is a bounded `fold_bounded<N>`.
-
-```vera
-transition transfer(from : id64<Account>, to : id64<Account>, amount : dec64)
-  reads  [Account[from].balance, Account[to].balance,
-          Account[from].frozen, Account[to].frozen]
-  writes [Account[from].balance, Account[to].balance]
-
-  require positive_amount : gt(amount, 0);
-  require from_exists     : table_exists(Account, from);
-  require to_exists       : table_exists(Account, to);
-  require not_frozen      : eq(Account[from].frozen, false);
-  require no_bound_breach : le(amount, sub(1000000000, Account[to].balance));
-
-  ensure conservation_of_funds : eq(sum(Account.balance), old_sum(Account.balance));
-
+transition increase(counter : id64<Counter>, delta : u64)
+  reads [Counter[counter].value] writes [Counter[counter].value]
+  require exists : table_exists(Counter, counter);
+  require room : le(delta, sub(1000000000, Counter[counter].value));
+  ensure total : eq(sum(Counter.value), add(old_sum(Counter.value), delta));
   body {
-    let %bal_from : dec64 = table_get(Account, from, balance);
-    let %bal_to   : dec64 = table_get(Account, to, balance);
-    let %frozen_to : bool  = table_get(Account, to, frozen);
-
-    guard(ge(%bal_from, amount), ERR_INSUFFICIENT);
-    guard(ne(from, to), ERR_SELF_TRANSFER);
-    guard(eq(%frozen_to, false), ERR_RECIPIENT_FROZEN);
-
-    let %new_from : dec64 = sub(%bal_from, amount);
-    let %new_to   : dec64 = add(%bal_to, amount);
-
-    table_set(Account, from, balance, %new_from);
-    table_set(Account, to,   balance, %new_to);
+    let %before : u64 = table_get(Counter, counter, value);
+    let %after : u64 = add(%before, delta);
+    table_set(Counter, counter, value, %after);
+    emit Updated(counter, %before, %after);
     commit;
   }
 ```
 
-The syntax is intentionally spartan: every statement starts with one of six
-keywords, every value has exactly one definition, and there are no implicit
-conversions. That is what makes it possible for an LLM to emit valid VERA —
-and for a proof to reason about it.
+The complete example is in [`examples/counter.vera`](examples/counter.vera).
+See the [language reference](docs/LANGUAGE.md) for syntax, types, evaluation
+order, error behavior, footprints, folds, effects, projections and persistence.
 
-### A wrong program, rejected with a witness
+| Area | Behavior |
+|---|---|
+| Scalars | bool, u8/u16/u32/u64, i64, dec64, dec128, sym32, bytes32, typed id64 handles, inline enums |
+| Arithmetic | Checked integer operations; exact fixed-point multiply/divide; widened 128/256-bit aggregates |
+| Tables | Fixed capacity, generation-checked handles, lowest-slot allocation, immutable unique columns with bounded Robin Hood indexes |
+| Transactions | Sequential requires, SSA bindings, guards, allocation, writes, typed effects, atomic rollback, immutable old/old_sum |
+| Iteration | Inclusive bounded folds, two nesting levels, maximum bound/product 1024, scoped bindings and no index wrap |
+| Specifications | Named global/row invariants, postconditions, safety, panic freedom and concrete non-vacuity |
+| Boundary | Authorized projection slices, stale-handle checks and configured intent affordances |
+| Execution | Reference interpreter, generated Rust, and shared exact-limb GLSL/WGSL/CUDA compute furnaces |
+| Batches | Safe optimistic snapshots, ordered validation and re-execution for both input-derived and state-dependent footprints |
+| Persistence | Versioned typed intents, program fingerprints, checksummed WAL/snapshots, replay, torn-tail recovery, optional io_uring |
 
-Remove the `guard(ne(from, to), ...)` line and the compiler refuses to accept
-the transition:
+`select` is lazy. Boolean `and`, `or` and `xor` evaluate both operands. Decimal
+literals are exact and excess precision is rejected. Every failed transaction
+preserves rows, generations, indexes, aggregates and effects.
 
-```
-[VERIFICATION FAILED: Obligation 1 - Invariant or Postcondition Violation]
-Transition:   transfer
-Violated Law: ensure conservation_of_funds
+A proof is inductive over valid initial states. Non-vacuity means at least one
+concrete committing state/input exists; it is not a temporal fairness guarantee.
+Projections expose data and hints, while execution still validates the intent.
 
-MINIMAL COUNTEREXAMPLE WITNESS:
-1. Pre-State (Sigma_0):
-   - Account[id=25165912] = { id: 25165912, balance: 403960524, frozen: False }
-2. Input Intent (iota):
-   - from   = 25165912
-   - to     = 25165912        <-- aliasing: from == to
-   - amount = 67877164
-3. SSA Execution Trace:
-   - let %bal_from : dec64 = 403960524
-   - let %bal_to   : dec64 = 403960524   <-- stale read before the first write
-   - table_set(Account, from, balance, 336083360)
-   - table_set(Account, to,   balance, 471837688)
-4. Violated Post-Condition / Invariant:
-   - ensure conservation_of_funds: expected true, got False
+## Compute furnaces
 
-REPAIR DIRECTIVE:
-   Add a disjointness guard `guard(ne(from, to), ERR_SELF_TRANSFER);`
-```
+GPU targets share one lowering and exact 32-bit-limb arithmetic, including
+512-bit multiplication/division intermediates. They execute transactions,
+validate invariants/postconditions, preserve atomic rollback and track committed
+effects by count and value digest; GPU furnaces do not deliver external outbox
+messages. They retain declared table capacities and use a deterministic xoshiro
+PRNG. Furnaces are bounded bug searches, not substitutes for the SMT proofs.
 
-This is the classic aliasing bug that sampling almost never finds, produced by
-the solver in milliseconds. See [`examples/bank_buggy.vera`](examples/bank_buggy.vera).
+```bash
+.venv/bin/vera codegen glsl examples/bank.vera --out /tmp/bank.comp
+glslangValidator /tmp/bank.comp
+gcc -O2 tools/furnace_host.c -o /tmp/vera-host -lEGL -lGL
+EGL_PLATFORM=surfaceless /tmp/vera-host /tmp/bank.comp 8
 
----
-
-## How VERA works
-
-### The three proof obligations
-
-For every transition, the compiler asks the solver three questions:
-
-1. **Safety** — is there any valid pre-state and input that reaches a committed
-   state violating a postcondition or a global invariant? Must be **impossible**.
-2. **Panic freedom** — can any input cause an unhandled arithmetic overflow,
-   division by zero, or a missing-row access? Must be **impossible**.
-3. **Non-vacuity** — is there at least one input that commits? Must be
-   **possible**. This defeats the vacuous "guard(false)" implementation that
-   trivially satisfies the first two.
-
-### One source, three targets
-
-```
-                       ┌── Target A ─ SMT-LIB 2.6 ─ Z3 ────────► machine-checked proof
-VERA source ──┼── Target B ─ GLSL / CUDA / WGSL ─ GPU ───────► massive fuzzing
-                       └── Target C ─ SoA Rust ──────────────► production runtime
+.venv/bin/vera codegen wgsl examples/bank.vera --out /tmp/bank.wgsl
+.venv/bin/vera codegen cuda examples/bank.vera --out /tmp/bank.cu
 ```
 
-* **Target A — proofs.** Footprint-localized quantifier elimination, slot-indexed
-  functional state, and a frame-decomposed representation of summed aggregates
-  that keeps proof cost linear in the number of *touched rows*, not table size.
-* **Target B — fuzzing.** The same transition compiles to a compute kernel with
-  a branchless SSA core and a warp-interleaved sandbox, running hundreds of
-  millions of trajectories per second.
-* **Target C — production.** `#[repr(C, align(64))]` SoA structs, checked
-  arithmetic, commit-after-validate transitions, and a lock-free dispatcher.
+Tests compile GLSL, validate and dispatch WGSL with `wgpu`, and execute the CUDA
+lowering's portable C++ host mode against mathematical results. The host mode
+checks shared kernel semantics without requiring an NVIDIA device; native CUDA
+compilation/execution additionally requires its own toolchain/device.
 
-### The production runtime
+## Rust runtime and durable replay
 
-* **Lock-free dispatch.** The compiler extracts each transition's exact read and
-  write footprint. The dispatcher partitions a batch of intents into
-  conflict-free waves and runs them on pinned threads with no mutexes.
-* **Durable persistence.** A canonical 64-byte `(IntentID, BinaryArgs,
-  TxSequenceNumber)` record is appended to an io_uring write-ahead log and
-  fsynced, paired with copy-on-write snapshots.
-* **Deterministic replay.** Replaying the intent log reproduces the live state
-  byte-for-byte.
+The standalone generated engine embeds the canonical WAL implementation. The
+optional `rust/vera-rt` crate uses io_uring on supported Linux kernels, with the
+same positional-write persistence protocol when io_uring is unavailable.
+
+```bash
+.venv/bin/python tools/build_cargo.py examples/bank.vera
+cargo test --manifest-path rust/vera-rt/Cargo.toml
+cargo run --manifest-path rust/vera-rt/Cargo.toml --bin vera-furnace
+```
+
+Typed intent payloads preserve arbitrary argument counts, complete bytes32
+values and full-width dec128 values. A canonical program fingerprint rejects
+replay under different transition semantics. WAL frames contain sequence and
+integrity checks and are aligned to 64 bytes; banking intents use 128-byte
+frames. `append` finishes the write and `sync` acknowledges durability. A torn
+final frame is recovered on reopen; complete corruption or sequence errors are
+rejected. One writer owns a log.
+
+Snapshots serialize fields explicitly, validate the schema/invariants/derived
+indexes and sums, and use checksums and atomic replacement. Legacy raw-memory
+snapshots and fixed-record WAL files are incompatible with these formats.
+
+The optimistic dispatcher uses safe owned snapshots and conservative validation
+of the whole pre-state. Conflicting candidates are re-executed in input order.
+This prioritizes deterministic correctness; it does not claim zero-allocation
+transactions, fine-grained Block-STM performance, or lock-free shared mutation.
+
+## Verification and tests
+
+```bash
+.venv/bin/python -m pytest tests -q -ra
+cargo test --manifest-path rust/vera-rt/Cargo.toml --locked
+```
+
+The suite covers the reviewed soundness failures, exact scalar boundaries,
+transaction rollback (including indexes/effects), nested folds, projections,
+foreign keys, all backend emitters, generated runtime execution, canonical
+argument codecs, program identity, corrupted records, torn writes and repeated
+restart/replay. Differential arithmetic tests compare Python, generated Rust
+and the shared GPU implementation against independently computed integer results.
+
+CI runs the full test suite on Python 3.11–3.14 with mandatory backend checks.
+Unavailable optional hardware/toolchains are reported explicitly by tests;
+backend failures are not hidden by `continue-on-error`.
+
+## Layout
 
 ```text
-wal backend: io_uring
-batch committed 4/4
-balance[0] = 450000000  balance[1] = 350000000
-replay matches live state: deterministic
+vera/                 parser, type checker, verifier, reference engine, backends
+vera/templates/       canonical embedded Rust persistence source
+rust/vera-rt/         optional Linux io_uring runtime and replay demo
+tools/                crate regeneration and headless GLSL host
+examples/             bank, deliberately broken bank, counter and setup states
+tests/                language, verifier, backend and persistence conformance
+docs/LANGUAGE.md      language semantics and API reference
+docs/IMPLEMENTATION.md implementation decisions and validation sequence
 ```
 
----
-
-## The example in this repository
-
-| file | what it is |
-|---|---|
-| [`examples/bank.vera`](examples/bank.vera) | A verified banking core: accounts, transfers, freezing, and orders. |
-| [`examples/bank_buggy.vera`](examples/bank_buggy.vera) | The same, minus the self-transfer guard. Rejected with a counterexample. |
-| [`examples/bank_setup.json`](examples/bank_setup.json) | Seed state for running the example. |
-
-Try it yourself:
-
-```bash
-.venv/bin/python -m vera verify examples/bank.vera        # the correct version: VERIFIED
-.venv/bin/python -m vera verify examples/bank_buggy.vera  # the buggy version: REJECTED
-```
-
----
-
-## Performance
-
-On a 6-core Linux host the verifier proves the banking core's three transitions
-in about **1.5 seconds** (capacity 32/8).
-
-Two encoding techniques keep proofs fast as tables grow:
-
-* **O(1) per-access writes.** The last-write map and an occupancy array with
-  symbolic-slot stores replace per-slot ite-chains; a known-slot fast path
-  resolves `table_get` on an allocation result without symbolic key extraction.
-* **Frame-decomposed sums.** `tracked_sum` aggregates are split into an exact
-  sum over the touched footprint and a bounded symbolic rest frame:
-
-  ```
-  σ₀ = σ_local,₀ + σ_rest,     n_rest·L_c ≤ σ_rest ≤ n_rest·U_c
-  ```
-
-  where `[L_c, U_c]` comes from the invariants themselves. Proof cost is
-  O(|footprint|), not O(capacity):
-
-  | capacity | frame (panic) | exact O(C) sum |
-  |---|---|---|
-  | 256 | **48 ms** | >30 s (timeout) |
-  | 1024 | 130 ms | — |
-  | 4096 | 439 ms | — |
-
-The GPU furnace runs 2048 threads through 64-step trajectories and finds
-invariant violations in a deliberately broken variant:
-
-| spec | threads | violations | committed |
-|---|---|---|---|
-| `bank.vera` | 2048 | 0 | 48144 |
-| bound-breaking variant | 2048 | **426** | 38910 |
-
----
-
-## Project layout
-
-```
-vera/                 compiler and verifier (Python)
-  lexer.py  parser.py     the language front end
-  types.py                fixed-width scalars and the SoA layout
-  semantic.py             type checking, access footprints, WCET bounds
-  smt_emit.py             AST → SMT-LIB 2.6, footprint localization, frame sums
-  verifier.py             counterexample lifting and repair directives
-  runtime.py              reference SoA engine with an undo log
-  codegen_rust.py         Target C: SoA Rust + dispatcher + WAL
-  codegen_glsl.py         Target B: OpenGL 4.6 compute furnace
-  codegen_gpu.py          Target B: CUDA / WGSL emission
-  fuzz.py                 reference trajectory furnace
-rust/vera-rt/         production runtime crate (io_uring WAL, snapshots, replay)
-tools/                EGL host for the GLSL furnace, cargo build helper
-examples/             the banking core, correct and buggy
-tests/                37 tests across the compiler, runtime, GPU and WAL
-```
-
----
-
-## Status
-
-VERA is a working implementation of the v1.1 language specification: a complete
-front end, a three-obligation verifier, a GPU fuzzing target, and a production
-Rust runtime.
-
-The language is intentionally narrow today. If your problem needs unbounded
-collections, dynamic dispatch, or raw pointers, VERA is not the right tool —
-that narrowness is exactly what makes the proofs possible.
-
-**Not yet implemented:** the MVMemory Tier-2 Block-STM fallback for
-data-dependent (Tier-2) access footprints; Robin Hood probing for secondary
-unique-key indexes (bounded linear probing is used instead).
-
----
-
-## Tests
-
-```bash
-.venv/bin/python -m pytest tests -q
-```
-
-37 tests cover the parser and type checker, access footprints, WCET bounds,
-capacity and fold limits, all three proof obligations, counterexample lifting,
-runtime atomicity, projections, the fuzzer, Rust codegen compilation and
-execution, secondary indexes, fold/alloc scaling, frame-decomposed sums
-(including two dependent columns and a joint bound), the GPU backend
-end-to-end, the Tier-1 dispatcher, and the io_uring WAL.
-
----
-
-## Contributing
-
-Contributions are welcome — especially new example programs, additional proof
-obligation shapes, and GPU fuzzing strategies.
-
-1. Fork and clone.
-2. Create a virtual environment and install `z3-solver` and `pytest`.
-3. Make your change and add tests.
-4. Run the full suite and open a pull request.
-
-Please keep the language's core promise intact: **if a transition cannot be
-proven, the compiler must refuse it.**
-
----
-
-## License
-
-VERA is released under the [MIT License](LICENSE).
+Contributions should include an executable behavioral regression and preserve
+fail-closed verification. VERA is released under the [MIT License](LICENSE).

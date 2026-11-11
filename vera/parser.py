@@ -20,8 +20,22 @@ _ADDITIVE_OPS = {"+": "add", "-": "sub"}
 _MULTIPLICATIVE_OPS = {"*": "mul", "/": "div", "%": "rem"}
 _PREFIX_UNARY = {"!": "not", "-": "neg"}
 _CANONICAL_BINARY = {
-    "add", "sub", "mul", "div", "rem", "eq", "ne", "lt", "le", "gt", "ge",
-    "and", "or", "xor", "min", "max",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "rem",
+    "eq",
+    "ne",
+    "lt",
+    "le",
+    "gt",
+    "ge",
+    "and",
+    "or",
+    "xor",
+    "min",
+    "max",
 }
 _CANONICAL_UNARY = {"not", "neg"}
 
@@ -53,6 +67,9 @@ class Parser:
 
     def expect_punct(self, value: str) -> Token:
         tok = self.peek()
+        if value == ">" and tok.kind == "punct" and tok.value == ">=":
+            self.tokens[self.pos] = Token("punct", "=", tok.line, tok.col + 1, "=")
+            return Token("punct", ">", tok.line, tok.col, ">")
         if tok.kind != "punct" or tok.value != value:
             self.error(f"expected {value!r} but found {tok.text!r}", tok)
         return self.advance()
@@ -130,8 +147,18 @@ class Parser:
             self.error(f"unknown type {tok.value!r}", tok)
         name = tok.value
         line, col = tok.line, tok.col
-        if name in ("bool", "u8", "u16", "u32", "u64", "i64", "dec64",
-                    "dec128", "sym32", "bytes32"):
+        if name in (
+            "bool",
+            "u8",
+            "u16",
+            "u32",
+            "u64",
+            "i64",
+            "dec64",
+            "dec128",
+            "sym32",
+            "bytes32",
+        ):
             self.advance()
             return A.TypeRef(name, line=line, col=col)
         if name == "id64":
@@ -139,8 +166,12 @@ class Parser:
             self.expect_punct("<")
             arg = self.expect_ident()
             self.expect_punct(">")
-            return A.TypeRef("id64", type_args=[A.TypeRef(arg.value, line=arg.line, col=arg.col)],
-                             line=line, col=col)
+            return A.TypeRef(
+                "id64",
+                type_args=[A.TypeRef(arg.value, line=arg.line, col=arg.col)],
+                line=line,
+                col=col,
+            )
         if name == "enum":
             self.advance()
             self.expect_punct("{")
@@ -159,8 +190,12 @@ class Parser:
         self.expect_punct("<")
         arg = self.expect_ident()
         self.expect_punct(">")
-        return A.TypeRef("id64", type_args=[A.TypeRef(arg.value, line=arg.line, col=arg.col)],
-                         line=tok.line, col=tok.col)
+        return A.TypeRef(
+            "id64",
+            type_args=[A.TypeRef(arg.value, line=arg.line, col=arg.col)],
+            line=tok.line,
+            col=tok.col,
+        )
 
     def parse_table(self) -> A.TableDecl:
         tok = self.expect_keyword("table")
@@ -195,10 +230,14 @@ class Parser:
                         break
                 self.expect_punct("]")
             self.expect_punct(";")
-            columns.append(A.ColumnDecl(col_tok.value, ctype, tracked, unique,
-                                        col_tok.line, col_tok.col))
-        return A.TableDecl(name, capacity, key_name, key_type, columns,
-                           tok.line, tok.col)
+            columns.append(
+                A.ColumnDecl(
+                    col_tok.value, ctype, tracked, unique, col_tok.line, col_tok.col
+                )
+            )
+        return A.TableDecl(
+            name, capacity, key_name, key_type, columns, tok.line, tok.col
+        )
 
     def parse_invariant(self) -> A.InvariantDecl:
         tok = self.expect_keyword("invariant")
@@ -233,6 +272,12 @@ class Parser:
 
     def parse_table_slice(self) -> A.TableSlice:
         tok = self.expect_ident()
+        if self.accept_punct("["):
+            row = None if self.accept_punct("*") else self.parse_logic_expr()
+            self.expect_punct("]")
+            self.expect_punct(".")
+            col = self.expect_ident()
+            return A.TableSlice(tok.value, col.value, row, tok.line, tok.col)
         self.expect_punct(".")
         col = self.expect_ident()
         row = None
@@ -281,8 +326,9 @@ class Parser:
             self.expect_punct("]")
         self.expect_punct(";")
         self.expect_punct("}")
-        return A.ProjectionDecl(name, params, allow_if, expose, intents,
-                                tok.line, tok.col)
+        return A.ProjectionDecl(
+            name, params, allow_if, expose, intents, tok.line, tok.col
+        )
 
     def parse_effect(self) -> A.EffectDecl:
         tok = self.expect_keyword("effect")
@@ -345,8 +391,17 @@ class Parser:
         self.expect_keyword("commit")
         self.expect_punct(";")
         self.expect_punct("}")
-        return A.TransitionDecl(name, params, reads, writes, requires, ensures,
-                                body, tok.line, tok.col)
+        return A.TransitionDecl(
+            name,
+            params,
+            reads,
+            writes,
+            requires,
+            ensures,
+            body + [A.Commit(tok.line, tok.col)],
+            tok.line,
+            tok.col,
+        )
 
     # --- statements --------------------------------------------------------
     def parse_stmt_list(self, stop_keyword: Optional[str] = None) -> List[A.Stmt]:
@@ -357,7 +412,11 @@ class Parser:
                 self.error("unexpected end of file in statement list")
             if tok.kind == "punct" and tok.value == "}":
                 break
-            if stop_keyword is not None and tok.kind == "keyword" and tok.value == stop_keyword:
+            if (
+                stop_keyword is not None
+                and tok.kind == "keyword"
+                and tok.value == stop_keyword
+            ):
                 break
             stmts.append(self.parse_stmt())
         return stmts
@@ -391,6 +450,12 @@ class Parser:
             self.advance()
             self.expect_punct("(")
             table = self.expect_ident().value
+            if (
+                tref.name != "id64"
+                or len(tref.type_args) != 1
+                or tref.type_args[0].name != table
+            ):
+                self.error(f"allocation result must be declared id64<{table}>")
             self.expect_punct(",")
             self.expect_punct("{")
             fields: List[Tuple[str, A.Expr]] = []
@@ -450,12 +515,21 @@ class Parser:
     # --- pure expressions (canonical prefix IR) ----------------------------
     def parse_pure_expr(self) -> A.Expr:
         tok = self.peek()
+        if tok.kind == "punct" and tok.value == "-":
+            self.advance()
+            operand = self.parse_pure_expr()
+            if isinstance(operand, A.Literal) and not isinstance(
+                operand.value, (bool, str)
+            ):
+                operand.value = -operand.value
+                return operand
+            return A.Unary("neg", operand, tok.line, tok.col)
         if tok.kind == "int":
             self.advance()
             return A.Literal(int(tok.value), line=tok.line, col=tok.col)
         if tok.kind == "decimal":
             self.advance()
-            return A.Literal(float(tok.value), line=tok.line, col=tok.col)
+            return A.Literal(tok.value, line=tok.line, col=tok.col)
         if tok.kind == "string":
             self.advance()
             return A.Literal(str(tok.value), line=tok.line, col=tok.col)
@@ -540,7 +614,7 @@ class Parser:
                 key = self.parse_pure_expr()
                 self.expect_punct(")")
                 return A.TableExistsUnique(table, key_column, key, tok.line, tok.col)
-            if kw == "key_of":
+            if kw in ("key_of", "id64"):
                 self.advance()
                 self.expect_punct("<")
                 table = self.expect_ident().value
@@ -549,6 +623,8 @@ class Parser:
                 expr = self.parse_pure_expr()
                 self.expect_punct(")")
                 return A.KeyOf(table, expr, tok.line, tok.col)
+            if kw in ("old", "sum", "old_sum"):
+                return self.parse_post_logic_expr()
             if kw == "fold_bounded":
                 return self.parse_fold(tok)
         self.error(f"expected expression but found {tok.text!r}", tok)
@@ -559,12 +635,16 @@ class Parser:
         n, _ = self.expect_int()
         self.expect_punct(">")
         self.expect_punct("(")
+        if self.peek().kind not in ("ident", "ssa"):
+            self.error("fold accumulator must be an identifier")
         acc_name = self.advance().value
         self.expect_punct(":")
         acc_type = self.parse_type_ref()
         self.expect_punct("=")
         init = self.parse_pure_expr()
         self.expect_punct(",")
+        if self.peek().kind not in ("ident", "ssa"):
+            self.error("fold index must be an identifier")
         index_name = self.advance().value
         self.expect_keyword("in")
         self.expect_punct("[")
@@ -579,8 +659,19 @@ class Parser:
         yield_expr = self.parse_pure_expr()
         self.expect_punct(";")
         self.expect_punct("}")
-        return A.Fold(n, acc_name, acc_type, init, index_name, lo, hi, body,
-                      yield_expr, tok.line, tok.col)
+        return A.Fold(
+            n,
+            acc_name,
+            acc_type,
+            init,
+            index_name,
+            lo,
+            hi,
+            body,
+            yield_expr,
+            tok.line,
+            tok.col,
+        )
 
     # --- logic expressions (human spec layer) ------------------------------
     def parse_post_logic_expr(self) -> A.Expr:
@@ -598,8 +689,9 @@ class Parser:
             self.expect_punct(".")
             column = self.expect_ident().value
             self.expect_punct(")")
-            return A.SumAgg(table, column, old=(tok.value == "old_sum"),
-                            line=tok.line, col=tok.col)
+            return A.SumAgg(
+                table, column, old=(tok.value == "old_sum"), line=tok.line, col=tok.col
+            )
         return self.parse_logic_expr()
 
     def parse_logic_expr(self) -> A.Expr:
@@ -609,8 +701,9 @@ class Parser:
         left = self.parse_logic_and()
         while True:
             tok = self.peek()
-            if (tok.kind == "keyword" and tok.value == "or") or \
-               (tok.kind == "punct" and tok.value == "||"):
+            if (tok.kind == "keyword" and tok.value == "or") or (
+                tok.kind == "punct" and tok.value == "||"
+            ):
                 self.advance()
                 right = self.parse_logic_and()
                 left = A.Binary("or", left, right, tok.line, tok.col)
@@ -621,8 +714,9 @@ class Parser:
         left = self.parse_logic_not()
         while True:
             tok = self.peek()
-            if (tok.kind == "keyword" and tok.value == "and") or \
-               (tok.kind == "punct" and tok.value == "&&"):
+            if (tok.kind == "keyword" and tok.value == "and") or (
+                tok.kind == "punct" and tok.value == "&&"
+            ):
                 self.advance()
                 right = self.parse_logic_not()
                 left = A.Binary("and", left, right, tok.line, tok.col)
@@ -631,8 +725,9 @@ class Parser:
 
     def parse_logic_not(self) -> A.Expr:
         tok = self.peek()
-        if (tok.kind == "keyword" and tok.value == "not") or \
-           (tok.kind == "punct" and tok.value == "!"):
+        if (tok.kind == "keyword" and tok.value == "not") or (
+            tok.kind == "punct" and tok.value == "!"
+        ):
             self.advance()
             operand = self.parse_logic_not()
             return A.Unary("not", operand, tok.line, tok.col)
@@ -654,7 +749,9 @@ class Parser:
             if tok.kind == "punct" and tok.value in _ADDITIVE_OPS:
                 self.advance()
                 right = self.parse_logic_multiplicative()
-                left = A.Binary(_ADDITIVE_OPS[tok.value], left, right, tok.line, tok.col)
+                left = A.Binary(
+                    _ADDITIVE_OPS[tok.value], left, right, tok.line, tok.col
+                )
             else:
                 return left
 
@@ -665,7 +762,9 @@ class Parser:
             if tok.kind == "punct" and tok.value in _MULTIPLICATIVE_OPS:
                 self.advance()
                 right = self.parse_logic_unary()
-                left = A.Binary(_MULTIPLICATIVE_OPS[tok.value], left, right, tok.line, tok.col)
+                left = A.Binary(
+                    _MULTIPLICATIVE_OPS[tok.value], left, right, tok.line, tok.col
+                )
             else:
                 return left
 
@@ -674,6 +773,13 @@ class Parser:
         if tok.kind == "punct" and tok.value in _PREFIX_UNARY:
             self.advance()
             operand = self.parse_logic_unary()
+            if (
+                tok.value == "-"
+                and isinstance(operand, A.Literal)
+                and not isinstance(operand.value, (bool, str))
+            ):
+                operand.value = -operand.value
+                return operand
             return A.Unary(_PREFIX_UNARY[tok.value], operand, tok.line, tok.col)
         if tok.kind == "keyword" and tok.value in _CANONICAL_UNARY:
             self.advance()
@@ -775,7 +881,7 @@ class Parser:
                 column = self.expect_ident().value
                 self.expect_punct(")")
                 return A.TableGet(table, key, column, tok.line, tok.col)
-            if kw == "key_of":
+            if kw in ("key_of", "id64"):
                 self.advance()
                 self.expect_punct("<")
                 table = self.expect_ident().value
@@ -799,8 +905,9 @@ class Parser:
                 self.expect_punct(".")
                 column = self.expect_ident().value
                 self.expect_punct(")")
-                return A.SumAgg(table, column, old=(kw == "old_sum"),
-                                line=tok.line, col=tok.col)
+                return A.SumAgg(
+                    table, column, old=(kw == "old_sum"), line=tok.line, col=tok.col
+                )
         self.error(f"expected logic expression but found {tok.text!r}", tok)
 
 

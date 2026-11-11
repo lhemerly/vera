@@ -1,0 +1,7 @@
+include LICENSE README.md pyproject.toml
+recursive-include docs *.md
+recursive-include examples *.vera *.json
+recursive-include tests *.py
+recursive-include tools *.py *.c
+include rust/vera-rt/Cargo.toml rust/vera-rt/Cargo.lock
+recursive-include rust/vera-rt/src *.rs

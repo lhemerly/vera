@@ -2,6 +2,10 @@
 __pycache__/
 *.pyc
 .pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
 # generated Rust output is written to caller-chosen paths; the
 # runtime crate sources under rust/ are tracked.
 *.smt2

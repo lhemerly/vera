@@ -38,9 +38,12 @@ def _sort_for_kind(kind):
 def _to_python(value: z3.ExprRef, ctype: ScalarType):
     if ctype.is_bool:
         return z3.is_true(value)
-    if ctype.kind == "enum":
-        return value.as_long()
-    return value.as_long()
+    raw = value.as_long()
+    if ctype.kind == "bytes32":
+        return raw.to_bytes(32, "little")
+    if ctype.is_signed and raw >= (1 << (ctype.width - 1)):
+        raw -= 1 << ctype.width
+    return raw
 
 
 class ModelProjector:
@@ -52,7 +55,7 @@ class ModelProjector:
     def param_values(self) -> Dict[str, object]:
         out: Dict[str, object] = {}
         for p in self.encoder.tr.decl.params:
-            name = f"p_{p.name}"
+            name = self.encoder.params[p.name]
             kind = self.encoder.const_kinds.get(name)
             if kind is None:
                 continue
@@ -60,36 +63,65 @@ class ModelProjector:
             out[p.name] = _to_python(val, self.encoder.tr.param_types[p.name])
         return out
 
-    def pre_state(self, relevant_only: bool = False) -> Dict[str, List[Dict[str, object]]]:
+    def pre_state(
+        self, relevant_only: bool = False
+    ) -> Dict[str, List[Dict[str, object]]]:
         out: Dict[str, List[Dict[str, object]]] = {}
         relevant = self._relevant_slots() if relevant_only else None
         for tname, tinfo in self.prog.tables.items():
             sbits = self.encoder.table_slot_bits[tname]
             gen_bits = min(64 - tinfo.layout.key_bits, 32)
-            occ_fn = z3.Array(self.encoder.pre_occ[tname],
-                              z3.BitVecSort(sbits), z3.BoolSort())
-            gen_fn = z3.Function(self.encoder.pre_gen[tname],
-                                 z3.BitVecSort(sbits), z3.BitVecSort(gen_bits))
+            occ_fn = z3.Array(
+                self.encoder.pre_occ[tname], z3.BitVecSort(sbits), z3.BoolSort()
+            )
+            gen_fn = z3.Function(
+                self.encoder.pre_gen[tname],
+                z3.BitVecSort(sbits),
+                z3.BitVecSort(gen_bits),
+            )
             rows: List[Dict[str, object]] = []
             for slot in range(tinfo.layout.capacity):
                 if relevant is not None and slot not in relevant.get(tname, set()):
                     continue
-                occ = self.model.eval(z3.Select(occ_fn, z3.BitVecVal(slot, sbits)),
-                                      model_completion=True)
+                occ = self.model.eval(
+                    z3.Select(occ_fn, z3.BitVecVal(slot, sbits)), model_completion=True
+                )
                 if not z3.is_true(occ):
                     continue
-                gen = self.model.eval(gen_fn(z3.BitVecVal(slot, sbits)),
-                                      model_completion=True).as_long()
+                gen = self.model.eval(
+                    gen_fn(z3.BitVecVal(slot, sbits)), model_completion=True
+                ).as_long()
                 key = (gen << tinfo.layout.key_bits) | slot
                 row: Dict[str, object] = {"id": key}
                 for cname, cinfo in tinfo.columns.items():
-                    fn = z3.Function(self.encoder.pre_col[tname][cname],
-                                     z3.BitVecSort(sbits), _sort_for(cinfo.type))
-                    val = self.model.eval(fn(z3.BitVecVal(slot, sbits)),
-                                          model_completion=True)
+                    fn = z3.Function(
+                        self.encoder.pre_col[tname][cname],
+                        z3.BitVecSort(sbits),
+                        _sort_for(cinfo.type),
+                    )
+                    val = self.model.eval(
+                        fn(z3.BitVecVal(slot, sbits)), model_completion=True
+                    )
                     row[cname] = _to_python(val, cinfo.type)
                 rows.append(row)
             out[tname] = rows
+        return out
+
+    def generation_values(self) -> Dict[str, List[int]]:
+        out = {}
+        for tname, tinfo in self.prog.tables.items():
+            sbits = self.encoder.table_slot_bits[tname]
+            fn = z3.Function(
+                self.encoder.pre_gen[tname],
+                z3.BitVecSort(sbits),
+                z3.BitVecSort(tinfo.layout.generation_bits),
+            )
+            out[tname] = [
+                self.model.eval(
+                    fn(z3.BitVecVal(i, sbits)), model_completion=True
+                ).as_long()
+                for i in range(tinfo.layout.capacity)
+            ]
         return out
 
     def pre_hashes(self) -> Dict[Tuple[str, str], List[Tuple[bool, int]]]:
@@ -98,15 +130,20 @@ class ModelProjector:
             hused_name = self.encoder.pre_hused[(tname, cname)]
             B = self.prog.tables[tname].layout.unique_hashes[cname]
             bb = max(1, B.bit_length() - 1)
-            hkey = z3.Array(hkey_name, z3.BitVecSort(bb),
-                            z3.BitVecSort(self.encoder.table_slot_bits[tname]))
+            hkey = z3.Array(
+                hkey_name,
+                z3.BitVecSort(bb),
+                z3.BitVecSort(self.encoder.table_slot_bits[tname]),
+            )
             hused = z3.Array(hused_name, z3.BitVecSort(bb), z3.BoolSort())
             buckets = []
             for i in range(B):
-                used = z3.is_true(self.model.eval(hused[z3.BitVecVal(i, bb)],
-                                                  model_completion=True))
-                key = self.model.eval(hkey[z3.BitVecVal(i, bb)],
-                                      model_completion=True).as_long()
+                used = z3.is_true(
+                    self.model.eval(hused[z3.BitVecVal(i, bb)], model_completion=True)
+                )
+                key = self.model.eval(
+                    hkey[z3.BitVecVal(i, bb)], model_completion=True
+                ).as_long()
                 buckets.append((used, key))
             out[(tname, cname)] = buckets
         return out
@@ -114,14 +151,14 @@ class ModelProjector:
     def pre_aggregates(self) -> Dict[str, Dict[str, int]]:
         out: Dict[str, Dict[str, int]] = {}
         for (tname, cname), wide_w in self.encoder.agg_wide.items():
-            name = f"{tname}_{cname}_agg_0"
+            name = self.encoder.pre_agg[tname][cname]
             kind = self.encoder.const_kinds.get(name)
             if kind is None:
                 continue
             val = self.model.eval(z3.BitVec(name, kind[1]), model_completion=True)
             raw = val.as_long()
-            if raw >= (1 << (kind[1] - 1)):
-                raw -= (1 << kind[1])
+            if self.encoder.agg_signed[(tname, cname)] and raw >= (1 << (kind[1] - 1)):
+                raw -= 1 << kind[1]
             out.setdefault(tname, {})[cname] = raw
         return out
 
@@ -148,11 +185,15 @@ class ModelProjector:
             for cname, cinfo in tinfo.columns.items():
                 if cinfo.type.kind != "id64":
                     continue
-                fn = z3.Function(self.encoder.pre_col[tname][cname],
-                                 z3.BitVecSort(self.encoder.table_slot_bits[tname]),
-                                 z3.BitVecSort(64))
-                key = self.model.eval(fn(z3.BitVecVal(slot, self.encoder.table_slot_bits[tname])),
-                                      model_completion=True).as_long()
+                fn = z3.Function(
+                    self.encoder.pre_col[tname][cname],
+                    z3.BitVecSort(self.encoder.table_slot_bits[tname]),
+                    z3.BitVecSort(64),
+                )
+                key = self.model.eval(
+                    fn(z3.BitVecVal(slot, self.encoder.table_slot_bits[tname])),
+                    model_completion=True,
+                ).as_long()
                 target = cinfo.type.key_table
                 ttarget = self.prog.tables[target]
                 tslot = key & (ttarget.layout.capacity - 1)
@@ -167,8 +208,13 @@ class ModelProjector:
         for name, kind in self.encoder.const_kinds.items():
             if kind[0] not in ("bv", "bool"):
                 continue
-            if name.startswith("p_") or name.startswith("pi_") or name.startswith("trap_") \
-                    or name.startswith("common_") or name.startswith("w_"):
+            if (
+                name.startswith("p_")
+                or name.startswith("pi_")
+                or name.startswith("trap_")
+                or name.startswith("common_")
+                or name.startswith("w_")
+            ):
                 continue
             try:
                 val = self.model.eval(_const_for(name, kind), model_completion=True)
@@ -178,18 +224,31 @@ class ModelProjector:
         return out
 
 
-def _materialize_state(prog: Program, pre: Dict[str, List[Dict[str, object]]],
-                       pre_agg: Optional[Dict[str, Dict[str, int]]] = None,
-                       pre_hashes: Optional[Dict[Tuple[str, str], List[Tuple[bool, int]]]] = None
-                       ) -> State:
+def _materialize_state(
+    prog: Program,
+    pre: Dict[str, List[Dict[str, object]]],
+    pre_agg: Optional[Dict[str, Dict[str, int]]] = None,
+    pre_hashes: Optional[Dict[Tuple[str, str], List[Tuple[bool, int]]]] = None,
+    pre_generations: Optional[Dict[str, List[int]]] = None,
+) -> State:
     state = State()
     for tname, tinfo in prog.tables.items():
         cap = tinfo.layout.capacity
         t = TableState(
-            name=tname, capacity=cap, key_bits=tinfo.layout.key_bits,
-            occ=bytearray(cap), gen=[0] * cap,
-            columns={c: [False if ci.type.is_bool else 0 for _ in range(cap)]
-                     for c, ci in tinfo.columns.items()},
+            name=tname,
+            capacity=cap,
+            key_bits=tinfo.layout.key_bits,
+            occ=bytearray(cap),
+            gen=list((pre_generations or {}).get(tname, [0] * cap)),
+            columns={
+                c: [
+                    False
+                    if ci.type.is_bool
+                    else (bytes(32) if ci.type.kind == "bytes32" else 0)
+                    for _ in range(cap)
+                ]
+                for c, ci in tinfo.columns.items()
+            },
             agg={c: 0 for c in tinfo.layout.agg_offsets},
         )
         for row in pre.get(tname, []):
@@ -217,12 +276,20 @@ def _materialize_state(prog: Program, pre: Dict[str, List[Dict[str, object]]],
     return state
 
 
-def _eval_spec_expr(prog: Program, state: State, params: Dict[str, object],
-                    env: Dict[str, object], expr: A.Expr,
-                    pre_agg: Optional[Dict[str, Dict[str, int]]] = None) -> object:
+def _eval_spec_expr(
+    prog: Program,
+    state: State,
+    params: Dict[str, object],
+    env: Dict[str, object],
+    expr: A.Expr,
+    pre_agg: Optional[Dict[str, Dict[str, int]]] = None,
+    pre_state: Optional[State] = None,
+) -> object:
     """Evaluate a specification-layer expression against a concrete state."""
     tx = Transaction(prog, state, "_eval", params)
     tx.env = dict(env)
+    if pre_state is not None:
+        tx.pre_state = pre_state
     for k, v in env.items():
         tx.type_env[k] = I64
     if pre_agg is not None:
@@ -230,8 +297,9 @@ def _eval_spec_expr(prog: Program, state: State, params: Dict[str, object],
     return tx.value_of(expr, "post")
 
 
-def lift_counterexample(prog: Program, encoder: SmtEncoder,
-                        result: VerificationResult) -> Optional[Counterexample]:
+def lift_counterexample(
+    prog: Program, encoder: SmtEncoder, result: VerificationResult
+) -> Optional[Counterexample]:
     """Build a Counterexample from a SAT safety or panic obligation."""
     if result.safety.status == "sat":
         obligation = "Obligation 1 - Invariant or Postcondition Violation"
@@ -246,34 +314,49 @@ def lift_counterexample(prog: Program, encoder: SmtEncoder,
 
     projector = ModelProjector(prog, encoder, model)
     params = projector.param_values()
-    pre = projector.pre_state(relevant_only=True)
+    pre = projector.pre_state(relevant_only=False)
 
     ce = Counterexample(transition=encoder.tr_name, obligation=obligation, law="")
     ce.params = params
     ce.pre_state = pre
+    ce.pre_generations = projector.generation_values()
 
     machine = Machine(prog)
     pre_agg = projector.pre_aggregates()
     pre_hashes = projector.pre_hashes()
-    machine.state = _materialize_state(prog, pre, pre_agg, pre_hashes)
+    machine.state = _materialize_state(
+        prog, pre, pre_agg, pre_hashes, ce.pre_generations
+    )
     pre_agg = {tname: dict(t.agg) for tname, t in machine.state.tables.items()}
     try:
         _, trace = machine.execute(encoder.tr_name, params, record_trace=True)
         ce.trace = [{"text": s.text, "kind": s.kind, "value": s.value} for s in trace]
     except Revert as exc:
-        ce.trace = [{"text": f"REVERT({exc.code})", "kind": "revert", "value": exc.code}]
+        ce.trace = [
+            {"text": step.text, "kind": step.kind, "value": step.value}
+            for step in machine.last_tx.trace
+        ]
+        ce.trace.append(
+            {"text": f"REVERT({exc.code})", "kind": "revert", "value": exc.code}
+        )
         ce.violated["trap"] = exc.code
         ce.law = _trap_law(exc.code)
         ce.directive = _trap_directive(exc.code)
         return ce
 
     # The transition committed: find the violated ensure or invariant.
-    final_env = dict(getattr(machine, "last_tx", None).env or {}) \
-        if getattr(machine, "last_tx", None) is not None else {}
+    final_env = (
+        dict(getattr(machine, "last_tx", None).env or {})
+        if getattr(machine, "last_tx", None) is not None
+        else {}
+    )
+    pre_snapshot = machine.last_tx.pre_state
     violated: Dict[str, object] = {}
     for name, expr in encoder.tr.decl.ensures:
         try:
-            val = _eval_spec_expr(prog, machine.state, params, final_env, expr, pre_agg)
+            val = _eval_spec_expr(
+                prog, machine.state, params, final_env, expr, pre_agg, pre_snapshot
+            )
         except Revert:
             val = "<revert>"
         if val is not True:
@@ -281,7 +364,15 @@ def lift_counterexample(prog: Program, encoder: SmtEncoder,
     for inv in prog.invariants.values():
         if inv.quant_table is None:
             try:
-                val = _eval_spec_expr(prog, machine.state, params, final_env, inv.expr)
+                val = _eval_spec_expr(
+                    prog,
+                    machine.state,
+                    params,
+                    final_env,
+                    inv.expr,
+                    pre_agg,
+                    pre_snapshot,
+                )
             except Revert:
                 val = "<revert>"
             if val is not True:
@@ -295,12 +386,21 @@ def lift_counterexample(prog: Program, encoder: SmtEncoder,
                 env = dict(final_env)
                 env[inv.quant_var] = key
                 try:
-                    val = _eval_spec_expr(prog, machine.state, params, env, inv.expr, pre_agg)
+                    val = _eval_spec_expr(
+                        prog,
+                        machine.state,
+                        params,
+                        env,
+                        inv.expr,
+                        pre_agg,
+                        pre_snapshot,
+                    )
                 except Revert:
                     val = "<revert>"
                 if val is not True:
-                    violated[f"invariant {inv.name}"] = \
+                    violated[f"invariant {inv.name}"] = (
                         f"{_fmt(inv.expr, val)} at {inv.quant_table}[id={key}]"
+                    )
                     break
     ce.violated = violated
     if violated:
@@ -324,16 +424,20 @@ def _trap_directive(code: str) -> str:
     return {
         "ERR_ARITH_OVERFLOW": (
             "Add an explicit domain guard before the arithmetic operation, e.g. "
-            "`guard(le(%rhs, sub(MAX, %lhs)), ERR_OVERFLOW);`, or widen the column type."),
+            "`guard(le(%rhs, sub(MAX, %lhs)), ERR_OVERFLOW);`, or widen the column type."
+        ),
         "ERR_MISSING_ROW": (
             "Add `require <key>_exists : table_exists(Table, <key>);` or guard the "
-            "table_get with table_exists before reading."),
+            "table_get with table_exists before reading."
+        ),
         "ERR_TABLE_FULL": (
             "Bound the table population with an invariant, or increase the static "
-            "capacity and re-verify."),
+            "capacity and re-verify."
+        ),
         "ERR_GENERATION_EXHAUSTED": (
             "The id64 generation counter wrapped; increase the key width or compact "
-            "the table."),
+            "the table."
+        ),
     }.get(code, "Guard the failing domain condition with an explicit guard().")
 
 
@@ -341,20 +445,27 @@ def _fmt(expr: A.Expr, val: object) -> str:
     return f"expected true, got {val!r}"
 
 
-def _violation_directive(law: str, params: Dict[str, object],
-                         pre: Dict[str, List[Dict[str, object]]]) -> str:
+def _violation_directive(
+    law: str, params: Dict[str, object], pre: Dict[str, List[Dict[str, object]]]
+) -> str:
     if "ensure" in law:
-        return ("The postcondition fails on a reachable input. Add a guard that "
-                "excludes the counterexample input class, or re-read the mutated "
-                "row after the first table_set so later reads observe the new value.")
+        return (
+            "The postcondition fails on a reachable input. Add a guard that "
+            "excludes the counterexample input class, or re-read the mutated "
+            "row after the first table_set so later reads observe the new value."
+        )
     if "invariant" in law:
-        return ("A global invariant is violated. Strengthen the transition's "
-                "guards so the violating state is unreachable, or amend the "
-                "invariant if it is not an inductive invariant.")
+        return (
+            "A global invariant is violated. Strengthen the transition's "
+            "guards so the violating state is unreachable, or amend the "
+            "invariant if it is not an inductive invariant."
+        )
     return "Restrict the transition's domain with an explicit guard()."
 
 
-def attach_counterexample(prog: Program, encoders, result: VerificationResult) -> VerificationResult:
+def attach_counterexample(
+    prog: Program, encoders, result: VerificationResult
+) -> VerificationResult:
     if isinstance(encoders, dict):
         if result.safety.status == "sat":
             encoder = encoders.get("safety")

@@ -1,36 +1,119 @@
 """Tokenizer for the VERA language."""
 
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import List, Optional, Tuple
 
 from .errors import D_PARSE, VeraError
 
 KEYWORDS = {
     # declaration structure
-    "module", "table", "capacity", "key", "col", "tracked_sum", "invariant",
-    "forall", "in", "projection", "allow_if", "expose", "enable_intents",
-    "when", "effect", "transition", "reads", "writes", "require", "ensure",
-    "body", "commit",
+    "module",
+    "table",
+    "capacity",
+    "key",
+    "col",
+    "tracked_sum",
+    "invariant",
+    "forall",
+    "in",
+    "projection",
+    "allow_if",
+    "expose",
+    "enable_intents",
+    "when",
+    "effect",
+    "transition",
+    "reads",
+    "writes",
+    "require",
+    "ensure",
+    "body",
+    "commit",
     # synthesis IR statements / rvalues
-    "let", "guard", "table_set", "table_alloc", "table_get", "table_exists",
-    "table_lookup", "table_exists_unique", "unique",
-    "select", "fold_bounded", "yield", "emit", "key_of",
+    "let",
+    "guard",
+    "table_set",
+    "table_alloc",
+    "table_get",
+    "table_exists",
+    "table_lookup",
+    "table_exists_unique",
+    "unique",
+    "select",
+    "fold_bounded",
+    "yield",
+    "emit",
+    "key_of",
     # scalar types
-    "bool", "u8", "u16", "u32", "u64", "i64", "dec64", "dec128", "sym32",
-    "bytes32", "id64", "enum",
+    "bool",
+    "u8",
+    "u16",
+    "u32",
+    "u64",
+    "i64",
+    "dec64",
+    "dec128",
+    "sym32",
+    "bytes32",
+    "id64",
+    "enum",
     # literals
-    "true", "false",
+    "true",
+    "false",
     # logic / arithmetic canonical operators
-    "and", "or", "not", "xor", "add", "sub", "mul", "div", "rem",
-    "eq", "ne", "lt", "le", "gt", "ge", "min", "max",
+    "and",
+    "or",
+    "not",
+    "xor",
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "rem",
+    "eq",
+    "ne",
+    "lt",
+    "le",
+    "gt",
+    "ge",
+    "min",
+    "max",
+    "neg",
     # postcondition accessors
-    "old", "sum", "old_sum",
+    "old",
+    "sum",
+    "old_sum",
 }
 
 PUNCTUATION = [
-    "..", "==", "!=", "<=", ">=", "&&", "||", "->",
-    "{", "}", "(", ")", "[", "]", ";", ":", ",", ".", "<", ">", "=",
-    "+", "-", "*", "/", "%", "!",
+    "..",
+    "==",
+    "!=",
+    "<=",
+    ">=",
+    "&&",
+    "||",
+    "->",
+    "{",
+    "}",
+    "(",
+    ")",
+    "[",
+    "]",
+    ";",
+    ":",
+    ",",
+    ".",
+    "<",
+    ">",
+    "=",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "!",
 ]
 
 IDENT_START = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_")
@@ -41,7 +124,7 @@ HEX_DIGITS = set("0123456789abcdefABCDEF")
 
 @dataclass
 class Token:
-    kind: str          # ident | ssa | int | decimal | string | keyword | punct | eof
+    kind: str  # ident | ssa | int | decimal | string | keyword | punct | eof
     value: object
     line: int
     col: int
@@ -67,8 +150,9 @@ class Lexer:
         self.col = 1
         self.tokens: List[Token] = []
 
-    def error(self, message: str, line: Optional[int] = None,
-              col: Optional[int] = None) -> None:
+    def error(
+        self, message: str, line: Optional[int] = None, col: Optional[int] = None
+    ) -> None:
         raise VeraError(D_PARSE, message, line or self.line, col or self.col)
 
     def _peek(self, offset: int = 0) -> str:
@@ -76,7 +160,7 @@ class Lexer:
         return self.src[idx] if idx < len(self.src) else ""
 
     def _advance(self, n: int = 1) -> str:
-        out = self.src[self.pos:self.pos + n]
+        out = self.src[self.pos : self.pos + n]
         for ch in out:
             if ch == "\n":
                 self.line += 1
@@ -96,7 +180,9 @@ class Lexer:
                     self._advance()
             elif ch == "/" and self._peek(1) == "*":
                 self._advance(2)
-                while self.pos < len(self.src) and not (self._peek() == "*" and self._peek(1) == "/"):
+                while self.pos < len(self.src) and not (
+                    self._peek() == "*" and self._peek(1) == "/"
+                ):
                     self._advance()
                 if self.pos >= len(self.src):
                     self.error("unterminated block comment")
@@ -123,7 +209,7 @@ class Lexer:
                 start = self.pos
                 while self.pos < len(self.src) and _is_ident_cont(self._peek()):
                     self._advance()
-                name = "%" + self.src[start:self.pos]
+                name = "%" + self.src[start : self.pos]
                 self.tokens.append(Token("ssa", name, line, col, name))
                 continue
 
@@ -132,7 +218,7 @@ class Lexer:
                 start = self.pos
                 while self.pos < len(self.src) and _is_ident_cont(self._peek()):
                     self._advance()
-                text = self.src[start:self.pos]
+                text = self.src[start : self.pos]
                 kind = "keyword" if text in KEYWORDS else "ident"
                 self.tokens.append(Token(kind, text, line, col, text))
                 continue
@@ -151,15 +237,23 @@ class Lexer:
                     c = self._advance()
                     if c == "\\":
                         nxt = self._advance()
-                        escapes = {"n": "\n", "t": "\t", "r": "\r", '"': '"', "\\": "\\", "0": "\0"}
+                        escapes = {
+                            "n": "\n",
+                            "t": "\t",
+                            "r": "\r",
+                            '"': '"',
+                            "\\": "\\",
+                            "0": "\0",
+                        }
                         buf.append(escapes.get(nxt, nxt))
                     else:
                         buf.append(c)
                 if self.pos >= len(self.src):
                     self.error("unterminated string literal", line, col)
                 self._advance()  # closing quote
-                self.tokens.append(Token("string", "".join(buf), line, col,
-                                         '"' + "".join(buf) + '"'))
+                self.tokens.append(
+                    Token("string", "".join(buf), line, col, '"' + "".join(buf) + '"')
+                )
                 continue
 
             # Punctuation
@@ -183,18 +277,22 @@ class Lexer:
                 self._advance()
             if self.pos == digits_start:
                 self.error("empty hexadecimal literal", line, col)
-            text = self.src[start:self.pos]
+            text = self.src[start : self.pos]
             return Token("int", int(text, 16), line, col, text)
-        while self.pos < len(self.src) and (self._peek() in DIGITS or self._peek() == "_"):
+        while self.pos < len(self.src) and (
+            self._peek() in DIGITS or self._peek() == "_"
+        ):
             self._advance()
         if self._peek() == "." and self._peek(1) in DIGITS:
             is_decimal = True
             self._advance()
-            while self.pos < len(self.src) and (self._peek() in DIGITS or self._peek() == "_"):
+            while self.pos < len(self.src) and (
+                self._peek() in DIGITS or self._peek() == "_"
+            ):
                 self._advance()
-        text = self.src[start:self.pos].replace("_", "")
+        text = self.src[start : self.pos].replace("_", "")
         if is_decimal:
-            return Token("decimal", float(text), line, col, text)
+            return Token("decimal", Decimal(text), line, col, text)
         return Token("int", int(text), line, col, text)
 
 
