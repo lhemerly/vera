@@ -30,7 +30,9 @@ jobs:
 
       - name: Install native test tools
         run: |
-          sudo apt-get -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+          ubuntu_sources=/etc/apt/sources.list.d/ubuntu.sources
+          if ! test -f "$ubuntu_sources"; then ubuntu_sources=/etc/apt/sources.list; fi
+          sudo apt-get -o Dir::Etc::sourcelist="$ubuntu_sources" -o Dir::Etc::sourceparts=- -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
           sudo apt-get -o DPkg::Lock::Timeout=60 -o Acquire::Retries=2 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 install -y --no-install-recommends build-essential curl unzip glslang-tools libegl-dev libgl-dev libgl1-mesa-dri
 
       - name: Install static solver
