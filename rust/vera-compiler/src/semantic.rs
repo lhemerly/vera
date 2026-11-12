@@ -35,6 +35,7 @@ struct Context {
     fold_depth: u32,
     fold_product: u32,
     commit: bool,
+    outbox: bool,
 }
 impl Context {
     fn specification(state: Snapshot) -> Self {
@@ -44,6 +45,7 @@ impl Context {
             fold_depth: 0,
             fold_product: 1,
             commit: false,
+            outbox: false,
         }
     }
     fn body() -> Self {
@@ -53,6 +55,7 @@ impl Context {
             fold_depth: 0,
             fold_product: 1,
             commit: true,
+            outbox: false,
         }
     }
 }
@@ -543,7 +546,10 @@ impl Analyzer {
                 expression,
                 &scope,
                 Some(Domain::scalar(ScalarType::Bool)),
-                Context::specification(Snapshot::Current),
+                Context {
+                    outbox: true,
+                    ..Context::specification(Snapshot::Current)
+                },
             )?;
             ensures.push(NamedExpr {
                 name: name.clone(),
@@ -895,6 +901,7 @@ impl Analyzer {
                 })?;
                 let old_context = Context {
                     state: Snapshot::Pre,
+                    outbox: false,
                     purity: if context.purity == Purity::Body {
                         Purity::OldKey
                     } else {
@@ -1002,12 +1009,93 @@ impl Analyzer {
                     value.cost,
                 )
             }
+            a::Expr::EffectCount(_) => {
+                if !context.outbox {
+                    return Err(diagnostic(
+                        "D_EFFECT_CONTEXT",
+                        "effect observations are only valid in transition ensures",
+                        span,
+                    ));
+                }
+                (
+                    Domain::scalar(ScalarType::U64),
+                    ExprKind::EffectCount,
+                    true,
+                    0,
+                )
+            }
+            a::Expr::EffectIs(query) => {
+                let (effect, index) =
+                    self.effect_index(&query.effect, &query.index, scope, context, span)?;
+                (
+                    Domain::scalar(ScalarType::Bool),
+                    ExprKind::EffectIs {
+                        effect,
+                        index: index.id,
+                    },
+                    true,
+                    index.cost,
+                )
+            }
+            a::Expr::EffectArg(query) => {
+                let (effect, index) =
+                    self.effect_index(&query.effect, &query.index, scope, context, span)?;
+                let info = self.program.effect(effect);
+                let parameter = info
+                    .params
+                    .iter()
+                    .position(|p| p.name == query.parameter)
+                    .ok_or_else(|| {
+                        diagnostic(
+                            "D_UNKNOWN_PARAM",
+                            format!("unknown effect parameter {:?}", query.parameter),
+                            span,
+                        )
+                    })?;
+                let domain = Self::promote(
+                    Domain::scalar(info.params[parameter].ty.clone()),
+                    expected.as_ref(),
+                );
+                (
+                    domain,
+                    ExprKind::EffectArg {
+                        effect,
+                        index: index.id,
+                        parameter,
+                    },
+                    true,
+                    index.cost,
+                )
+            }
             a::Expr::Fold(fold) => return self.fold(fold, scope, expected, context),
         };
         Ok(Lowered {
             id: self.push(domain, kind, dependent, span),
             cost,
         })
+    }
+
+    fn effect_index(
+        &mut self,
+        name: &str,
+        index: &a::Expr,
+        scope: &Scope,
+        context: Context,
+        span: Span,
+    ) -> Result<(EffectId, Lowered)> {
+        if !context.outbox {
+            return Err(diagnostic(
+                "D_EFFECT_CONTEXT",
+                "effect observations are only valid in transition ensures",
+                span,
+            ));
+        }
+        let effect = self.effect_names.get(name).copied().ok_or_else(|| {
+            diagnostic("D_UNKNOWN_EFFECT", format!("unknown effect {name:?}"), span)
+        })?;
+        let index =
+            self.expression(index, scope, Some(Domain::scalar(ScalarType::U64)), context)?;
+        Ok((effect, index))
     }
 
     fn promote(mut domain: Domain, expected: Option<&Domain>) -> Domain {
@@ -1121,6 +1209,35 @@ impl Analyzer {
             ))),
             a::Expr::TableExists(_) | a::Expr::TableExistsUnique(_) => {
                 Some(Domain::scalar(ScalarType::Bool))
+            }
+            a::Expr::EffectCount(_) => Some(Domain::scalar(ScalarType::U64)),
+            a::Expr::EffectIs(_) => Some(Domain::scalar(ScalarType::Bool)),
+            a::Expr::EffectArg(query) => {
+                let effect = self
+                    .effect_names
+                    .get(&query.effect)
+                    .copied()
+                    .ok_or_else(|| {
+                        diagnostic(
+                            "D_UNKNOWN_EFFECT",
+                            format!("unknown effect {:?}", query.effect),
+                            query.span,
+                        )
+                    })?;
+                let parameter = self
+                    .program
+                    .effect(effect)
+                    .params
+                    .iter()
+                    .find(|p| p.name == query.parameter)
+                    .ok_or_else(|| {
+                        diagnostic(
+                            "D_UNKNOWN_PARAM",
+                            format!("unknown effect parameter {:?}", query.parameter),
+                            query.span,
+                        )
+                    })?;
+                Some(Domain::scalar(parameter.ty.clone()))
             }
             a::Expr::Fold(fold) => Some(Domain::scalar(self.resolve_type(&fold.acc_type)?)),
             a::Expr::Unary(unary) => {
@@ -1721,7 +1838,10 @@ impl Analyzer {
     fn collect_reads(&self, id: ExprId, reads: &mut Vec<Access>, tier_two: &mut bool) {
         let expression = self.program.expr(id);
         match &expression.kind {
-            ExprKind::Constant(_) | ExprKind::Binding(_) => {}
+            ExprKind::Constant(_) | ExprKind::Binding(_) | ExprKind::EffectCount => {}
+            ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
+                self.collect_reads(*index, reads, tier_two)
+            }
             ExprKind::Unary { operand, .. } => self.collect_reads(*operand, reads, tier_two),
             ExprKind::Binary { left, right, .. } => {
                 self.collect_reads(*left, reads, tier_two);
@@ -1758,7 +1878,13 @@ impl Analyzer {
 
     fn collect_expression_writes(&self, id: ExprId, writes: &mut Vec<Access>, tier_two: &mut bool) {
         match &self.program.expr(id).kind {
-            ExprKind::Constant(_) | ExprKind::Binding(_) | ExprKind::Sum { .. } => {}
+            ExprKind::Constant(_)
+            | ExprKind::Binding(_)
+            | ExprKind::Sum { .. }
+            | ExprKind::EffectCount => {}
+            ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
+                self.collect_expression_writes(*index, writes, tier_two)
+            }
             ExprKind::Unary { operand, .. } => {
                 self.collect_expression_writes(*operand, writes, tier_two)
             }

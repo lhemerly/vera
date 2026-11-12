@@ -178,6 +178,9 @@ node_enum!(Expr {
     SumAgg(SumAgg),
     KeyOf(KeyOf),
     Fold(Box<Fold>),
+    EffectCount(EffectCount),
+    EffectIs(EffectIs),
+    EffectArg(EffectArg),
 });
 
 impl Expr {
@@ -197,6 +200,9 @@ impl Expr {
             Self::SumAgg(v) => v.span,
             Self::KeyOf(v) => v.span,
             Self::Fold(v) => v.span,
+            Self::EffectCount(v) => v.span,
+            Self::EffectIs(v) => v.span,
+            Self::EffectArg(v) => v.span,
         }
     }
 }
@@ -400,3 +406,25 @@ pub struct Commit {
     pub span: Span,
 }
 serialize_node!(Commit, "Commit",);
+
+/// Transaction-local outbox observations, admitted only in postconditions.
+#[derive(Clone, Debug)]
+pub struct EffectCount {
+    pub span: Span,
+}
+serialize_node!(EffectCount, "EffectCount",);
+#[derive(Clone, Debug)]
+pub struct EffectIs {
+    pub effect: String,
+    pub index: Box<Expr>,
+    pub span: Span,
+}
+serialize_node!(EffectIs, "EffectIs", effect => "effect", index => "index");
+#[derive(Clone, Debug)]
+pub struct EffectArg {
+    pub effect: String,
+    pub index: Box<Expr>,
+    pub parameter: String,
+    pub span: Span,
+}
+serialize_node!(EffectArg, "EffectArg", effect => "effect", index => "index", parameter => "parameter");

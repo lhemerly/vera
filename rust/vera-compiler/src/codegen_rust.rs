@@ -269,6 +269,7 @@ impl<'a> Generator<'a> {
             "DuplicateKey",
             "IndexSaturated",
             "InvalidEncoding",
+            "EffectAccess",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -354,6 +355,7 @@ impl<'a> Generator<'a> {
             self.transition(index)?;
         }
         self.runtime(options.use_rt);
+        self.postconditions()?;
         self.snapshot()?;
         self.projections()?;
         if options.include_main {
@@ -811,7 +813,10 @@ impl Generator<'_> {
                     result.remove(&binding);
                 }
             }
-            ExprKind::Constant(_) | ExprKind::Sum { .. } => {}
+            ExprKind::Constant(_) | ExprKind::Sum { .. } | ExprKind::EffectCount => {}
+            ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
+                self.expression_bindings(*index, result)
+            }
         }
     }
 
@@ -1104,6 +1109,8 @@ impl Generator<'_> {
                     | ExprKind::TableGet { .. }
                     | ExprKind::SlotRead { .. }
                     | ExprKind::Fold(_)
+                    | ExprKind::EffectArg { .. }
+                    | ExprKind::EffectCount
             );
         let state_name = |snapshot| {
             if snapshot == Snapshot::Pre {
@@ -1278,6 +1285,27 @@ impl Generator<'_> {
                     format!("({value}).0.0[0]")
                 } else {
                     format!("(({value}) as u64)")
+                }
+            }
+            ExprKind::EffectCount => {
+                "(state.outbox.len().saturating_sub(pre.outbox.len()) as u64)".into()
+            }
+            ExprKind::EffectIs { effect, index } | ExprKind::EffectArg { effect, index, .. } => {
+                let aggregate = self.expr_info(index).domain.is_aggregate();
+                let index = self.expr(index, env)?;
+                let index = if aggregate {
+                    format!("({index}).to_u128().and_then(|i|usize::try_from(i).ok())")
+                } else {
+                    format!("usize::try_from({index}).ok()")
+                };
+                let record = format!("{index}.and_then(|i|pre.outbox.len().checked_add(i)).and_then(|i|state.outbox.get(i))");
+                let variant = &self.effect_variants[effect.0];
+                if let ExprKind::EffectArg { parameter, .. } = expression.kind {
+                    let fields = parameter_fields(&self.program.effect(effect).params);
+                    let field = &fields[parameter];
+                    format!("{{match {record}{{Some(Effect::{variant}{{{field}:value,..}})=>*value,_=>return Err(ErrorCode::EffectAccess)}}}}")
+                } else {
+                    format!("matches!({record},Some(Effect::{variant}{{..}}))")
                 }
             }
             ExprKind::Fold(fold) => self.fold(&fold, env)?,
@@ -1460,6 +1488,46 @@ impl Generator<'_> {
             self.statement(statement, &mut env)?;
         }
         self.line("Ok(())}");
+        Ok(())
+    }
+
+    fn postconditions(&mut self) -> Result<(), Diagnostic> {
+        self.line("/// A false postcondition, or a trap while evaluating it. This does not indicate whether execution was verified.");
+        self.line("#[derive(Clone,Debug,PartialEq,Eq)] pub struct PostconditionFailure { pub name: &'static str, pub cause: Option<ErrorCode> }");
+        self.line("impl Params { /// Evaluate this intent's named ensures against an actual committed result and its transaction-start state. Does not replay the intent, validate invariants, or alter execution admission.
+ pub fn check_postconditions(&self,pre:&State,state:&State)->Result<(),PostconditionFailure>{");
+        let target = if self.program.transitions.is_empty() {
+            "*self"
+        } else {
+            "self"
+        };
+        self.line(format!("match {target}{{"));
+        for transition in &self.program.transitions {
+            let fields = parameter_fields(&transition.params);
+            let names = transition
+                .params
+                .iter()
+                .zip(&fields)
+                .map(|(param, field)| format!("{field}:{}", self.binding(param.binding)))
+                .collect::<Vec<_>>();
+            self.line(format!(
+                "Self::{}{{{}}}=>{{",
+                self.transition_variants[transition.id.0],
+                names.join(",")
+            ));
+            let env = transition
+                .params
+                .iter()
+                .map(|param| (param.binding, format!("(*{})", self.binding(param.binding))))
+                .collect::<Environment>();
+            for ensure in &transition.ensures {
+                let value = self.expr(ensure.value, &env)?;
+                let name = quote(&ensure.name);
+                self.line(format!("match (||->Result<bool,ErrorCode>{{Ok({value})}})(){{Ok(true)=>{{}},Ok(false)=>return Err(PostconditionFailure{{name:{name},cause:None}}),Err(cause)=>return Err(PostconditionFailure{{name:{name},cause:Some(cause)}})}}"));
+            }
+            self.line("Ok(())},");
+        }
+        self.line("}}}");
         Ok(())
     }
 

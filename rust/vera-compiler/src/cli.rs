@@ -39,6 +39,8 @@ Usage: vera <command> <file|-> [options]
 Common: --json, --timeout MS (10000), --setup FILE
 Proofs: --transition NAME, --emit-smt PREFIX, --max-state-cells N,
         --max-unroll N, --witness-attempts N, --exact-sum
+        --max-expression-steps N (4194304), --max-smt-bytes N (67108864),
+        --max-effect-events N (4096)
 Execution: --unverified (development), --snapshot-in FILE,
            --snapshot-out FILE, --wal FILE (recover, append and sync)
 Codegen: --out FILE, --no-main, --runtime-crate, --depth N
@@ -94,6 +96,9 @@ impl Options {
             max_state_cells: self.number("--max-state-cells", 4096)?,
             max_unroll: self.number("--max-unroll", 1024)?,
             witness_attempts: self.number("--witness-attempts", 8)?,
+            max_expression_steps: self.number("--max-expression-steps", 4_194_304)?,
+            max_smt_bytes: self.number("--max-smt-bytes", 64 * 1024 * 1024)?,
+            max_effect_events: self.number("--max-effect-events", 4096)?,
         };
         if config.timeout_ms == 0 {
             return Err(input("--timeout must be positive"));
@@ -117,6 +122,9 @@ fn options(mut args: Vec<OsString>) -> Result<Options> {
                 "--max-state-cells",
                 "--max-unroll",
                 "--witness-attempts",
+                "--max-expression-steps",
+                "--max-smt-bytes",
+                "--max-effect-events",
             ],
         ),
         "run" => (
@@ -132,6 +140,9 @@ fn options(mut args: Vec<OsString>) -> Result<Options> {
                 "--max-state-cells",
                 "--max-unroll",
                 "--witness-attempts",
+                "--max-expression-steps",
+                "--max-smt-bytes",
+                "--max-effect-events",
             ],
         ),
         "project" => (
@@ -148,6 +159,9 @@ fn options(mut args: Vec<OsString>) -> Result<Options> {
                 "--max-state-cells",
                 "--max-unroll",
                 "--witness-attempts",
+                "--max-expression-steps",
+                "--max-smt-bytes",
+                "--max-effect-events",
             ],
         ),
         "codegen" => (
@@ -159,6 +173,9 @@ fn options(mut args: Vec<OsString>) -> Result<Options> {
                 "--max-state-cells",
                 "--max-unroll",
                 "--witness-attempts",
+                "--max-expression-steps",
+                "--max-smt-bytes",
+                "--max-effect-events",
             ],
         ),
         "fuzz" => (

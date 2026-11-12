@@ -797,6 +797,37 @@ impl Evaluator<'_, '_> {
                 let value = self.value(value, context)?;
                 Ok(Value::Int(BigInt::from(low_u64(&value))))
             }
+            ExprKind::EffectCount => Ok(Value::Int(BigInt::from(
+                self.state
+                    .outbox
+                    .len()
+                    .saturating_sub(self.pre.outbox.len()),
+            ))),
+            ExprKind::EffectIs { effect, index } => {
+                let index = self.value(index, context)?.as_u64();
+                let record = index
+                    .and_then(|i| usize::try_from(i).ok())
+                    .and_then(|i| self.pre.outbox.len().checked_add(i))
+                    .and_then(|i| self.state.outbox.get(i));
+                Ok(Value::Bool(record.is_some_and(|r| r.effect == effect)))
+            }
+            ExprKind::EffectArg {
+                effect,
+                index,
+                parameter,
+            } => {
+                let index = self
+                    .value(index, context)?
+                    .as_u64()
+                    .and_then(|i| usize::try_from(i).ok())
+                    .and_then(|i| self.pre.outbox.len().checked_add(i));
+                index
+                    .and_then(|i| self.state.outbox.get(i))
+                    .filter(|r| r.effect == effect)
+                    .and_then(|r| r.args.get(parameter))
+                    .cloned()
+                    .ok_or_else(|| RuntimeError::new("ERR_EFFECT_ACCESS", FailureKind::Trap))
+            }
             ExprKind::Fold(fold) => self.fold(&fold, context),
         }
     }

@@ -449,3 +449,120 @@ fn all_gpu_targets_lower_the_same_checked_program() {
         );
     }
 }
+
+const EFFECT_CONTRACT: &str = r#"
+effect Item(value:u64, payload:bytes32, enabled:bool);
+effect Done();
+transition send(n:u64, payload:bytes32, accept:bool) reads [] writes []
+require bounded:le(n,3);
+ensure count:eq(effect_count(),add(n,2));
+ensure final:effect_is(Done,add(n,1));
+ensure absent:not(effect_is(Item,18446744073709551615));
+ensure wrong_type:not(effect_is(Item,add(n,1)));
+ensure guarded:select(effect_is(Item,add(n,1)),eq(effect_arg(Item,add(n,1),value),0),true);
+ensure payloads:fold_bounded<4>(ok:bool=true,i in [0..n]) {
+  yield and(ok,and(effect_is(Item,i),and(eq(effect_arg(Item,i,value),i),and(eq(effect_arg(Item,i,payload),payload),eq(effect_arg(Item,i,enabled),true)))));
+};
+body {
+  let %unused:u64=fold_bounded<4>(acc:u64=0,i in [0..n]) {
+    emit Item(i,payload,true);
+    yield acc;
+  };
+  emit Done();
+  guard(accept,ERR_REJECT);
+  commit;
+}
+"#;
+
+#[test]
+fn effect_contracts_execute_in_gpu_with_order_payload_and_transaction_scope() {
+    run_cpp(
+        EFFECT_CONTRACT,
+        r#"
+Ctx ctx{};vera_init(&ctx);
+V payload=v_make(1u,2u,3u,4u,5u,6u,7u,8u);
+assert(transition_v_send(&ctx,v_small(3u),payload,v_small(1u))==1u);
+assert(ctx.s.effect_count==5u);
+assert(transition_v_send(&ctx,v_zero(),payload,v_small(1u))==1u);
+assert(ctx.s.effect_count==7u);
+assert(transition_v_send(&ctx,v_small(2u),payload,v_zero())==0u);
+assert(ctx.s.effect_count==7u);
+assert(transition_v_send(&ctx,v_small(1u),payload,v_small(1u))==1u);
+assert(ctx.s.effect_count==10u);
+"#,
+    );
+    let code = generate_wgsl(&checked(EFFECT_CONTRACT), 2).unwrap();
+    let module = naga::front::wgsl::parse_str(&code)
+        .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&code)));
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+#[test]
+fn gpu_effect_contracts_reject_wrong_payload_order_and_invalid_access() {
+    for source in [
+        "effect A(v:u64);effect B();transition go() reads [] writes [] ensure e:effect_is(A,0);body {emit B();emit A(9);commit;}",
+        "effect A(v:u64);transition go() reads [] writes [] ensure e:eq(effect_arg(A,0,v),10);body {emit A(9);commit;}",
+        "effect A(v:u64);transition go() reads [] writes [] ensure e:eq(effect_arg(A,18446744073709551615,v),0);body {emit A(9);commit;}",
+        "effect A(v:u64);effect B();transition go() reads [] writes [] ensure e:eq(effect_arg(A,0,v),0);body {emit B();commit;}",
+    ] {
+        run_cpp(source, "Ctx ctx{};vera_init(&ctx);assert(transition_v_go(&ctx)==2u);");
+    }
+}
+
+#[test]
+fn gpu_effect_buffers_are_bounded_and_do_not_grow_for_unrelated_transitions() {
+    let large_body = "let %x:u64=fold_bounded<1024>(acc:u64=0,i in [0..1023]){emit A(0,0,0,0);yield acc;};commit;";
+    let declarations = "effect A(a:u64,b:u64,c:u64,d:u64);";
+    let too_large = format!("{declarations}transition go() reads [] writes [] ensure e:and(eq(effect_count(),1024),eq(effect_arg(A,0,d),0));body {{{large_body}}}");
+    for target in [
+        vera_compiler::codegen_gpu::GpuTarget::Glsl,
+        vera_compiler::codegen_gpu::GpuTarget::Wgsl,
+        vera_compiler::codegen_gpu::GpuTarget::Cuda,
+    ] {
+        let error =
+            vera_compiler::codegen_gpu::generate_gpu(&checked(&too_large), target, 2).unwrap_err();
+        assert_eq!(error.code, "D_GPU_RESOURCE");
+    }
+    let separate = format!("{declarations}transition large() reads [] writes [] body {{{large_body}}}transition small() reads [] writes [] ensure e:eq(effect_count(),1);body {{emit A(1,2,3,4);commit;}}");
+    let code = generate_cuda(&checked(&separate), 2).unwrap();
+    assert!(code.contains("emitted_kind[1]"));
+    let without_query =
+        format!("{declarations}transition large() reads [] writes [] body {{{large_body}}}");
+    assert!(!generate_cuda(&checked(&without_query), 2)
+        .unwrap()
+        .contains("emitted_kind"));
+}
+
+#[test]
+fn gpu_effect_indices_preserve_wide_aggregate_carriers() {
+    let source = r#"table T capacity 2 {key id:id64<T>;col v:u64 [tracked_sum];}
+effect A(v:u64);
+transition go() reads [] writes [T[*].v]
+ensure absent:not(effect_is(A,sum(T.v)));
+body {let %a:id64<T>=table_alloc(T,{v:18446744073709551615});let %b:id64<T>=table_alloc(T,{v:1});emit A(0);commit;}"#;
+    run_cpp(
+        source,
+        "Ctx ctx{};vera_init(&ctx);assert(transition_v_go(&ctx)==1u);",
+    );
+    let invalid = source.replace(
+        "not(effect_is(A,sum(T.v)))",
+        "eq(effect_arg(A,sum(T.v),v),0)",
+    );
+    run_cpp(
+        &invalid,
+        "Ctx ctx{};vera_init(&ctx);assert(transition_v_go(&ctx)==2u);",
+    );
+}
+
+#[test]
+fn gpu_effect_contract_storage_covers_payload_queries_nested_in_indices() {
+    run_cpp(
+        "effect A(v:u64);transition go() reads [] writes [] ensure e:effect_is(A,effect_arg(A,1,v));body {emit A(0);emit A(0);commit;}",
+        "Ctx ctx{};vera_init(&ctx);assert(transition_v_go(&ctx)==1u);",
+    );
+}

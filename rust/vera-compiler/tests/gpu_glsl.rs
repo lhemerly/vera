@@ -76,3 +76,22 @@ atomicAdd(committed,ctx.rng[0]);atomicAdd(reverted,ctx.rng[1]);atomicAdd(effects
         "violations=1 committed=857776784 reverted=3957087773 effects=3837013768",
     );
 }
+
+#[test]
+fn glsl_effect_contracts_validate_transaction_local_order_and_payload() {
+    run(
+        r#"effect A(v:bytes32);effect B();
+transition go(v:bytes32) reads [] writes []
+ensure count:eq(effect_count(),2);
+ensure tag:effect_is(A,0);
+ensure payload:eq(effect_arg(A,0,v),v);
+ensure end:effect_is(B,1);
+ensure missing:not(effect_is(A,18446744073709551615));
+body {emit A(v);emit B();commit;}"#,
+        r#"void main(){if(gl_GlobalInvocationID.x!=0u){return;}Ctx ctx;vera_init(ctx);
+V payload=v_make(1u,2u,3u,4u,5u,6u,7u,8u);
+uint first=transition_v_go(ctx,payload);uint second=transition_v_go(ctx,payload);
+atomicAdd(violations,first);atomicAdd(committed,second);atomicAdd(effects,ctx.s.effect_count);}"#,
+        "violations=1 committed=1 reverted=0 effects=4",
+    );
+}

@@ -207,3 +207,23 @@ atomicStore(&output.committed,ctx.rng[0]);atomicStore(&output.reverted,ctx.rng[1
         [1, 857776784, 3957087773, 3837013768],
     );
 }
+
+#[test]
+fn wgsl_effect_contracts_validate_transaction_local_order_and_payload() {
+    expect(
+        r#"effect A(v:bytes32);effect B();
+transition go(v:bytes32) reads [] writes []
+ensure count:eq(effect_count(),2);
+ensure tag:effect_is(A,0);
+ensure payload:eq(effect_arg(A,0,v),v);
+ensure end:effect_is(B,1);
+ensure missing:not(effect_is(A,18446744073709551615));
+body {emit A(v);emit B();commit;}"#,
+        r#"@compute @workgroup_size(1) fn probe(){var ctx:Ctx;vera_init(&ctx);
+let payload=v_make(1u,2u,3u,4u,5u,6u,7u,8u);
+let first=transition_v_go(&ctx,payload);let second=transition_v_go(&ctx,payload);
+atomicAdd(&output.violations,first);atomicAdd(&output.committed,second);atomicAdd(&output.effects,ctx.s.effect_count);}"#,
+        "probe",
+        [1, 1, 0, 4],
+    );
+}

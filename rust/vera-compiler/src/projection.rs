@@ -308,7 +308,10 @@ fn contains_binding(
     let mut children = Vec::new();
     match &program.expr(expression).kind {
         ExprKind::Binding(binding) => return *binding == needle,
-        ExprKind::Constant(_) | ExprKind::Sum { .. } => {}
+        ExprKind::Constant(_) | ExprKind::Sum { .. } | ExprKind::EffectCount => {}
+        ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
+            children.push(*index)
+        }
         ExprKind::Unary { operand, .. } => children.push(*operand),
         ExprKind::Binary { left, right, .. } => {
             children.push(*left);

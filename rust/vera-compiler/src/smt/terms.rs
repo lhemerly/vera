@@ -180,17 +180,50 @@ impl Default for Path {
     }
 }
 
-#[derive(Default)]
 pub(super) struct Script {
-    pub declarations: Vec<String>,
-    pub assertions: Vec<String>,
+    declarations: Vec<String>,
+    assertions: Vec<String>,
     serial: usize,
+    bytes: usize,
+    max_bytes: usize,
+    exceeded: bool,
 }
 
 impl Script {
+    pub fn with_budget(max_bytes: usize) -> Self {
+        Self {
+            declarations: Vec::new(),
+            assertions: Vec::new(),
+            serial: 0,
+            bytes: 0,
+            max_bytes,
+            exceeded: false,
+        }
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+    pub fn exceeded(&self) -> bool {
+        self.exceeded
+    }
+
+    fn reserve(&mut self, bytes: usize) -> bool {
+        if self.exceeded || bytes > self.max_bytes.saturating_sub(self.bytes) {
+            self.exceeded = true;
+            return false;
+        }
+        self.bytes += bytes;
+        true
+    }
+
+    pub fn declaration(&mut self, value: String) {
+        if self.reserve(value.len().saturating_add(1)) {
+            self.declarations.push(value);
+        }
+    }
     pub fn declare(&mut self, name: &str, sort: Sort) -> Term {
-        self.declarations
-            .push(format!("(declare-const {name} {})", sort.smt()));
+        self.declaration(format!("(declare-const {name} {})", sort.smt()));
         Term {
             text: name.into(),
             sort,
@@ -198,7 +231,11 @@ impl Script {
     }
 
     pub fn assert(&mut self, value: impl Into<String>) {
-        self.assertions.push(value.into());
+        let value = value.into();
+        // Include the `(assert ...)` wrapper and newline in retained bytes.
+        if self.reserve(value.len().saturating_add(10)) {
+            self.assertions.push(value);
+        }
     }
 
     pub fn bind(&mut self, stem: &str, value: impl Into<String>, sort: Sort) -> Term {
@@ -207,6 +244,18 @@ impl Script {
         let term = self.declare(&name, sort);
         self.assert(eq(&name, &value.into()));
         term
+    }
+
+    /// Bind an SMT array once, so repeated reads do not duplicate store chains.
+    pub fn bind_array(&mut self, stem: &str, value: &str, element: Sort) -> String {
+        let name = format!("v_{}_{}", stem, self.serial);
+        self.serial += 1;
+        self.declaration(format!(
+            "(declare-const {name} (Array (_ BitVec 64) {}))",
+            element.smt()
+        ));
+        self.assert(eq(&name, value));
+        name
     }
 
     pub fn guard(&mut self, path: &mut Path, condition: &str) {

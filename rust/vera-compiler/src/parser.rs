@@ -697,7 +697,18 @@ impl Parser {
         self.checked_tree(expr)
     }
 
+    fn effect_call(&self) -> bool {
+        matches!(&self.peek().kind, TokenKind::Ident(name) if matches!(name.as_str(), "effect_count" | "effect_is" | "effect_arg"))
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|t| matches!(&t.kind, TokenKind::Punct(p) if p == "("))
+    }
+
     fn pure_expr_inner(&mut self) -> Result<Expr> {
+        if self.effect_call() {
+            return self.call(false);
+        }
         let token = self.peek().clone();
         match token.kind {
             TokenKind::Punct(ref name) if name == "-" => {
@@ -786,7 +797,7 @@ impl Parser {
     fn call(&mut self, logic: bool) -> Result<Expr> {
         let token = self.peek().clone();
         let name = match &token.kind {
-            TokenKind::Keyword(name) => name.as_str(),
+            TokenKind::Keyword(name) | TokenKind::Ident(name) => name.as_str(),
             _ => return Err(self.error("expected expression")),
         };
         if name == "fold_bounded" {
@@ -835,6 +846,43 @@ impl Parser {
                 b,
                 span: self.cover(token.span),
             }));
+        }
+        if name == "effect_count" {
+            self.advance();
+            self.expect_punct("(")?;
+            self.expect_punct(")")?;
+            return Ok(Expr::EffectCount(EffectCount {
+                span: self.cover(token.span),
+            }));
+        }
+        if name == "effect_is" || name == "effect_arg" {
+            self.advance();
+            self.expect_punct("(")?;
+            let effect = self.ident()?.0;
+            self.expect_punct(",")?;
+            let index = Box::new(self.expression(logic)?);
+            let parameter = if name == "effect_arg" {
+                self.expect_punct(",")?;
+                Some(self.ident()?.0)
+            } else {
+                None
+            };
+            self.expect_punct(")")?;
+            let span = self.cover(token.span);
+            return Ok(if let Some(parameter) = parameter {
+                Expr::EffectArg(EffectArg {
+                    effect,
+                    index,
+                    parameter,
+                    span,
+                })
+            } else {
+                Expr::EffectIs(EffectIs {
+                    effect,
+                    index,
+                    span,
+                })
+            });
         }
         if name == "key_of" || name == "id64" {
             self.advance();
@@ -1088,6 +1136,9 @@ impl Parser {
     }
 
     fn logic_atom(&mut self) -> Result<Expr> {
+        if self.effect_call() {
+            return self.call(true);
+        }
         let token = self.peek().clone();
         if self.accept_punct("(") {
             let expr = self.logic_expr()?;
@@ -1200,7 +1251,9 @@ fn exceeds_nesting(expr: &Expr, remaining: usize) -> bool {
     let remaining = remaining - 1;
     let child = |expr: &Expr| exceeds_nesting(expr, remaining);
     match expr {
-        Expr::Var(_) | Expr::Literal(_) | Expr::SumAgg(_) => false,
+        Expr::Var(_) | Expr::Literal(_) | Expr::SumAgg(_) | Expr::EffectCount(_) => false,
+        Expr::EffectIs(v) => child(&v.index),
+        Expr::EffectArg(v) => child(&v.index),
         Expr::Unary(v) => child(&v.operand),
         Expr::Binary(v) => child(&v.left) || child(&v.right),
         Expr::Select(v) => child(&v.cond) || child(&v.a) || child(&v.b),

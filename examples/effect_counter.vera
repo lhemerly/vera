@@ -1,0 +1,45 @@
+module CounterExample;
+
+table Counter capacity 4 {
+  key id : id64<Counter>;
+  col value : u64 [tracked_sum];
+}
+
+invariant bounded {
+  forall k in Counter : le(Counter[k].value, 1000000000);
+}
+
+effect Updated(counter : id64<Counter>, before : u64, after : u64);
+
+transition create(initial : u64)
+  reads [] writes [Counter[*].value]
+  require bounded : le(initial, 1000000000);
+  body {
+    let %k : id64<Counter> = table_alloc(Counter, { value : initial });
+    commit;
+  }
+
+transition increase(counter : id64<Counter>, delta : u64)
+  reads [Counter[counter].value] writes [Counter[counter].value]
+  require exists : table_exists(Counter, counter);
+  require room : le(delta, sub(1000000000, Counter[counter].value));
+  ensure updated : eq(Counter[counter].value, add(old(Counter[counter].value), delta));
+  ensure total : eq(sum(Counter.value), add(old_sum(Counter.value), delta));
+  ensure event_count : eq(effect_count(), 1);
+  ensure event_kind : effect_is(Updated, 0);
+  ensure event_counter : eq(effect_arg(Updated, 0, counter), counter);
+  ensure event_before : eq(effect_arg(Updated, 0, before), old(Counter[counter].value));
+  ensure event_after : eq(effect_arg(Updated, 0, after), Counter[counter].value);
+  body {
+    let %before : u64 = table_get(Counter, counter, value);
+    let %after : u64 = add(%before, delta);
+    table_set(Counter, counter, value, %after);
+    emit Updated(counter, %before, %after);
+    commit;
+  }
+
+projection CounterView(counter : id64<Counter>) {
+  allow_if : table_exists(Counter, counter);
+  expose : [Counter[counter].value];
+  enable_intents : [increase when (lt(Counter[counter].value, 1000000000))];
+}

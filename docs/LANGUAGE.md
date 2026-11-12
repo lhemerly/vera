@@ -129,6 +129,15 @@ restores columns, occupancy, generations, aggregates, secondary indexes and the
 outbox. Effects are typed records in an outbox; the language itself performs no
 network, filesystem, clock or random operations.
 
+Transition ensures may constrain the ordered effects of the current transaction:
+`effect_count()` returns a `u64` count; `effect_is(Name, index)` tests the effect
+variant at a zero-based position; `effect_arg(Name, index, parameter)` reads its
+typed payload field. Only ensures admit these observations, including pure folds.
+They exclude pre-existing outbox entries. A missing/wrong-variant payload read
+traps, making the ensure fail; protect optional reads with lazy `select`, not
+an eager boolean `and`. See [effect contracts](EFFECT_CONTRACTS.md) for exact
+semantics, backend boundaries and repair feedback.
+
 Declared footprints must cover actual reads and writes. `T[*].column` denotes
 all slots. Input-derived footprints are Tier 1; state-dependent/allocated
 footprints are Tier 2. The Rust optimistic dispatcher speculates using owned
@@ -178,6 +187,9 @@ allowed. Any frontend/lowering error, timeout, or solver `unknown` fails closed.
 The guarantee is relative to the declared invariants and the compiler/solver
 implementation. Callers choose the invariants that express their application
 rules.
+
+See [proof budgets](PROOF_BUDGETS.md) for independent expression, script-byte,
+and candidate-effect limits. Resource exhaustion never weakens a proof.
 
 ## Projections
 

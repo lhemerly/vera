@@ -204,6 +204,16 @@ pub enum ExprKind {
         value: ExprId,
     },
     Fold(Box<Fold>),
+    EffectCount,
+    EffectIs {
+        effect: EffectId,
+        index: ExprId,
+    },
+    EffectArg {
+        effect: EffectId,
+        index: ExprId,
+        parameter: usize,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct Fold {

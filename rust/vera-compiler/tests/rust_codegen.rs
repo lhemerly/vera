@@ -718,3 +718,52 @@ fn aggregate_arithmetic_and_narrowing_match_exact_integer_semantics() {
         run_case(&source, &main);
     }
 }
+
+#[test]
+fn effect_contract_program_keeps_order_payload_and_atomic_outbox_in_generated_rust() {
+    run_case(
+        r#"effect Item(value:u64,payload:bytes32,enabled:bool);effect Done();
+transition send(n:u64,payload:bytes32,accept:bool) reads [] writes []
+require bounded:le(n,3);
+ensure count:eq(effect_count(),add(n,2));
+ensure final:effect_is(Done,add(n,1));
+ensure initial:and(eq(effect_arg(Item,0,value),0),eq(effect_arg(Item,0,payload),payload));
+body {let %unused:u64=fold_bounded<4>(acc:u64=0,i in [0..n]){emit Item(i,payload,true);yield acc;};emit Done();guard(accept,ERR_REJECT);commit;}"#,
+        r#"fn main(){
+let mut state=State::default();let payload=[7u8;32];
+send(&mut state,2,payload,true).unwrap();
+assert_eq!(state.outbox.len(),4);
+for i in 0..3 {assert_eq!(state.outbox[i],Effect::Item{value:i as u64,payload,enabled:true});}
+assert_eq!(state.outbox[3],Effect::Done{});
+let saved=state.clone();assert!(send(&mut state,3,payload,false).is_err());assert_eq!(state,saved);
+send(&mut state,0,payload,true).unwrap();assert_eq!(state.outbox.len(),6);
+}"#,
+    );
+}
+
+#[test]
+fn generated_postcondition_monitor_checks_effect_contracts_and_wide_indices() {
+    run_case(
+        r#"table T capacity 2 {key id:id64<T>;col v:u64 [tracked_sum];}
+effect A(v:u64);effect B();
+transition go() reads [] writes [T[*].v]
+ensure count:eq(effect_count(),2);
+ensure payload:eq(effect_arg(A,0,v),9);
+ensure tag:effect_is(B,1);
+ensure absent:not(effect_is(A,sum(T.v)));
+body {let %a:id64<T>=table_alloc(T,{v:18446744073709551615});let %b:id64<T>=table_alloc(T,{v:1});emit A(9);emit B();commit;}
+transition invalid() reads [] writes [] ensure bad_index:eq(effect_arg(A,sum(T.v),v),0);body {emit A(0);commit;}
+transition looped(n:u64) reads [] writes []
+require bound:le(n,3);
+ensure items:fold_bounded<4>(ok:bool=true,i in [0..n]){yield and(ok,eq(effect_arg(A,i,v),i));};
+body {let %x:u64=fold_bounded<4>(acc:u64=0,i in [0..n]){emit A(i);yield acc;};commit;}"#,
+        r#"fn main(){
+let pre=State::default();let mut state=pre.clone();let intent=Params::Go{};
+intent.execute(&mut state).unwrap();intent.check_postconditions(&pre,&state).unwrap();
+let mut bad=state.clone();bad.outbox[0]=Effect::A{v:10};let error=intent.check_postconditions(&pre,&bad).unwrap_err();assert_eq!(error.name,"payload");assert_eq!(error.cause,None);
+let mut wrong_tag=state.clone();wrong_tag.outbox[0]=Effect::B{};let error=intent.check_postconditions(&pre,&wrong_tag).unwrap_err();assert_eq!(error.name,"payload");assert_eq!(error.cause,Some(ErrorCode::EffectAccess));
+let start=state.clone();let invalid=Params::Invalid{};invalid.execute(&mut state).unwrap();let error=invalid.check_postconditions(&start,&state).unwrap_err();assert_eq!(error.name,"bad_index");assert_eq!(error.cause,Some(ErrorCode::EffectAccess));
+let start=state.clone();let looped=Params::Looped{n:3};looped.execute(&mut state).unwrap();looped.check_postconditions(&start,&state).unwrap();
+}"#,
+    );
+}

@@ -49,6 +49,9 @@ transition increase(counter : id64<Counter>, delta : u64)
   writes [Counter[counter].value]
   require live : table_exists(Counter, counter);
   ensure total : eq(sum(Counter.value), add(old_sum(Counter.value), delta));
+  ensure event_count : eq(effect_count(), 1);
+  ensure event_kind : effect_is(Increased, 0);
+  ensure event_amount : eq(effect_arg(Increased, 0, amount), delta);
   body {
     let %before : u64 = table_get(Counter, counter, value);
     guard(le(delta, sub(1000, %before)), ERR_LIMIT);
@@ -129,6 +132,10 @@ For each transition, VERA uses Z3 to check that:
 Guards may reject inputs. Proofs assume a well-formed initial state satisfying
 the declared invariants; setup and snapshot loading validate that state.
 A timeout, resource limit, or unknown solver result rejects verification.
+[Effect contracts](docs/EFFECT_CONTRACTS.md) also verify emitted count, order,
+variant and payload; try [the effect counter](examples/effect_counter.vera).
+[Proof budgets](docs/PROOF_BUDGETS.md) expose independent
+limits without shrinking declared state.
 
 ## Explore a program
 

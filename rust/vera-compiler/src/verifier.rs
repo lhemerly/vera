@@ -46,6 +46,12 @@ pub struct VerifierConfig {
     pub max_state_cells: usize,
     pub max_unroll: u32,
     pub witness_attempts: usize,
+    /// Maximum expression visits during symbolic lowering, independent of capacity.
+    pub max_expression_steps: usize,
+    /// Maximum UTF-8 bytes retained in one generated SMT query.
+    pub max_smt_bytes: usize,
+    /// Maximum candidate effects, including inactive unrolled emissions.
+    pub max_effect_events: usize,
 }
 
 impl Default for VerifierConfig {
@@ -55,6 +61,9 @@ impl Default for VerifierConfig {
             max_state_cells: 4096,
             max_unroll: 1024,
             witness_attempts: 8,
+            max_expression_steps: 4_194_304,
+            max_smt_bytes: 64 * 1024 * 1024,
+            max_effect_events: 4096,
         }
     }
 }
@@ -93,12 +102,65 @@ pub struct Counterexample {
     pub trace: Vec<TraceStep>,
     pub failure: Option<RuntimeError>,
     pub violated: Vec<String>,
+    /// Only effects committed by this replay, in transaction-local order.
+    pub emitted_effects: Vec<EmittedEffect>,
+    /// Evaluated failures, not merely symbolic claims. Liveness witnesses can
+    /// also fail ensures: committing alone is not a correctness guarantee.
+    pub failed_ensures: Vec<FailedEnsure>,
     pub directive: String,
+}
+
+/// A payload value with source-level type identity. Numeric/decimal values use
+/// exact raw/scaled JSON integers; bytes32 uses canonical little-endian hex.
+#[derive(Clone, Debug, Serialize)]
+pub struct EffectArgument {
+    #[serde(rename = "type")]
+    pub scalar_type: String,
+    pub value: serde_json::Value,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EmittedEffect {
+    pub index: usize,
+    pub effect: String,
+    pub arguments: BTreeMap<String, EffectArgument>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum EnsureOutcome {
+    Value { value: Value },
+    Error { error: RuntimeError },
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct FailedEnsure {
+    pub name: String,
+    pub span: Span,
+    pub outcome: EnsureOutcome,
+}
+
+/// Observed encoding sizes, not process-memory or solver-time bounds.
+#[derive(Clone, Debug, Serialize)]
+pub struct EncodingMetrics {
+    /// Complete finite model: occupancy, generation and column cells.
+    pub state_cells: usize,
+    /// Actual symbolic expression visits, including repeated fold visits.
+    pub expression_steps: usize,
+    /// Candidate emissions, including inactive unrolled paths.
+    pub effect_events: usize,
+    /// Retained declarations and assertions, including SMT wrappers/newlines.
+    pub retained_smt_bytes: usize,
+    /// Largest exported obligation query, including witness-blocking clauses.
+    pub max_query_bytes: usize,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct VerificationResult {
     pub transition: String,
+    pub config: VerifierConfig,
+    /// None when a complete encoding could not be constructed.
+    pub encoding_metrics: Option<EncodingMetrics>,
     pub safety: ObligationResult,
     pub panic: ObligationResult,
     pub liveness: ObligationResult,
@@ -194,6 +256,13 @@ struct Encoding<'a> {
     panic: String,
     liveness: String,
     work: usize,
+    state_cells: usize,
+    /// A quantified key constructed from an enumerated physical slot.
+    known_slot: Option<(TableId, String, usize)>,
+    effect_events: usize,
+    effect_tags: String,
+    effect_args: BTreeMap<(EffectId, usize), String>,
+    effect_count: Term,
 }
 
 type LowerResult<T> = Result<T, Diagnostic>;
@@ -262,7 +331,7 @@ impl<'a> Encoding<'a> {
             program,
             transition,
             config,
-            script: Script::default(),
+            script: Script::with_budget(config.max_smt_bytes),
             pre: SymbolicState {
                 tables: Vec::new(),
                 aggregates: Vec::new(),
@@ -283,10 +352,20 @@ impl<'a> Encoding<'a> {
             panic: String::new(),
             liveness: String::new(),
             work: 0,
+            state_cells: cells,
+            known_slot: None,
+            effect_events: 0,
+            effect_tags: format!(
+                "((as const (Array (_ BitVec 64) (_ BitVec 64))) {})",
+                bv(0, 64)
+            ),
+            effect_args: BTreeMap::new(),
+            effect_count: Term::bits(bv(0, 64), 64),
         };
         for table in program.tables() {
             let mut rows = Vec::new();
             for slot in 0..table.capacity as usize {
+                this.check_script_budget(table.span)?;
                 let occupied = this.input(
                     &format!("pre_t{}_s{slot}_occupied", table.id.0),
                     Sort::Bool,
@@ -324,11 +403,12 @@ impl<'a> Encoding<'a> {
                 // An inverse map enforces distinct live values with one clause
                 // per row, avoiding quadratic pairwise inequality expansion.
                 let inverse = format!("pre_t{}_c{}_inverse", table.id.0, column.id.index);
-                this.script.declarations.push(format!(
+                this.script.declaration(format!(
                     "(declare-const {inverse} (Array {} (_ BitVec 64)))",
                     scalar_sort(&column.ty).smt()
                 ));
                 for (slot, row) in rows.iter().enumerate() {
+                    this.check_script_budget(column.span)?;
                     this.script.assert(implies(
                         &row.occupied.text,
                         &eq(
@@ -347,10 +427,18 @@ impl<'a> Encoding<'a> {
                     // the state schema, so this is precisely the live-row sum.
                     for row in &rows {
                         let value = &row.columns[column.id.index];
-                        total = format!(
-                            "(bvadd {total} {})",
-                            extend(&value.text, value.width(), width, column.ty.signed())
-                        );
+                        this.check_script_budget(column.span)?;
+                        total = this
+                            .script
+                            .bind(
+                                "sum_prefix",
+                                format!(
+                                    "(bvadd {total} {})",
+                                    extend(&value.text, value.width(), width, column.ty.signed())
+                                ),
+                                Sort::Bits(width),
+                            )
+                            .text;
                     }
                     Some(this.script.bind("aggregate", total, Sort::Bits(width)))
                 } else {
@@ -384,7 +472,39 @@ impl<'a> Encoding<'a> {
         this.safety = and([this.path.live.clone(), not(&and(postconditions))]);
         this.panic = this.path.trapped.clone();
         this.liveness = this.path.live.clone();
+        this.check_script_budget(transition.span)?;
+        // Reserve the wrapper and final obligation before constructing a query.
+        let predicate_bytes = [&this.safety, &this.panic, &this.liveness]
+            .into_iter()
+            .map(|value| value.len())
+            .max()
+            .unwrap_or(0);
+        if this
+            .script
+            .bytes()
+            .saturating_add(predicate_bytes)
+            .saturating_add(128)
+            > config.max_smt_bytes
+        {
+            return Err(diagnostic(
+                "D_VERIFY_RESOURCE",
+                "SMT query exceeds max_smt_bytes",
+                transition.span,
+            ));
+        }
         Ok(this)
+    }
+
+    fn check_script_budget(&self, span: Span) -> LowerResult<()> {
+        if self.script.exceeded() {
+            Err(diagnostic(
+                "D_VERIFY_RESOURCE",
+                "SMT encoding exceeds max_smt_bytes",
+                span,
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     fn input(&mut self, name: &str, kind: Sort, location: Location) -> Term {
@@ -464,7 +584,18 @@ impl<'a> Encoding<'a> {
         format!("(bvor {shifted} {})", bv(slot, 64))
     }
 
+    fn known_slot(&self, table: TableId, key: &str) -> Option<usize> {
+        self.known_slot
+            .as_ref()
+            .and_then(|(known_table, known_key, slot)| {
+                (*known_table == table && known_key == key).then_some(*slot)
+            })
+    }
+
     fn slot(&self, table: TableId, key: &str) -> String {
+        if let Some(slot) = self.known_slot(table, key) {
+            return bv(slot, 64);
+        }
         let bits = self.program.table(table).key_bits();
         if bits == 0 {
             bv(0, 64)
@@ -479,14 +610,19 @@ impl<'a> Encoding<'a> {
     fn read_column(&self, column: ColumnId, key: &str, snapshot: Snapshot) -> Term {
         let slot = self.slot(column.table, key);
         let rows = &self.pre.tables[column.table.0];
-        let mut value = rows[0].columns[column.index].clone();
-        for (index, row) in rows.iter().enumerate().skip(1).rev() {
-            value.text = ite(
-                &eq(&slot, &bv(index, 64)),
-                &row.columns[column.index].text,
-                &value.text,
-            );
-        }
+        let mut value = if let Some(index) = self.known_slot(column.table, key) {
+            rows[index].columns[column.index].clone()
+        } else {
+            let mut value = rows[0].columns[column.index].clone();
+            for (index, row) in rows.iter().enumerate().skip(1).rev() {
+                value.text = ite(
+                    &eq(&slot, &bv(index, 64)),
+                    &row.columns[column.index].text,
+                    &value.text,
+                );
+            }
+            value
+        };
         for write in self
             .state(snapshot)
             .writes
@@ -503,6 +639,15 @@ impl<'a> Encoding<'a> {
     }
 
     fn exists(&self, table: TableId, key: &str, snapshot: Snapshot) -> String {
+        if let Some(slot) = self.known_slot(table, key) {
+            let row = &self.state(snapshot).tables[table.0][slot];
+            // A known slot is not proof of existence: retain full generation
+            // equality and occupancy, including when an old snapshot is read.
+            return and([
+                row.occupied.text.clone(),
+                eq(key, &self.key(table, slot, &row.generation)),
+            ]);
+        }
         or(self.state(snapshot).tables[table.0]
             .iter()
             .enumerate()
@@ -556,22 +701,18 @@ impl<'a> Encoding<'a> {
     }
 
     fn expr(&mut self, id: ExprId) -> LowerResult<Term> {
-        self.work += 1;
-        // A resource error is explicit and fails closed rather than exhausting
-        // memory on an intentionally enormous specification fold.
-        if self.work
-            > self
-                .config
-                .max_state_cells
-                .saturating_mul(self.config.max_unroll as usize)
-                .max(100_000)
-        {
+        self.check_script_budget(self.program.expr(id).span)?;
+        if self.work >= self.config.max_expression_steps {
             return Err(diagnostic(
                 "D_VERIFY_RESOURCE",
-                "SMT expression expansion exceeded the configured resource budget",
+                format!(
+                    "SMT expression expansion exceeds max_expression_steps {}",
+                    self.config.max_expression_steps
+                ),
                 self.program.expr(id).span,
             ));
         }
+        self.work += 1;
         let expression = self.program.expr(id).clone();
         let direct = matches!(
             &expression.kind,
@@ -719,10 +860,69 @@ impl<'a> Encoding<'a> {
                 let input_domain = &self.program.expr(value).domain;
                 self.coerce(&input, domain, input_domain.signed())
             }
+            ExprKind::EffectCount => self.effect_count.clone(),
+            ExprKind::EffectIs { effect, index } => {
+                let index = self.expr(index)?;
+                Term::boolean(self.effect_hit(effect, &index))
+            }
+            ExprKind::EffectArg {
+                effect,
+                index,
+                parameter,
+            } => {
+                let index = self.expr(index)?;
+                let hit = self.effect_hit(effect, &index);
+                self.script.trap_if(&mut self.path, &not(&hit));
+                let parameter_type = &self.program.effect(effect).params[parameter].ty;
+                let element = scalar_sort(parameter_type);
+                let array = self
+                    .effect_args
+                    .get(&(effect, parameter))
+                    .cloned()
+                    .unwrap_or_else(|| Self::empty_effect_array(element));
+                let value = Term {
+                    text: format!(
+                        "(select {array} {})",
+                        truncate(&index.text, index.width(), 64)
+                    ),
+                    sort: element,
+                };
+                self.coerce(&value, domain, domain.signed())
+            }
             ExprKind::Fold(fold) => self.fold(&fold)?,
         };
         let value = self.coerce(&value, domain, domain.signed());
         Ok(if direct { value } else { self.bind(value) })
+    }
+
+    fn empty_effect_array(element: Sort) -> String {
+        let zero = if element == Sort::Bool {
+            "false".into()
+        } else {
+            bv(
+                0,
+                match element {
+                    Sort::Bits(w) => w,
+                    Sort::Bool => 1,
+                },
+            )
+        };
+        format!(
+            "((as const (Array (_ BitVec 64) {})) {zero})",
+            element.smt()
+        )
+    }
+
+    fn effect_hit(&self, effect: EffectId, index: &Term) -> String {
+        let key = truncate(&index.text, index.width(), 64);
+        and([
+            fits(&index.text, index.width(), 64, false),
+            cmp("lt", &key, &self.effect_count.text, false),
+            eq(
+                &format!("(select {} {key})", self.effect_tags),
+                &bv(effect.0 + 1, 64),
+            ),
+        ])
     }
 
     fn statements(&mut self, statements: &[Stmt]) -> LowerResult<()> {
@@ -777,12 +977,74 @@ impl<'a> Encoding<'a> {
                     fields,
                 } => self.allocate(*table, *binding, fields)?,
                 StmtKind::Emit { effect, args } => {
+                    if self.effect_events >= self.config.max_effect_events {
+                        return Err(diagnostic(
+                            "D_VERIFY_RESOURCE",
+                            "symbolic outbox exceeds max_effect_events",
+                            statement.span,
+                        ));
+                    }
+                    let mut values = Vec::new();
                     for (argument, parameter) in
                         args.iter().zip(&self.program.effect(*effect).params)
                     {
                         let value = self.expr(*argument)?;
-                        self.narrow(value, &parameter.ty);
+                        values.push(self.narrow(value, &parameter.ty));
                     }
+                    // Arguments may themselves emit. Check again at the actual
+                    // append boundary, not only on entry to the outer emit.
+                    if self.effect_events >= self.config.max_effect_events {
+                        return Err(diagnostic(
+                            "D_VERIFY_RESOURCE",
+                            "symbolic outbox exceeds max_effect_events",
+                            statement.span,
+                        ));
+                    }
+                    let active = self
+                        .script
+                        .bind(
+                            "effect_active",
+                            and([self.path.live.clone(), self.path.active.clone()]),
+                            Sort::Bool,
+                        )
+                        .text;
+                    let ordinal = self.effect_count.clone();
+                    let store = format!(
+                        "(store {} {} {})",
+                        self.effect_tags,
+                        ordinal.text,
+                        bv(effect.0 + 1, 64)
+                    );
+                    self.effect_tags = self.script.bind_array(
+                        "effect_tags",
+                        &ite(&active, &store, &self.effect_tags),
+                        Sort::Bits(64),
+                    );
+                    for (parameter, value) in values.into_iter().enumerate() {
+                        let previous = self
+                            .effect_args
+                            .get(&(*effect, parameter))
+                            .cloned()
+                            .unwrap_or_else(|| Self::empty_effect_array(value.sort));
+                        let store = format!("(store {previous} {} {})", ordinal.text, value.text);
+                        let next = self.script.bind_array(
+                            "effect_arg",
+                            &ite(&active, &store, &previous),
+                            value.sort,
+                        );
+                        self.effect_args.insert((*effect, parameter), next);
+                    }
+                    self.effect_count = self.script.bind(
+                        "effect_count",
+                        format!(
+                            "(bvadd {} {})",
+                            ordinal.text,
+                            ite(&active, &bv(1, 64), &bv(0, 64))
+                        ),
+                        Sort::Bits(64),
+                    );
+                    self.effect_events += 1;
+                    self.check_script_budget(statement.span)?;
                 }
                 StmtKind::Eval(value) => {
                     self.expr(*value)?;
@@ -1046,14 +1308,12 @@ impl<'a> Encoding<'a> {
                 };
                 let saved = self.env.get(&binding).cloned();
                 for (slot, row) in rows.iter().enumerate() {
-                    self.env.insert(
-                        binding,
-                        Term::bits(self.key(table, slot, &row.generation), 64),
-                    );
-                    conditions.push(implies(
-                        &row.occupied.text,
-                        &self.spec(invariant.condition, pre)?,
-                    ));
+                    let key = self.key(table, slot, &row.generation);
+                    self.env.insert(binding, Term::bits(key.clone(), 64));
+                    let saved_slot = self.known_slot.replace((table, key, slot));
+                    let condition = self.spec(invariant.condition, pre);
+                    self.known_slot = saved_slot;
+                    conditions.push(implies(&row.occupied.text, &condition?));
                 }
                 if let Some(saved) = saved {
                     self.env.insert(binding, saved);
@@ -1100,6 +1360,7 @@ fn row_local(
                 || (stable_occupancy.contains(target)
                     && row_local(program, *key, table, quantifier, stable_occupancy))
         }
+        ExprKind::EffectCount | ExprKind::EffectIs { .. } | ExprKind::EffectArg { .. } => false,
         ExprKind::UniqueLookup { .. }
         | ExprKind::Sum { .. }
         | ExprKind::KeyOf { .. }
@@ -1175,6 +1436,25 @@ fn model_term(model: &z3::Model, term: &Term) -> Result<Value, String> {
     }
 }
 
+fn model_equality(model: &z3::Model, term: &Term) -> Result<Bool, String> {
+    match term.sort {
+        Sort::Bool => {
+            let expression = Bool::new_const(term.text.as_str());
+            model
+                .eval(&expression, true)
+                .map(|value| expression.eq(&value))
+                .ok_or_else(|| format!("missing boolean model value {}", term.text))
+        }
+        Sort::Bits(width) => {
+            let expression = BV::new_const(term.text.as_str(), width);
+            model
+                .eval(&expression, true)
+                .map(|value| expression.eq(&value))
+                .ok_or_else(|| format!("missing bit-vector model value {}", term.text))
+        }
+    }
+}
+
 fn signed_value(value: Value, ty: &ScalarType) -> Value {
     match value {
         Value::Int(value)
@@ -1219,6 +1499,66 @@ fn project(encoding: &Encoding<'_>, model: &z3::Model) -> Result<Candidate, Stri
     Ok(Candidate { params, state })
 }
 
+fn failed_ensures(
+    program: &CheckedProgram,
+    transition: &Transition,
+    pre: &State,
+    current: &State,
+    bindings: &BTreeMap<BindingId, Value>,
+) -> Vec<FailedEnsure> {
+    transition
+        .ensures
+        .iter()
+        .filter_map(|ensure| {
+            let outcome = match eval_expression(program, current, pre, bindings, ensure.value) {
+                Ok(Value::Bool(true)) => return None,
+                Ok(value) => EnsureOutcome::Value { value },
+                Err(error) => EnsureOutcome::Error { error },
+            };
+            Some(FailedEnsure {
+                name: ensure.name.clone(),
+                span: program.expr(ensure.value).span,
+                outcome,
+            })
+        })
+        .collect()
+}
+
+fn emitted_effects(program: &CheckedProgram, pre: &State, current: &State) -> Vec<EmittedEffect> {
+    current
+        .outbox
+        .iter()
+        .skip(pre.outbox.len())
+        .enumerate()
+        .map(|(index, record)| {
+            let effect = program.effect(record.effect);
+            let arguments = effect
+                .params
+                .iter()
+                .zip(&record.args)
+                .map(|(parameter, value)| {
+                    let scalar_type = match &parameter.ty {
+                        ScalarType::Id64(table) => format!("id64<{}>", program.table(*table).name),
+                        ty => ty.to_string(),
+                    };
+                    (
+                        parameter.name.clone(),
+                        EffectArgument {
+                            scalar_type,
+                            value: value.to_json(&parameter.ty),
+                        },
+                    )
+                })
+                .collect();
+            EmittedEffect {
+                index,
+                effect: effect.name.clone(),
+                arguments,
+            }
+        })
+        .collect()
+}
+
 /// Evaluate specifications independently of the encoder, including each live
 /// quantified row and the actual post-state rather than a model's claim.
 fn violated_postconditions(
@@ -1227,15 +1567,12 @@ fn violated_postconditions(
     pre: &State,
     current: &State,
     bindings: &BTreeMap<BindingId, Value>,
-) -> Vec<String> {
-    let mut violated = Vec::new();
-    for ensure in &transition.ensures {
-        if eval_expression(program, current, pre, bindings, ensure.value).ok()
-            != Some(Value::Bool(true))
-        {
-            violated.push(format!("ensure {}", ensure.name));
-        }
-    }
+) -> (Vec<String>, Vec<FailedEnsure>) {
+    let failed_ensures = failed_ensures(program, transition, pre, current, bindings);
+    let mut violated = failed_ensures
+        .iter()
+        .map(|ensure| format!("ensure {}", ensure.name))
+        .collect::<Vec<_>>();
     for invariant in program.invariants() {
         if let Some((table, binding)) = invariant.quantifier {
             let table_info = program.table(table);
@@ -1264,7 +1601,7 @@ fn violated_postconditions(
             violated.push(format!("invariant {}", invariant.name));
         }
     }
-    violated
+    (violated, failed_ensures)
 }
 
 fn replay(
@@ -1275,6 +1612,7 @@ fn replay(
     let mut machine = Machine::with_state(encoding.program, candidate.state.clone())
         .map_err(|error| format!("native state admission: {}", error.code))?;
     let execution = machine.execute(&encoding.transition.name, &candidate.params, true);
+    let mut ensure_failures = Vec::new();
     let (trace, violated, law, directive, failure) = match (obligation, execution) {
         (Obligation::Panic, Err(error)) if error.kind == FailureKind::Trap => {
             let law = format!("reachable trap {}", error.code);
@@ -1297,7 +1635,7 @@ fn replay(
             return Err("symbolic trap candidate commits during native replay".into())
         }
         (Obligation::Safety, Ok(execution)) => {
-            let violated = violated_postconditions(
+            let (violated, details) = violated_postconditions(
                 encoding.program,
                 encoding.transition,
                 &candidate.state,
@@ -1309,8 +1647,9 @@ fn replay(
                     "symbolic postcondition failure is not reproduced by native replay".into(),
                 );
             }
+            ensure_failures = details;
             let law = violated[0].clone();
-            (execution.trace, violated, law, "Strengthen the transition's guards or state updates so every committed execution preserves this law.".to_string(), None)
+            (execution.trace, violated, law, "Correct the transition to satisfy the declared law; for effect contracts, check emission count, type, order and payload.".to_string(), None)
         }
         (Obligation::Safety, Err(error)) => {
             return Err(format!(
@@ -1318,13 +1657,22 @@ fn replay(
                 error.code
             ))
         }
-        (Obligation::Liveness, Ok(execution)) => (
-            execution.trace,
-            Vec::new(),
-            "concrete committing execution".into(),
-            String::new(),
-            None,
-        ),
+        (Obligation::Liveness, Ok(execution)) => {
+            ensure_failures = failed_ensures(
+                encoding.program,
+                encoding.transition,
+                &candidate.state,
+                &machine.state,
+                &execution.bindings,
+            );
+            (
+                execution.trace,
+                Vec::new(),
+                "concrete committing execution".into(),
+                String::new(),
+                None,
+            )
+        }
         (Obligation::Liveness, Err(error)) => {
             return Err(format!(
                 "symbolic committing candidate reverts during native replay: {}",
@@ -1341,6 +1689,8 @@ fn replay(
         trace,
         failure,
         violated,
+        emitted_effects: emitted_effects(encoding.program, &candidate.state, &machine.state),
+        failed_ensures: ensure_failures,
         directive,
     })
 }
@@ -1356,6 +1706,8 @@ fn solve(
     let mut last_spurious = None;
     let result = catch_unwind(AssertUnwindSafe(|| {
         let mut blocks = Vec::new();
+        let solver = Solver::new();
+        solver.from_string(base_script.clone());
         let mut params = z3::Params::new();
         for attempt in 0..encoding.config.witness_attempts.max(1) {
             let remaining = u128::from(encoding.config.timeout_ms)
@@ -1363,10 +1715,7 @@ fn solve(
             if remaining == 0 {
                 return ("unknown", Some("verification timeout".into()), None);
             }
-            let solver = Solver::new();
-            let candidate_script = base_script.clone() + &blocks.join("\n");
-            solver.from_string(candidate_script.clone());
-            exported_script = candidate_script + "\n(check-sat)\n";
+            exported_script = base_script.clone() + &blocks.join("\n") + "\n(check-sat)\n";
             params.set_u32("timeout", remaining.min(u128::from(u32::MAX)) as u32);
             solver.set_params(&params);
             match solver.check() {
@@ -1427,7 +1776,29 @@ fn solve(
                         Err(reason) => return ("unknown", Some(reason), None),
                     };
                     let blocked = not(&and(equalities));
-                    blocks.push(format!("(assert {blocked})"));
+                    let clause = format!("(assert {blocked})");
+                    let next_bytes = exported_script
+                        .len()
+                        .saturating_add(clause.len())
+                        .saturating_add(1);
+                    if next_bytes > encoding.config.max_smt_bytes {
+                        return (
+                            "unknown",
+                            Some("witness search exceeds max_smt_bytes".into()),
+                            None,
+                        );
+                    }
+                    let native_equalities = encoding
+                        .projections
+                        .iter()
+                        .map(|variable| model_equality(&model, &variable.term))
+                        .collect::<Result<Vec<_>, _>>();
+                    let native_equalities = match native_equalities {
+                        Ok(equalities) => equalities,
+                        Err(reason) => return ("unknown", Some(reason), None),
+                    };
+                    solver.assert(Bool::and(&native_equalities).not());
+                    blocks.push(clause);
                 }
             }
         }
@@ -1460,10 +1831,12 @@ fn solve(
     )
 }
 
-fn failed(transition: &str, diagnostic: Diagnostic) -> VerificationResult {
+fn failed(transition: &str, diagnostic: Diagnostic, config: &VerifierConfig) -> VerificationResult {
     let reason = Some(diagnostic.message.clone());
     VerificationResult {
         transition: transition.into(),
+        config: config.clone(),
+        encoding_metrics: None,
         safety: ObligationResult::new(Obligation::Safety.name(), "error", 0.0, reason.clone()),
         panic: ObligationResult::new(Obligation::Panic.name(), "error", 0.0, reason.clone()),
         liveness: ObligationResult::new(Obligation::Liveness.name(), "error", 0.0, reason),
@@ -1491,11 +1864,12 @@ pub fn verify_transition(
                 format!("unknown transition {name:?}"),
                 Span::default(),
             ),
+            config,
         );
     };
     let encoding = match Encoding::new(program, program.transition(id), config) {
         Ok(encoding) => encoding,
-        Err(diagnostic) => return failed(name, diagnostic),
+        Err(diagnostic) => return failed(name, diagnostic, config),
     };
     let (safety, smt_safety, safety_witness) = solve(&encoding, Obligation::Safety);
     let (panic, smt_panic, panic_witness) = solve(&encoding, Obligation::Panic);
@@ -1513,8 +1887,21 @@ pub fn verify_transition(
             ));
         }
     }
+    let encoding_metrics = Some(EncodingMetrics {
+        state_cells: encoding.state_cells,
+        expression_steps: encoding.work,
+        effect_events: encoding.effect_events,
+        retained_smt_bytes: encoding.script.bytes(),
+        max_query_bytes: [&smt_safety, &smt_panic, &smt_liveness]
+            .into_iter()
+            .map(|query| query.len())
+            .max()
+            .unwrap_or(0),
+    });
     VerificationResult {
         transition: name.into(),
+        config: config.clone(),
+        encoding_metrics,
         safety,
         panic,
         liveness,
