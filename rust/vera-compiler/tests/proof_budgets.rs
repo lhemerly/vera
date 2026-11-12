@@ -37,8 +37,8 @@ fn expression_budget_is_explicit_and_independent_of_state_budget() {
             verify(
                 PURE,
                 &VerifierConfig {
-                    max_expression_steps: 1,
-                    max_state_cells: state_limit,
+                    max_expression_steps: Some(1),
+                    max_state_cells: Some(state_limit),
                     ..VerifierConfig::default()
                 },
             ),
@@ -48,8 +48,8 @@ fn expression_budget_is_explicit_and_independent_of_state_budget() {
     let result = verify(
         PURE,
         &VerifierConfig {
-            max_expression_steps: 32,
-            max_state_cells: 0,
+            max_expression_steps: Some(32),
+            max_state_cells: Some(0),
             ..VerifierConfig::default()
         },
     );
@@ -63,7 +63,7 @@ fn zero_and_small_script_budgets_fail_closed() {
             verify(
                 PURE,
                 &VerifierConfig {
-                    max_smt_bytes,
+                    max_smt_bytes: Some(max_smt_bytes),
                     ..VerifierConfig::default()
                 },
             ),
@@ -73,7 +73,7 @@ fn zero_and_small_script_budgets_fail_closed() {
     let result = verify(
         PURE,
         &VerifierConfig {
-            max_smt_bytes: 4096,
+            max_smt_bytes: Some(4096),
             ..VerifierConfig::default()
         },
     );
@@ -90,7 +90,7 @@ fn exhausted_budget_does_not_hide_a_real_violation() {
         verify(
             &source,
             &VerifierConfig {
-                max_expression_steps: 1,
+                max_expression_steps: Some(1),
                 ..VerifierConfig::default()
             },
         ),
@@ -108,7 +108,7 @@ fn bounded_folds_charge_actual_symbolic_expansion() {
         verify(
             source,
             &VerifierConfig {
-                max_expression_steps: 16,
+                max_expression_steps: Some(16),
                 ..VerifierConfig::default()
             },
         ),
@@ -117,7 +117,7 @@ fn bounded_folds_charge_actual_symbolic_expansion() {
     let result = verify(
         source,
         &VerifierConfig {
-            max_expression_steps: 256,
+            max_expression_steps: Some(256),
             ..VerifierConfig::default()
         },
     );
@@ -180,10 +180,10 @@ fn cli_accepts_and_enforces_independent_proof_budget_options() {
 fn json_reports_effective_limits_and_observed_encoding_sizes() {
     let source = "table T capacity 8 {key id:id64<T>;col v:u8;} effect E(v:u8); transition go() reads [] writes [] ensure count:eq(effect_count(),2); body {emit E(1);emit E(2);commit;}";
     let config = VerifierConfig {
-        max_state_cells: 24,
-        max_expression_steps: 256,
-        max_smt_bytes: 8192,
-        max_effect_events: 2,
+        max_state_cells: Some(24),
+        max_expression_steps: Some(256),
+        max_smt_bytes: Some(8192),
+        max_effect_events: Some(2),
         ..VerifierConfig::default()
     };
     let result = verify(source, &config);
@@ -194,9 +194,9 @@ fn json_reports_effective_limits_and_observed_encoding_sizes() {
     assert_eq!(metrics.state_cells, 24);
     assert_eq!(metrics.effect_events, 2);
     assert!(metrics.expression_steps > 0);
-    assert!(metrics.expression_steps <= config.max_expression_steps);
+    assert!(metrics.expression_steps <= config.max_expression_steps.unwrap());
     assert!(metrics.retained_smt_bytes <= metrics.max_query_bytes);
-    assert!(metrics.max_query_bytes <= config.max_smt_bytes);
+    assert!(metrics.max_query_bytes <= config.max_smt_bytes.unwrap());
     assert_eq!(
         metrics.max_query_bytes,
         [&result.smt_safety, &result.smt_panic, &result.smt_liveness]
@@ -214,7 +214,7 @@ fn failed_encoding_reports_limits_without_shrinking_declared_capacity() {
     let source = "table T capacity 8 {key id:id64<T>;col v:u8;} transition go() reads [] writes [] body {commit;}";
     let program = analyze(parse_source(source).unwrap()).unwrap();
     let mut config = VerifierConfig {
-        max_state_cells: 23,
+        max_state_cells: Some(23),
         ..VerifierConfig::default()
     };
     let result = verify_transition(&program, "go", &config);
@@ -228,7 +228,7 @@ fn failed_encoding_reports_limits_without_shrinking_declared_capacity() {
         .iter()
         .any(|d| d.message.contains("requires 24 cells")));
     assert_eq!(program.tables()[0].capacity, 8);
-    config.max_state_cells = 24;
+    config.max_state_cells = Some(24);
     let result = verify_transition(&program, "go", &config);
     assert!(result.ok(), "{}", result.summary());
     assert_eq!(result.encoding_metrics.unwrap().state_cells, 24);
@@ -239,15 +239,51 @@ fn failed_encoding_reports_limits_without_shrinking_declared_capacity() {
 fn unknown_transition_preserves_configuration_without_metrics() {
     let program = analyze(parse_source(PURE).unwrap()).unwrap();
     let config = VerifierConfig {
-        max_smt_bytes: 12345,
+        max_smt_bytes: Some(12345),
         ..VerifierConfig::default()
     };
     let result = verify_transition(&program, "missing", &config);
     assert!(!result.ok());
     assert!(result.encoding_metrics.is_none());
-    assert_eq!(result.config.max_smt_bytes, 12345);
+    assert_eq!(result.config.max_smt_bytes, Some(12345));
     assert_eq!(
         serde_json::to_value(&result).unwrap()["config"],
         serde_json::to_value(&config).unwrap()
+    );
+}
+
+#[test]
+fn default_configuration_has_no_policy_limits_or_solver_timeout() {
+    let config = VerifierConfig::default();
+    let json = serde_json::to_value(&config).unwrap();
+    assert!(json
+        .as_object()
+        .unwrap()
+        .values()
+        .all(serde_json::Value::is_null));
+    let result = verify(PURE, &config);
+    assert!(result.ok(), "{}", result.summary());
+    for script in [&result.smt_safety, &result.smt_panic, &result.smt_liveness] {
+        assert!(
+            !script.contains(":timeout"),
+            "default solver must have no timeout option"
+        );
+        assert!(
+            !script.contains(":rlimit"),
+            "default solver must have no resource option"
+        );
+    }
+}
+
+#[test]
+fn default_verification_accepts_a_model_above_the_removed_cell_cap() {
+    let source = "table T capacity 2048 {key id:id64<T>;col v:u8;} transition go() reads [] writes [] body {commit;}";
+    let result = verify(source, &VerifierConfig::default());
+    assert!(result.ok(), "{}", result.summary());
+    assert_eq!(result.encoding_metrics.unwrap().state_cells, 6144);
+    assert!(result.config.max_state_cells.is_none());
+    assert_eq!(
+        result.witness.unwrap().pre_state.tables[0].occupied.len(),
+        2048
     );
 }

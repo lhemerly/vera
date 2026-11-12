@@ -113,7 +113,8 @@ rustc --edition 2021 --crate-type lib counter.rs
 | Values | Booleans, fixed-width integers, exact fixed-point decimals, symbols, bytes32, enums |
 | Specifications | Row/global invariants, preconditions, postconditions, old-state values |
 | Transactions | Checked reads and writes, allocation, guards, atomic commit, typed effects |
-| Folds | Inclusive bounded iteration with scoped accumulator and index bindings |
+| Folds | Inclusive declared-bounded iteration with scoped accumulator and index bindings |
+| Functions | Pure scalar helpers with independently verified reusable contracts |
 | Projections | Authorized state slices and available intents with parameter hints |
 | Persistence | Typed intent logs, checksummed snapshots, deterministic replay |
 
@@ -135,7 +136,9 @@ A timeout, resource limit, or unknown solver result rejects verification.
 [Effect contracts](docs/EFFECT_CONTRACTS.md) also verify emitted count, order,
 variant and payload; try [the effect counter](examples/effect_counter.vera).
 [Proof budgets](docs/PROOF_BUDGETS.md) expose independent
-limits without shrinking declared state.
+opt-in controls without shrinking declared state. No proof timeout or resource
+ceiling is imposed by default. [Pure functions](docs/COMPOSITIONAL_FUNCTIONS.md)
+reuse verified summaries rather than inlining callee bodies into caller proofs.
 
 ## Explore a program
 

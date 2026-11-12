@@ -1,0 +1,25 @@
+module VerifiedFunctions;
+
+function increment(x : u64) -> u64
+  require room : lt(x, 1000);
+  ensure exact : eq(result, add(x, 1));
+  body { yield add(x, 1); }
+
+function twice_increment(x : u64) -> u64
+  require room : lt(x, 999);
+  ensure exact : eq(result, add(x, 2));
+  body { yield increment(increment(x)); }
+
+effect Increased(before : u64, after : u64);
+transition increase_twice(value : u64)
+  reads [] writes []
+  require room : lt(value, 999);
+  ensure count : eq(effect_count(), 1);
+  ensure kind : effect_is(Increased, 0);
+  ensure before : eq(effect_arg(Increased, 0, before), value);
+  ensure after : eq(effect_arg(Increased, 0, after), add(value, 2));
+  body {
+    let %after : u64 = twice_increment(value);
+    emit Increased(value, %after);
+    commit;
+  }

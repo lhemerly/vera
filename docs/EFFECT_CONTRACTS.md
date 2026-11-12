@@ -84,8 +84,9 @@ expression expansion have independent limits. Exhaustion fails closed.
 GPU furnaces allocate exact transaction-local buffers only for transitions with
 effect observations. They retain the existing digest for ordinary effect
 tracking. Tag and payload bounds are calculated without expanding folds, with
-per-transition payload stride. A buffer exceeding 4096 tag/payload cells is an
-explicit `D_GPU_RESOURCE` generation error, not a truncated model.
+per-transition payload stride. There is no fixed tag/payload-cell policy ceiling. Actual target 32-bit index
+representability is checked explicitly; target compilation and host/device memory
+can still fail. No model is silently truncated.
 
 The interpreter, verifier replay, native fuzzing, and GPU furnaces evaluate the
 same effect observations. Generated Rust additionally exposes:
@@ -124,13 +125,14 @@ Structural scaling tests double fixed emission bounds from 8 through 64 while
 querying a symbolic position and verify linear retained SMT growth. A separate
 8-iteration symbolic-length contract checks every payload. This is not a claim
 of linear solver runtime: a 32-iteration symbolic-length/all-payload proof was
-observed to hit the default 10-second timeout. It correctly remained unverified.
+observed to hit an explicitly configured 10-second timeout. There is now no
+default timeout. It correctly remained unverified.
 Arbitrary cross-row, nonlinear, or heavily nested specifications can still be
 expensive. See [proof budgets](PROOF_BUDGETS.md).
 
-General named record values, user-defined tagged payload unions, modular verified
-function calls, variable-length bounded bytes and source-language codec primitives
-are **not implemented by this increment**. Existing distinct effect declarations
+General named record values, user-defined tagged payload unions,
+variable-length bounded bytes and source-language codec primitives are
+**not implemented**. Pure scalar modular verified functions are now implemented
+as a separate compositional feature. Existing distinct effect declarations
 provide typed outbox variants, not general-purpose structured values.
-[Compositional functions](COMPOSITIONAL_FUNCTIONS.md) records the proposed next
-increment and its required soundness and scaling boundaries.
+[Compositional functions](COMPOSITIONAL_FUNCTIONS.md) describes the implemented feature and its soundness and scaling boundaries.

@@ -227,3 +227,16 @@ atomicAdd(&output.violations,first);atomicAdd(&output.committed,second);atomicAd
         [1, 1, 0, 4],
     );
 }
+
+#[test]
+fn wgsl_compositional_function_helpers_execute_success_and_failure() {
+    expect(
+        include_str!("fixtures/functions.vera"),
+        r#"@compute @workgroup_size(1) fn probe(){var ctx:Ctx;vera_init(&ctx);
+let payload=v_make(1u,2u,3u,4u,5u,6u,7u,8u);
+let first=transition_v_run(&ctx,v_small(3u),payload);let second=transition_v_lazy(&ctx);let bad=transition_v_bad_pre(&ctx);
+atomicAdd(&output.violations,first);atomicAdd(&output.committed,second);atomicAdd(&output.reverted,bad);atomicAdd(&output.effects,ctx.s.effect_count);}"#,
+        "probe",
+        [1, 1, 3, 2],
+    );
+}

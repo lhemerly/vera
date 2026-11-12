@@ -515,18 +515,16 @@ fn gpu_effect_contracts_reject_wrong_payload_order_and_invalid_access() {
 }
 
 #[test]
-fn gpu_effect_buffers_are_bounded_and_do_not_grow_for_unrelated_transitions() {
+fn gpu_effect_buffers_follow_declared_bounds_without_arbitrary_policy_caps() {
     let large_body = "let %x:u64=fold_bounded<1024>(acc:u64=0,i in [0..1023]){emit A(0,0,0,0);yield acc;};commit;";
     let declarations = "effect A(a:u64,b:u64,c:u64,d:u64);";
-    let too_large = format!("{declarations}transition go() reads [] writes [] ensure e:and(eq(effect_count(),1024),eq(effect_arg(A,0,d),0));body {{{large_body}}}");
+    let larger_contract = format!("{declarations}transition go() reads [] writes [] ensure e:and(eq(effect_count(),1024),eq(effect_arg(A,0,d),0));body {{{large_body}}}");
     for target in [
         vera_compiler::codegen_gpu::GpuTarget::Glsl,
         vera_compiler::codegen_gpu::GpuTarget::Wgsl,
         vera_compiler::codegen_gpu::GpuTarget::Cuda,
     ] {
-        let error =
-            vera_compiler::codegen_gpu::generate_gpu(&checked(&too_large), target, 2).unwrap_err();
-        assert_eq!(error.code, "D_GPU_RESOURCE");
+        vera_compiler::codegen_gpu::generate_gpu(&checked(&larger_contract), target, 2).unwrap();
     }
     let separate = format!("{declarations}transition large() reads [] writes [] body {{{large_body}}}transition small() reads [] writes [] ensure e:eq(effect_count(),1);body {{emit A(1,2,3,4);commit;}}");
     let code = generate_cuda(&checked(&separate), 2).unwrap();
@@ -564,5 +562,50 @@ fn gpu_effect_contract_storage_covers_payload_queries_nested_in_indices() {
     run_cpp(
         "effect A(v:u64);transition go() reads [] writes [] ensure e:effect_is(A,effect_arg(A,1,v));body {emit A(0);emit A(0);commit;}",
         "Ctx ctx{};vera_init(&ctx);assert(transition_v_go(&ctx)==1u);",
+    );
+}
+
+#[test]
+fn compositional_gpu_function_helpers_preserve_values_failure_and_argument_order() {
+    let source = include_str!("fixtures/functions.vera");
+    run_cpp(
+        source,
+        r#"
+Ctx ctx{};vera_init(&ctx);V payload=v_make(1u,2u,3u,4u,5u,6u,7u,8u);
+assert(transition_v_run(&ctx,v_small(3u),payload)==1u);
+assert(ctx.s.effect_count==1u);
+assert(transition_v_lazy(&ctx)==1u);
+assert(transition_v_bad_pre(&ctx)==3u);assert(ctx.s.effect_count==2u);
+assert(transition_v_bad_arithmetic(&ctx)==3u);
+assert(transition_v_ordered_requires(&ctx,v_small(255u))==3u);
+assert(transition_v_ordered_requires(&ctx,v_zero())==3u);
+assert(transition_v_argument_order(&ctx)==1u);assert(ctx.s.effect_count==5u);
+"#,
+    );
+    let program = checked(source);
+    let cuda = generate_cuda(&program, 2).unwrap();
+    assert_eq!(
+        cuda.matches("__device__ inline R vera_function_").count(),
+        program.functions().len()
+    );
+    let code = generate_wgsl(&program, 2).unwrap();
+    let module = naga::front::wgsl::parse_str(&code)
+        .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&code)));
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+#[test]
+fn gpu_scalar_function_boundaries_narrow_arguments_and_promote_results() {
+    run_cpp(
+        include_str!("fixtures/function_aggregate.vera"),
+        r#"
+Ctx ctx{};vera_init(&ctx);assert(transition_v_init(&ctx)==1u);
+assert(transition_v_round(&ctx)==3u);assert(transition_v_promoted(&ctx)==1u);
+"#,
     );
 }

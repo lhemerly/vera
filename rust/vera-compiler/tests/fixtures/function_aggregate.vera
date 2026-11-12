@@ -1,0 +1,9 @@
+function identity(x:u64)->u64 body {yield x;}
+table T capacity 2 {key id:id64<T>;col v:u64 [tracked_sum];}
+transition init() reads [] writes [T[*].v]
+body {let %a:id64<T>=table_alloc(T,{v:18446744073709551615});let %b:id64<T>=table_alloc(T,{v:1});commit;}
+transition round() reads [T[*].v] writes []
+body {let %v:u64=identity(sum(T.v));commit;}
+transition promoted() reads [] writes []
+ensure total:eq(add(identity(1),sum(T.v)),add(sum(T.v),1));
+body {commit;}

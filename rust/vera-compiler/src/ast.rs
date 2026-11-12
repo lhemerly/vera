@@ -55,6 +55,7 @@ node_enum!(Decl {
     Projection(ProjectionDecl),
     Effect(EffectDecl),
     Transition(TransitionDecl),
+    Function(FunctionDecl),
 });
 
 #[derive(Clone, Debug)]
@@ -178,6 +179,7 @@ node_enum!(Expr {
     SumAgg(SumAgg),
     KeyOf(KeyOf),
     Fold(Box<Fold>),
+    Call(Call),
     EffectCount(EffectCount),
     EffectIs(EffectIs),
     EffectArg(EffectArg),
@@ -200,6 +202,7 @@ impl Expr {
             Self::SumAgg(v) => v.span,
             Self::KeyOf(v) => v.span,
             Self::Fold(v) => v.span,
+            Self::Call(v) => v.span,
             Self::EffectCount(v) => v.span,
             Self::EffectIs(v) => v.span,
             Self::EffectArg(v) => v.span,
@@ -428,3 +431,22 @@ pub struct EffectArg {
     pub span: Span,
 }
 serialize_node!(EffectArg, "EffectArg", effect => "effect", index => "index", parameter => "parameter");
+
+#[derive(Clone, Debug)]
+pub struct FunctionDecl {
+    pub name: String,
+    pub params: Vec<Param>,
+    pub result_type: TypeRef,
+    pub requires: Vec<(String, Expr)>,
+    pub ensures: Vec<(String, Expr)>,
+    pub body: Expr,
+    pub span: Span,
+}
+serialize_node!(FunctionDecl, "FunctionDecl", name => "name", params => "params", result_type => "result_type", requires => "requires", ensures => "ensures", body => "body");
+#[derive(Clone, Debug)]
+pub struct Call {
+    pub function: String,
+    pub args: Vec<Expr>,
+    pub span: Span,
+}
+serialize_node!(Call, "Call", function => "function", args => "args");

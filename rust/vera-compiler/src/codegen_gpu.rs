@@ -358,6 +358,9 @@ pub fn generate_cuda(program: &CheckedProgram, depth: u32) -> Result<String, Dia
 fn expression_emissions(program: &CheckedProgram, id: ExprId) -> usize {
     let child = |id| expression_emissions(program, id);
     match &program.expr(id).kind {
+        ExprKind::Call { args, .. } => args
+            .iter()
+            .fold(0usize, |sum, id| sum.saturating_add(child(*id))),
         ExprKind::Unary { operand, .. } => child(*operand),
         ExprKind::Binary { left, right, .. } => child(*left).saturating_add(child(*right)),
         ExprKind::Select { condition, yes, no } => child(*condition)
@@ -411,6 +414,7 @@ fn effect_stride(program: &CheckedProgram, id: ExprId) -> Option<usize> {
         ExprKind::EffectArg {
             parameter, index, ..
         } => Some(parameter + 1).max(child(*index)),
+        ExprKind::Call { args, .. } => args.iter().filter_map(|id| child(*id)).max(),
         ExprKind::Unary { operand, .. } => child(*operand),
         ExprKind::Binary { left, right, .. } => child(*left).max(child(*right)),
         ExprKind::Select { condition, yes, no } => {
@@ -459,6 +463,7 @@ struct Generator<'a> {
     effect_storage: Option<(usize, usize)>,
     record_effects: bool,
     effect_stride: usize,
+    scalar_function: bool,
 }
 
 impl<'a> Generator<'a> {
@@ -490,6 +495,7 @@ impl<'a> Generator<'a> {
             effect_storage: None,
             record_effects: false,
             effect_stride: 0,
+            scalar_function: false,
         };
         for table in program.tables() {
             if table.key_bits() >= 32 {
@@ -561,10 +567,10 @@ impl<'a> Generator<'a> {
             }
             // This is transaction-local storage, not a finite approximation of
             // the persistent outbox. Refuse an oversized exact model explicitly.
-            if slots.saturating_add(payloads) > 4096 {
+            if slots > u32::MAX as usize || payloads > u32::MAX as usize {
                 return Err(error(
                     "D_GPU_RESOURCE",
-                    "effect contract buffer exceeds 4096 tag/payload cells",
+                    "effect contract buffers exceed GPU 32-bit indexing",
                     Span::default(),
                 ));
             }
@@ -646,6 +652,9 @@ impl<'a> Generator<'a> {
             self.effect_storage,
         );
         self.table_helpers();
+        for function in self.program.functions() {
+            self.function(function);
+        }
         self.invariants();
         for transition in self.program.transitions() {
             self.transition(transition);
@@ -762,9 +771,46 @@ impl<'a> Generator<'a> {
         }
     }
 
+    fn failure_return(&self) -> &'static str {
+        if self.scalar_function {
+            "return v_result(v_zero(),false);"
+        } else {
+            "return false;"
+        }
+    }
+
+    fn function(&mut self, function: &crate::ir::Function) {
+        self.scalar_function = true;
+        let c = self.context();
+        let params = function
+            .params
+            .iter()
+            .map(|p| (format!("arg_{}", p.binding.0), "V".into()))
+            .collect::<Vec<_>>();
+        let env = function
+            .params
+            .iter()
+            .map(|p| (p.binding, format!("arg_{}", p.binding.0)))
+            .collect::<Environment>();
+        for parameter in &function.params {
+            self.narrow(&env[&parameter.binding], &parameter.ty);
+        }
+        for require in &function.requires {
+            let value = self.expression(require.value, &env);
+            self.push(format!(
+                "if(!v_truth({value})){{{c}.trap=1u;return v_result(v_zero(),false);}}"
+            ));
+        }
+        let result = self.typed_expression(function.body, &env, &function.result_type);
+        self.push(format!("return v_result({result},true);"));
+        self.finish_function(&format!("vera_function_{}", function.id.0), "R", params);
+        self.scalar_function = false;
+    }
+
     fn narrow(&mut self, value: &str, ty: &ScalarType) {
+        let failure = self.failure_return();
         self.push(format!(
-            "if(!({})){{{}.trap=1u;return false;}}",
+            "if(!({})){{{}.trap=1u;{failure}}}",
             Self::accepts(value, ty),
             self.context()
         ));
@@ -779,7 +825,27 @@ impl<'a> Generator<'a> {
     fn expression(&mut self, id: ExprId, env: &Environment) -> String {
         let expression = self.program.expr(id);
         let c = self.context();
+        let failure = self.failure_return();
         match &expression.kind {
+            ExprKind::Call { function, args } => {
+                let callee = self.program.function(*function);
+                let values = args
+                    .iter()
+                    .zip(&callee.params)
+                    .map(|(argument, parameter)| {
+                        self.typed_expression(*argument, env, &parameter.ty)
+                    })
+                    .collect::<Vec<_>>();
+                let suffix = if values.is_empty() {
+                    String::new()
+                } else {
+                    format!(",{}", values.join(","))
+                };
+                let result =
+                    self.temporary("R", format!("vera_function_{}(ctx{suffix})", function.0));
+                self.push(format!("if(!{result}.ok){{{c}.trap=1u;{failure}}}"));
+                self.temporary("V", format!("{result}.value"))
+            }
             ExprKind::Constant(value) => {
                 let value = match value {
                     Value::Bool(v) => BigInt::from(u8::from(*v)),
@@ -799,7 +865,7 @@ impl<'a> Generator<'a> {
                 // upon for out-of-range storage accesses on any shader target.
                 self.push(format!("if(v_ucmp({index},v_small({c}.emitted_count))==0u){{{found}=({c}.emitted_kind[{index}.w[0]]=={}u);}}", effect.0));
                 if let ExprKind::EffectArg { parameter, .. } = &expression.kind {
-                    self.push(format!("if(!{found}){{{c}.trap=1u;return false;}}"));
+                    self.push(format!("if(!{found}){{{c}.trap=1u;{failure}}}"));
                     let stride = self.effect_stride;
                     self.temporary(
                         "V",
@@ -830,7 +896,7 @@ impl<'a> Generator<'a> {
                 let key = self.expression(*key, env);
                 if matches!(&expression.kind, ExprKind::TableGet { .. }) {
                     self.push(format!(
-                        "if(!{}_exists(ctx,{key},{})){{{c}.trap=1u;return false;}}",
+                        "if(!{}_exists(ctx,{key},{})){{{c}.trap=1u;{failure}}}",
                         Self::table_name(column.table),
                         Self::flag(*state)
                     ));
@@ -870,7 +936,7 @@ impl<'a> Generator<'a> {
                 if *exists_only {
                     self.temporary("V", format!("v_bool({result}.ok)"))
                 } else {
-                    self.push(format!("if(!{result}.ok){{{c}.trap=1u;return false;}}"));
+                    self.push(format!("if(!{result}.ok){{{c}.trap=1u;{failure}}}"));
                     self.temporary("V", format!("{result}.value"))
                 }
             }
@@ -886,7 +952,7 @@ impl<'a> Generator<'a> {
                     UnaryOp::Not => self.temporary("V", format!("v_bool(!v_truth({operand}))")),
                     UnaryOp::Neg => {
                         let out = self.temporary("V", format!("v_neg({operand})"));
-                        self.push(format!("if(!v_fits({out},{}u,{}) || (v_negative({operand}) && v_eq({operand},{out}) && !v_eq({operand},v_zero()))){{{c}.trap=1u;return false;}}", expression.domain.width, Self::bool_text(expression.domain.signed())));
+                        self.push(format!("if(!v_fits({out},{}u,{}) || (v_negative({operand}) && v_eq({operand},{out}) && !v_eq({operand},v_zero()))){{{c}.trap=1u;{failure}}}", expression.domain.width, Self::bool_text(expression.domain.signed())));
                         out
                     }
                 }
@@ -954,7 +1020,7 @@ impl<'a> Generator<'a> {
                                 scale
                             ),
                         );
-                        self.push(format!("if(!{result}.ok){{{c}.trap=1u;return false;}}"));
+                        self.push(format!("if(!{result}.ok){{{c}.trap=1u;{failure}}}"));
                         self.temporary("V", format!("{result}.value"))
                     }
                 }
@@ -984,6 +1050,7 @@ impl<'a> Generator<'a> {
 
     fn statement(&mut self, statement: &Stmt, env: &mut Environment) {
         let c = self.context();
+        let failure = self.failure_return();
         match &statement.kind {
             StmtKind::Let { binding, value } => {
                 let ty = &self.program.binding(*binding).ty;
@@ -992,13 +1059,13 @@ impl<'a> Generator<'a> {
             }
             StmtKind::Guard { condition, .. } => {
                 let value = self.expression(*condition, env);
-                self.push(format!("if(!v_truth({value})){{return false;}}"));
+                self.push(format!("if(!v_truth({value})){{{failure}}}"));
             }
             StmtKind::TableSet { column, key, value } => {
                 let key = self.expression(*key, env);
                 let value = self.expression(*value, env);
                 self.push(format!(
-                    "if(!{}_exists(ctx,{key},false)){{{c}.trap=1u;return false;}}",
+                    "if(!{}_exists(ctx,{key},false)){{{c}.trap=1u;{failure}}}",
                     Self::table_name(column.table)
                 ));
                 self.narrow(&value, &self.program.column(*column).ty);
@@ -1036,7 +1103,7 @@ impl<'a> Generator<'a> {
                     "R",
                     format!("{}_alloc(ctx{suffix})", Self::table_name(*table)),
                 );
-                self.push(format!("if(!{result}.ok){{return false;}}"));
+                self.push(format!("if(!{result}.ok){{{failure}}}"));
                 let value = self.temporary("V", format!("{result}.value"));
                 env.insert(*binding, value);
             }
@@ -1053,7 +1120,7 @@ impl<'a> Generator<'a> {
                     let slots = self.effect_storage.expect("effect recording storage").0;
                     let stride = self.effect_stride;
                     self.push(format!(
-                        "if({c}.emitted_count>={slots}u){{{c}.trap=1u;return false;}}"
+                        "if({c}.emitted_count>={slots}u){{{c}.trap=1u;{failure}}}"
                     ));
                     self.push(format!(
                         "{c}.emitted_kind[{c}.emitted_count]={}u;",

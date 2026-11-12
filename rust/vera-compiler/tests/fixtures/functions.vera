@@ -1,0 +1,64 @@
+// Dependency order intentionally differs from declaration order.
+function composed(x:u64)->u64
+  require bounded:le(x,500);
+  ensure exact:eq(result,mul(x,4));
+  body {yield twice(twice(x));}
+function twice(x:u64)->u64
+  require bounded:le(x,1000);
+  ensure exact:eq(result,mul(x,2));
+  body {yield add(x,x);}
+function bytes_identity(x:bytes32)->bytes32
+  ensure exact:eq(result,x);
+  body {yield x;}
+function flip(x:bool)->bool
+  ensure exact:eq(result,not(x));
+  body {yield not(x);}
+function decimal_twice(x:dec64)->dec64
+  require low:ge(x,0);
+  require high:le(x,1000000000);
+  ensure exact:eq(result,mul(x,2.0));
+  body {yield mul(x,2.0);}
+function quotient(x:u64,y:u64)->u64
+  require nonzero:gt(y,0);
+  body {yield div(x,y);}
+function folded(n:u64)->u64
+  require bounded:le(n,3);
+  ensure exact:eq(result,add(n,1));
+  body {yield fold_bounded<4>(acc:u64=0,i in [0..n]){yield add(acc,1);};}
+function overflow(x:u8)->u8 body {yield add(x,1);}
+function ordered(x:u8)->bool
+  require first:gt(add(x,1),0);
+  require later:false;
+  body {yield true;}
+function same_tag(x:enum { First,Second })->enum { First,Second }
+  ensure exact:eq(result,x);
+  body {yield x;}
+function choose(a:u64,b:u64)->u64 body {yield a;}
+
+effect Values(n:u64,bytes:bytes32,flag:bool,decimal:dec64,count:u64,tag:enum { First,Second });
+effect Number(n:u64);
+transition run(n:u64,payload:bytes32) reads [] writes []
+  require range:le(n,3);
+  require function_call:eq(quotient(9,3),3);
+  ensure result:eq(effect_arg(Values,0,n),composed(n));
+  ensure values:and(eq(effect_arg(Values,0,bytes),payload),and(eq(effect_arg(Values,0,flag),true),and(eq(effect_arg(Values,0,decimal),300000000),and(eq(effect_arg(Values,0,count),add(n,1)),eq(effect_arg(Values,0,tag),Second)))));
+  body {emit Values(composed(n),bytes_identity(payload),flip(false),decimal_twice(1.5),folded(n),same_tag(Second));commit;}
+transition lazy() reads [] writes []
+  body {let %v:u64=select(false,quotient(1,0),7);emit Number(%v);commit;}
+transition bad_pre() reads [] writes []
+  body {emit Number(9);let %v:u64=quotient(1,0);commit;}
+transition bad_arithmetic() reads [] writes []
+  body {let %v:u8=overflow(255);commit;}
+transition ordered_requires(x:u8) reads [] writes []
+  body {let %v:bool=ordered(x);commit;}
+transition argument_order() reads [] writes []
+  ensure first:eq(effect_arg(Number,0,n),1);
+  ensure second:eq(effect_arg(Number,1,n),2);
+  ensure value:eq(effect_arg(Number,2,n),11);
+  body {
+    let %x:u64=choose(
+      fold_bounded<1>(acc:u64=0,i in [0..0]){emit Number(1);yield 11;},
+      fold_bounded<1>(acc:u64=0,i in [0..0]){emit Number(2);yield 22;}
+    );
+    emit Number(%x);commit;
+  }

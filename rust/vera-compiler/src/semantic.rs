@@ -76,6 +76,7 @@ struct Analyzer {
     table_names: BTreeMap<String, TableId>,
     effect_names: BTreeMap<String, EffectId>,
     transition_names: BTreeMap<String, TransitionId>,
+    function_names: BTreeMap<String, FunctionId>,
     stats: FoldStats,
 }
 
@@ -99,6 +100,7 @@ impl Analyzer {
             table_names: BTreeMap::new(),
             effect_names: BTreeMap::new(),
             transition_names: BTreeMap::new(),
+            function_names: BTreeMap::new(),
             stats: FoldStats::default(),
         }
     }
@@ -122,6 +124,7 @@ impl Analyzer {
                 self.transition_names.insert(transition.name.clone(), id);
             }
         }
+        self.functions(&declarations)?;
         let mut invariant_names = BTreeSet::new();
         for declaration in &declarations {
             if let a::Decl::Invariant(invariant) = declaration {
@@ -154,6 +157,188 @@ impl Analyzer {
             }
         }
         Ok(self.program)
+    }
+
+    fn functions(&mut self, declarations: &[a::Decl]) -> Result<()> {
+        let mut functions = BTreeMap::new();
+        for declaration in declarations {
+            if let a::Decl::Function(function) = declaration {
+                if functions.insert(function.name.clone(), function).is_some() {
+                    return Err(diagnostic(
+                        "D_DUPLICATE",
+                        format!("function {:?} declared twice", function.name),
+                        function.span,
+                    ));
+                }
+                if matches!(
+                    function.name.as_str(),
+                    "effect_count" | "effect_is" | "effect_arg"
+                ) {
+                    return Err(diagnostic(
+                        "D_FUNCTION_NAME",
+                        "function name conflicts with an effect observation",
+                        function.span,
+                    ));
+                }
+                if function.params.iter().any(|p| p.name == "result") {
+                    return Err(diagnostic(
+                        "D_DUPLICATE",
+                        "result is reserved for the function postcondition value",
+                        function.span,
+                    ));
+                }
+            }
+        }
+        let mut dependencies = BTreeMap::new();
+        for (name, function) in &functions {
+            for (_, expression) in function.requires.iter().chain(&function.ensures) {
+                function_expression_dependencies(expression, false, &mut BTreeSet::new())?;
+            }
+            let mut names = BTreeSet::new();
+            function_expression_dependencies(&function.body, true, &mut names)?;
+            for dependency in &names {
+                if !functions.contains_key(dependency) {
+                    return Err(diagnostic(
+                        "D_UNKNOWN_FUNCTION",
+                        format!("unknown function {dependency:?}"),
+                        function.span,
+                    ));
+                }
+            }
+            dependencies.insert(name.clone(), names);
+        }
+        // Kahn's algorithm keeps dependency resolution stack-safe and linear in
+        // graph edges, with deterministic lexical tie breaking.
+        let mut pending: BTreeMap<String, usize> = dependencies
+            .iter()
+            .map(|(name, deps)| (name.clone(), deps.len()))
+            .collect();
+        let mut users: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, deps) in &dependencies {
+            for dependency in deps {
+                users
+                    .entry(dependency.clone())
+                    .or_default()
+                    .push(name.clone());
+            }
+        }
+        let mut ready: BTreeSet<String> = pending
+            .iter()
+            .filter(|(_, count)| **count == 0)
+            .map(|(name, _)| name.clone())
+            .collect();
+        let mut ordered = Vec::new();
+        while let Some(name) = ready.pop_first() {
+            if let Some(callers) = users.get(&name) {
+                for caller in callers {
+                    let count = pending.get_mut(caller).expect("known function dependency");
+                    *count -= 1;
+                    if *count == 0 {
+                        ready.insert(caller.clone());
+                    }
+                }
+            }
+            ordered.push(name);
+        }
+        if ordered.len() != functions.len() {
+            let name = pending.iter().find(|(_, count)| **count != 0).unwrap().0;
+            return Err(diagnostic(
+                "D_FUNCTION_CYCLE",
+                format!("recursive function dependency involving {name:?}"),
+                functions[name].span,
+            ));
+        }
+        for name in ordered {
+            let function = functions[&name];
+            self.stats = FoldStats {
+                depth: 0,
+                product: 1,
+            };
+            let (params, scope) = self.parameters(&function.params)?;
+            let result_type = self.resolve_type(&function.result_type)?;
+            let mut requires = Vec::new();
+            let mut ensures = Vec::new();
+            let mut cost = 0;
+            let mut requirement_names = BTreeSet::new();
+            for (name, expression) in &function.requires {
+                if !requirement_names.insert(name) {
+                    return Err(diagnostic(
+                        "D_DUPLICATE",
+                        "function requirement declared twice",
+                        expression.span(),
+                    ));
+                }
+                let lowered = self.expression(
+                    expression,
+                    &scope,
+                    Some(Domain::scalar(ScalarType::Bool)),
+                    Context::specification(Snapshot::Current),
+                )?;
+                cost = add_cost(cost, lowered.cost, function.span)?;
+                requires.push(NamedExpr {
+                    name: name.clone(),
+                    value: lowered.id,
+                });
+            }
+            let body = self.expression(
+                &function.body,
+                &scope,
+                Some(Domain::scalar(result_type.clone())),
+                Context::specification(Snapshot::Current),
+            )?;
+            cost = add_cost(cost, body.cost, function.span)?;
+            let mut result_scope = scope;
+            let result = self.bind(
+                &mut result_scope,
+                "result",
+                result_type.clone(),
+                BindingOrigin::Local,
+                false,
+                function.span,
+            )?;
+            let mut ensure_names = BTreeSet::new();
+            for (name, expression) in &function.ensures {
+                if !ensure_names.insert(name) {
+                    return Err(diagnostic(
+                        "D_DUPLICATE",
+                        "function ensure declared twice",
+                        expression.span(),
+                    ));
+                }
+                let lowered = self.expression(
+                    expression,
+                    &result_scope,
+                    Some(Domain::scalar(ScalarType::Bool)),
+                    Context::specification(Snapshot::Current),
+                )?;
+                ensures.push(NamedExpr {
+                    name: name.clone(),
+                    value: lowered.id,
+                });
+            }
+            let id = FunctionId(self.program.functions.len());
+            let deps = dependencies[&name]
+                .iter()
+                .map(|name| self.function_names[name])
+                .collect();
+            self.program.functions.push(Function {
+                id,
+                name: name.clone(),
+                params,
+                result,
+                result_type,
+                requires,
+                ensures,
+                body: body.id,
+                dependencies: deps,
+                wcet_bound: cost,
+                fold_depth: self.stats.depth,
+                max_fold_product: self.stats.product,
+                span: function.span,
+            });
+            self.function_names.insert(name, id);
+        }
+        Ok(())
     }
 
     fn collect_tables(&mut self, declarations: &[a::Decl]) -> Result<()> {
@@ -1009,6 +1194,62 @@ impl Analyzer {
                     value.cost,
                 )
             }
+            a::Expr::Call(call) => {
+                let function = self
+                    .function_names
+                    .get(&call.function)
+                    .copied()
+                    .ok_or_else(|| {
+                        diagnostic(
+                            "D_UNKNOWN_FUNCTION",
+                            format!("unknown function {:?}", call.function),
+                            span,
+                        )
+                    })?;
+                let info = self.program.function(function).clone();
+                if call.args.len() != info.params.len() {
+                    return Err(diagnostic(
+                        "D_ARITY",
+                        "function argument count differs from its declaration",
+                        span,
+                    ));
+                }
+                let mut args = Vec::new();
+                let mut cost = add_cost(1, info.wcet_bound, span)?;
+                let mut dependent = false;
+                for (argument, parameter) in call.args.iter().zip(&info.params) {
+                    let value = self.expression(
+                        argument,
+                        scope,
+                        Some(Domain::scalar(parameter.ty.clone())),
+                        context,
+                    )?;
+                    cost = add_cost(cost, value.cost, span)?;
+                    dependent |= self.program.expr(value.id).state_dependent;
+                    args.push(value.id);
+                }
+                let product = context
+                    .fold_product
+                    .checked_mul(info.max_fold_product)
+                    .ok_or_else(|| {
+                        diagnostic(
+                            "D_FOLD_BOUND",
+                            "transitive function fold product exceeds u32 representation",
+                            span,
+                        )
+                    })?;
+                self.stats.product = self.stats.product.max(product);
+                self.stats.depth = self
+                    .stats
+                    .depth
+                    .max(context.fold_depth.saturating_add(info.fold_depth));
+                (
+                    Self::promote(Domain::scalar(info.result_type), expected.as_ref()),
+                    ExprKind::Call { function, args },
+                    dependent,
+                    cost,
+                )
+            }
             a::Expr::EffectCount(_) => {
                 if !context.outbox {
                     return Err(diagnostic(
@@ -1209,6 +1450,22 @@ impl Analyzer {
             ))),
             a::Expr::TableExists(_) | a::Expr::TableExistsUnique(_) => {
                 Some(Domain::scalar(ScalarType::Bool))
+            }
+            a::Expr::Call(call) => {
+                let function = self
+                    .function_names
+                    .get(&call.function)
+                    .copied()
+                    .ok_or_else(|| {
+                        diagnostic(
+                            "D_UNKNOWN_FUNCTION",
+                            format!("unknown function {:?}", call.function),
+                            call.span,
+                        )
+                    })?;
+                Some(Domain::scalar(
+                    self.program.function(function).result_type.clone(),
+                ))
             }
             a::Expr::EffectCount(_) => Some(Domain::scalar(ScalarType::U64)),
             a::Expr::EffectIs(_) => Some(Domain::scalar(ScalarType::Bool)),
@@ -1431,33 +1688,22 @@ impl Analyzer {
             .as_decimal()
             .parse::<u32>()
             .ok()
-            .filter(|bound| (1..=1024).contains(bound))
+            .filter(|bound| *bound > 0)
             .ok_or_else(|| {
                 diagnostic(
                     "D_FOLD_BOUND",
-                    "fold bound must be between 1 and 1024",
+                    "fold bound must be a positive u32",
                     fold.span,
                 )
             })?;
         let depth = context.fold_depth + 1;
-        if depth > 2 {
-            return Err(diagnostic(
-                "D_FOLD_DEPTH",
-                "fold nesting depth exceeds 2",
+        let product = context.fold_product.checked_mul(limit).ok_or_else(|| {
+            diagnostic(
+                "D_FOLD_BOUND",
+                "nested fold product exceeds u32 representation",
                 fold.span,
-            ));
-        }
-        let product = context
-            .fold_product
-            .checked_mul(limit)
-            .filter(|product| *product <= 1024)
-            .ok_or_else(|| {
-                diagnostic(
-                    "D_FOLD_BOUND",
-                    "nested fold product exceeds 1024",
-                    fold.span,
-                )
-            })?;
+            )
+        })?;
         self.stats.depth = self.stats.depth.max(depth);
         self.stats.product = self.stats.product.max(product);
         let inner_context = Context {
@@ -1783,6 +2029,10 @@ impl Analyzer {
                 .get(&variable.name)
                 .is_some_and(|id| self.program.binding(*id).state_dependent),
             a::Expr::Literal(_) => false,
+            a::Expr::Call(call) => call
+                .args
+                .iter()
+                .any(|arg| self.source_state_dependent(arg, scope)),
             a::Expr::Unary(unary) => self.source_state_dependent(&unary.operand, scope),
             a::Expr::Binary(binary) => {
                 self.source_state_dependent(&binary.left, scope)
@@ -1842,6 +2092,11 @@ impl Analyzer {
             ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
                 self.collect_reads(*index, reads, tier_two)
             }
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.collect_reads(*arg, reads, tier_two);
+                }
+            }
             ExprKind::Unary { operand, .. } => self.collect_reads(*operand, reads, tier_two),
             ExprKind::Binary { left, right, .. } => {
                 self.collect_reads(*left, reads, tier_two);
@@ -1884,6 +2139,11 @@ impl Analyzer {
             | ExprKind::EffectCount => {}
             ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
                 self.collect_expression_writes(*index, writes, tier_two)
+            }
+            ExprKind::Call { args, .. } => {
+                for arg in args {
+                    self.collect_expression_writes(*arg, writes, tier_two);
+                }
             }
             ExprKind::Unary { operand, .. } => {
                 self.collect_expression_writes(*operand, writes, tier_two)
@@ -1976,6 +2236,16 @@ impl Analyzer {
         }
         let eq = |left, right| self.same_expression(left, right, bindings);
         match (&left.kind, &right.kind) {
+            (
+                ExprKind::Call {
+                    function: a,
+                    args: x,
+                },
+                ExprKind::Call {
+                    function: b,
+                    args: y,
+                },
+            ) => a == b && x.len() == y.len() && x.iter().zip(y).all(|(x, y)| eq(*x, *y)),
             (ExprKind::Constant(a), ExprKind::Constant(b)) => a == b,
             (ExprKind::Binding(a), ExprKind::Binding(b)) => bindings.get(a).unwrap_or(a) == b,
             (ExprKind::Unary { op: a, operand: x }, ExprKind::Unary { op: b, operand: y }) => {
@@ -2169,5 +2439,64 @@ fn statement_span(statement: &a::Stmt) -> Span {
         a::Stmt::Emit(value) => value.span,
         a::Stmt::Yield(value) => value.span,
         a::Stmt::Commit(value) => value.span,
+    }
+}
+
+/// Reject effects and state observations before lowering a function. Contracts
+/// additionally reject calls, preventing hidden contract expansion/dependencies.
+fn function_expression_dependencies(
+    expression: &a::Expr,
+    calls: bool,
+    deps: &mut BTreeSet<String>,
+) -> Result<()> {
+    let mut child = |e: &a::Expr| function_expression_dependencies(e, calls, deps);
+    match expression {
+        a::Expr::Literal(_) | a::Expr::Var(_) => Ok(()),
+        a::Expr::Unary(v) => child(&v.operand),
+        a::Expr::Binary(v) => {
+            child(&v.left)?;
+            child(&v.right)
+        }
+        a::Expr::Select(v) => {
+            child(&v.cond)?;
+            child(&v.a)?;
+            child(&v.b)
+        }
+        a::Expr::KeyOf(v) => child(&v.expr),
+        a::Expr::Fold(v) => {
+            child(&v.init)?;
+            child(&v.lo)?;
+            child(&v.hi)?;
+            for statement in &v.body {
+                match statement {
+                    a::Stmt::Let(v) => child(&v.value)?,
+                    _ => {
+                        return Err(diagnostic(
+                            "D_FUNCTION_PURITY",
+                            "pure function folds may only bind values",
+                            statement_span(statement),
+                        ))
+                    }
+                }
+            }
+            child(&v.yield_expr)
+        }
+        a::Expr::Call(v) if calls => {
+            for arg in &v.args {
+                child(arg)?;
+            }
+            deps.insert(v.function.clone());
+            Ok(())
+        }
+        a::Expr::Call(_) => Err(diagnostic(
+            "D_FUNCTION_CONTRACT",
+            "function contracts cannot call functions",
+            expression.span(),
+        )),
+        _ => Err(diagnostic(
+            "D_FUNCTION_PURITY",
+            "functions and their contracts cannot observe or mutate state or effects",
+            expression.span(),
+        )),
     }
 }

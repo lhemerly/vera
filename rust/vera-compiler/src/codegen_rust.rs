@@ -224,6 +224,9 @@ impl<'a> Generator<'a> {
             .map(|((id, _), name)| (*id, name))
             .collect::<HashMap<_, _>>();
         let mut reserved = "main run_batch run_batch_serial restore snapshot mix64 decimal_mul decimal_div checksum replay_file atomic_write wide_product wide_quotient decimal_wide_result decimal_wide_mul decimal_wide_div projection_bound I256 U256".split_whitespace().map(str::to_owned).collect::<HashSet<_>>();
+        for function in program.functions() {
+            reserved.insert(format!("vera_function_{}", function.id.0));
+        }
         for transition in &program.transitions {
             reserved.insert(format!("transition_{}", transition.name));
         }
@@ -270,6 +273,7 @@ impl<'a> Generator<'a> {
             "IndexSaturated",
             "InvalidEncoding",
             "EffectAccess",
+            "FunctionPrecondition",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -351,6 +355,9 @@ impl<'a> Generator<'a> {
         }
         self.accessors();
         self.state();
+        for function in self.program.functions() {
+            self.function(function)?;
+        }
         for index in 0..self.program.transitions.len() {
             self.transition(index)?;
         }
@@ -758,6 +765,11 @@ impl Generator<'_> {
             ExprKind::Binding(binding) => {
                 result.insert(*binding);
             }
+            ExprKind::Call { args, .. } => {
+                for id in args {
+                    self.expression_bindings(*id, result);
+                }
+            }
             ExprKind::Unary { operand, .. } => self.expression_bindings(*operand, result),
             ExprKind::Binary { left, right, .. } => {
                 self.expression_bindings(*left, result);
@@ -1111,6 +1123,7 @@ impl Generator<'_> {
                     | ExprKind::Fold(_)
                     | ExprKind::EffectArg { .. }
                     | ExprKind::EffectCount
+                    | ExprKind::Call { .. }
             );
         let state_name = |snapshot| {
             if snapshot == Snapshot::Pre {
@@ -1120,6 +1133,26 @@ impl Generator<'_> {
             }
         };
         let value = match expression.kind {
+            ExprKind::Call { function, args } => {
+                let callee = self.program.function(function);
+                let mut source = String::from("{");
+                let mut values = Vec::new();
+                for (argument, parameter) in args.iter().zip(&callee.params) {
+                    let value = self.narrowed(*argument, env, &parameter.ty)?;
+                    let local = self.fresh("argument");
+                    source.push_str(&format!(
+                        "let {local}:{}={value};",
+                        rust_type(&parameter.ty)
+                    ));
+                    values.push(local);
+                }
+                source.push_str(&format!(
+                    "vera_function_{}({})?}}",
+                    function.0,
+                    values.join(",")
+                ));
+                source
+            }
             ExprKind::Constant(value) => self.scalar_literal(&value, &domain),
             ExprKind::Binding(binding) => env
                 .get(&binding)
@@ -1438,6 +1471,34 @@ impl Generator<'_> {
             }
             StmtKind::Commit => {}
         }
+        Ok(())
+    }
+
+    fn function(&mut self, function: &Function) -> Result<(), Diagnostic> {
+        let params = function
+            .params
+            .iter()
+            .map(|p| format!("{}:{}", self.binding(p.binding), rust_type(&p.ty)))
+            .collect::<Vec<_>>()
+            .join(",");
+        self.line(format!(
+            "fn vera_function_{}({params})->Result<{},ErrorCode>{{",
+            function.id.0,
+            rust_type(&function.result_type)
+        ));
+        let env = function
+            .params
+            .iter()
+            .map(|p| (p.binding, self.binding(p.binding)))
+            .collect::<Environment>();
+        for require in &function.requires {
+            let condition = self.expr(require.value, &env)?;
+            self.line(format!(
+                "if !({condition}){{return Err(ErrorCode::FunctionPrecondition);}}"
+            ));
+        }
+        let result = self.narrowed(function.body, &env, &function.result_type)?;
+        self.line(format!("Ok({result})}}"));
         Ok(())
     }
 

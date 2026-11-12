@@ -4,6 +4,7 @@
 //! A successful commit publishes the complete staged value; every failure drops
 //! it, including occupancy, generations, indexes, aggregates and effects.
 
+use crate::ir::FunctionId;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -142,10 +143,8 @@ pub struct State {
     pub outbox: Vec<EffectRecord>,
 }
 
-/// Interpreter storage is more expensive than the generated fixed-width SoA.
-/// Reject allocations beyond this host budget explicitly; never shrink tables.
-pub const DEFAULT_MAX_STATE_BYTES: u64 = 256 * 1024 * 1024;
-
+/// Check an explicitly selected interpreter-storage estimate budget.
+/// Default construction has no policy ceiling and never shrinks table capacities.
 pub fn ensure_state_budget(program: &CheckedProgram, max_bytes: u64) -> Result<(), RuntimeError> {
     let mut estimate = 0u128;
     for table in program.tables() {
@@ -162,11 +161,16 @@ pub fn ensure_state_budget(program: &CheckedProgram, max_bytes: u64) -> Result<(
     Ok(())
 }
 
-fn filled<T: Clone>(length: usize, value: T) -> Result<Vec<T>, RuntimeError> {
+fn reserved<T>(length: usize) -> Result<Vec<T>, RuntimeError> {
     let mut values = Vec::new();
     values
         .try_reserve_exact(length)
         .map_err(|_| resource("ERR_STATE_ALLOCATION"))?;
+    Ok(values)
+}
+
+fn filled<T: Clone>(length: usize, value: T) -> Result<Vec<T>, RuntimeError> {
+    let mut values = reserved(length)?;
     values.resize(length, value);
     Ok(values)
 }
@@ -175,22 +179,28 @@ impl State {
     /// Construct representation-correct empty tables for trusted setup assembly.
     /// Use `Machine::with_state` to admit a completed initial state.
     pub fn empty(program: &CheckedProgram) -> Result<Self, RuntimeError> {
-        Self::empty_with_limit(program, DEFAULT_MAX_STATE_BYTES)
+        Self::empty_inner(program, None)
     }
 
-    /// Explicit host budget for applications with larger supported memory.
+    /// Construct with an explicit opt-in interpreter-storage estimate budget.
     pub fn empty_with_limit(
         program: &CheckedProgram,
         max_bytes: u64,
     ) -> Result<Self, RuntimeError> {
-        ensure_state_budget(program, max_bytes)?;
-        let mut tables = Vec::new();
+        Self::empty_inner(program, Some(max_bytes))
+    }
+
+    fn empty_inner(program: &CheckedProgram, max_bytes: Option<u64>) -> Result<Self, RuntimeError> {
+        if let Some(max_bytes) = max_bytes {
+            ensure_state_budget(program, max_bytes)?;
+        }
+        let mut tables = reserved(program.tables().len())?;
         for table in program.tables() {
             let capacity =
                 usize::try_from(table.capacity).map_err(|_| resource("ERR_STATE_ALLOCATION"))?;
-            let mut columns = Vec::new();
-            let mut aggregates = Vec::new();
-            let mut indexes = Vec::new();
+            let mut columns = reserved(table.columns.len())?;
+            let mut aggregates = reserved(table.columns.len())?;
+            let mut indexes = reserved(table.columns.len())?;
             for column in &table.columns {
                 columns.push(filled(capacity, Value::zero(&column.ty))?);
                 aggregates.push(column.tracked_sum.then(BigInt::zero));
@@ -605,6 +615,36 @@ pub fn validate_state(program: &CheckedProgram, state: &State) -> Result<(), Run
     check_invariants(program, state, state)
 }
 
+/// Execute a pure function without allocating or validating unrelated program state.
+pub fn eval_function(
+    program: &CheckedProgram,
+    function: FunctionId,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    let pre = State {
+        tables: Vec::new(),
+        outbox: Vec::new(),
+    };
+    let mut state = pre.clone();
+    Evaluator {
+        program,
+        state: &mut state,
+        pre: &pre,
+        bindings: BTreeMap::new(),
+        trace: Vec::new(),
+        record_trace: false,
+    }
+    .call_function(function, args)
+}
+
+pub fn evaluate_function(
+    program: &CheckedProgram,
+    function: FunctionId,
+    args: &[Value],
+) -> Result<Value, RuntimeError> {
+    eval_function(program, function, args)
+}
+
 pub fn eval_expression(
     program: &CheckedProgram,
     current: &State,
@@ -707,6 +747,68 @@ impl Evaluator<'_, '_> {
         }
     }
 
+    fn call_function(
+        &mut self,
+        function: FunctionId,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        let info = self.program.function(function).clone();
+        if args.len() != info.params.len() {
+            return Err(RuntimeError::new("ERR_ARGUMENTS", FailureKind::Trap).at(info.span));
+        }
+        let mut bindings = BTreeMap::new();
+        for (param, arg) in info.params.iter().zip(args) {
+            bindings.insert(
+                param.binding,
+                coerce(arg, &param.ty).map_err(|_| arithmetic().at(info.span))?,
+            );
+        }
+        if self.record_trace {
+            for (param, arg) in info.params.iter().zip(args) {
+                self.log(
+                    info.span,
+                    "function_argument",
+                    format!("{}.{}", info.name, param.name),
+                    Some(arg.clone()),
+                );
+            }
+        }
+        let saved = std::mem::replace(&mut self.bindings, bindings);
+        let result = (|| {
+            for requirement in &info.requires {
+                let evaluated = self.value(requirement.value, Snapshot::Current);
+                if self.record_trace {
+                    self.log(
+                        self.program.expr(requirement.value).span,
+                        "function_require",
+                        format!("{}.{}", info.name, requirement.name),
+                        evaluated.as_ref().ok().cloned(),
+                    );
+                }
+                let value = evaluated?;
+                if value != Value::Bool(true) {
+                    return Err(
+                        RuntimeError::new("ERR_FUNCTION_PRECONDITION", FailureKind::Trap)
+                            .at(self.program.expr(requirement.value).span),
+                    );
+                }
+            }
+            let value = self.value(info.body, Snapshot::Current)?;
+            coerce(&value, &info.result_type)
+                .map_err(|_| arithmetic().at(self.program.expr(info.body).span))
+        })();
+        if self.record_trace {
+            self.log(
+                self.program.expr(info.body).span,
+                "function_return",
+                info.name.clone(),
+                result.as_ref().ok().cloned(),
+            );
+        }
+        self.bindings = saved;
+        result
+    }
+
     fn value(&mut self, expression: ExprId, context: Snapshot) -> Result<Value, RuntimeError> {
         let expr = self.program.expr(expression).clone();
         let result = self.value_inner(expr.kind, &expr.domain, context);
@@ -720,6 +822,13 @@ impl Evaluator<'_, '_> {
         context: Snapshot,
     ) -> Result<Value, RuntimeError> {
         match kind {
+            ExprKind::Call { function, args } => {
+                let values = args
+                    .into_iter()
+                    .map(|arg| self.value(arg, context))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.call_function(function, &values)
+            }
             ExprKind::Constant(value) => Ok(value),
             ExprKind::Binding(binding) => self
                 .bindings

@@ -767,3 +767,70 @@ let start=state.clone();let looped=Params::Looped{n:3};looped.execute(&mut state
 }"#,
     );
 }
+
+#[test]
+fn compositional_function_helpers_execute_scalar_contracts_without_inlining() {
+    let source = include_str!("fixtures/functions.vera");
+    run_case(
+        source,
+        r#"fn main(){
+let pre=State::default();let mut state=pre.clone();let payload=[0xa5u8;32];
+let intent=Params::Run{n:3,payload};intent.execute(&mut state).unwrap();intent.check_postconditions(&pre,&state).unwrap();
+assert_eq!(state.outbox[0],Effect::Values{n:12,bytes:payload,flag:true,decimal:300000000,count:4,tag:1});
+lazy(&mut state).unwrap();assert_eq!(state.outbox[1],Effect::Number{n:7});
+let before=state.clone();assert_eq!(bad_pre(&mut state),Err(ErrorCode::FunctionPrecondition));assert_eq!(state,before);
+assert_eq!(bad_arithmetic(&mut state),Err(ErrorCode::ArithOverflow));assert_eq!(state,before);
+assert_eq!(ordered_requires(&mut state,255),Err(ErrorCode::ArithOverflow));
+assert_eq!(ordered_requires(&mut state,0),Err(ErrorCode::FunctionPrecondition));
+let start=state.clone();let intent=Params::ArgumentOrder{};intent.execute(&mut state).unwrap();intent.check_postconditions(&start,&state).unwrap();
+assert_eq!(&state.outbox[2..],&[Effect::Number{n:1},Effect::Number{n:2},Effect::Number{n:11}]);
+}"#,
+    );
+    let program = analyze(parse_source(source).unwrap()).unwrap();
+    let code = generate_rust(
+        &program,
+        RustOptions {
+            use_rt: false,
+            include_main: false,
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        code.matches("fn vera_function_").count(),
+        program.functions().len()
+    );
+}
+
+#[test]
+fn function_helpers_do_not_multiply_with_callers_or_collide_with_transition_names() {
+    for callers in [1usize, 16, 256] {
+        let mut source =
+            String::from("function helper(x:u64)->u64 body {yield x;} effect Number(n:u64);");
+        for index in 0..callers {
+            source.push_str(&format!("transition call_{index}(x:u64) reads [] writes [] body {{emit Number(helper(x));commit;}}"));
+        }
+        let program = analyze(parse_source(&source).unwrap()).unwrap();
+        let code = generate_rust(
+            &program,
+            RustOptions {
+                use_rt: false,
+                include_main: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(code.matches("fn vera_function_0(").count(), 1);
+    }
+    run_case("function helper(x:u64)->u64 body {yield x;} transition vera_function_0() reads [] writes [] body {let %x:u64=helper(7);commit;}",r#"fn main(){let mut state=State::default();Params::VeraFunction0{}.execute(&mut state).unwrap();}"#);
+}
+
+#[test]
+fn scalar_function_boundaries_narrow_arguments_and_promote_results() {
+    run_case(
+        include_str!("fixtures/function_aggregate.vera"),
+        r#"fn main(){
+let mut state=State::default();init(&mut state).unwrap();let saved=state.clone();
+assert_eq!(round(&mut state),Err(ErrorCode::ArithOverflow));assert_eq!(state,saved);
+let intent=Params::Promoted{};intent.execute(&mut state).unwrap();intent.check_postconditions(&saved,&state).unwrap();
+}"#,
+    );
+}

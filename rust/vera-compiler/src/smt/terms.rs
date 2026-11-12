@@ -185,12 +185,12 @@ pub(super) struct Script {
     assertions: Vec<String>,
     serial: usize,
     bytes: usize,
-    max_bytes: usize,
+    max_bytes: Option<usize>,
     exceeded: bool,
 }
 
 impl Script {
-    pub fn with_budget(max_bytes: usize) -> Self {
+    pub fn with_budget(max_bytes: Option<usize>) -> Self {
         Self {
             declarations: Vec::new(),
             assertions: Vec::new(),
@@ -209,7 +209,11 @@ impl Script {
     }
 
     fn reserve(&mut self, bytes: usize) -> bool {
-        if self.exceeded || bytes > self.max_bytes.saturating_sub(self.bytes) {
+        if self.exceeded
+            || self
+                .max_bytes
+                .is_some_and(|limit| bytes > limit.saturating_sub(self.bytes))
+        {
             self.exceeded = true;
             return false;
         }
@@ -276,11 +280,11 @@ impl Script {
         self.guard(path, &not(failure));
     }
 
-    pub fn query(&self, assertion: &str, timeout_ms: u32) -> String {
-        let mut lines = vec![
-            "(set-logic QF_AUFBV)".into(),
-            format!("(set-option :timeout {timeout_ms})"),
-        ];
+    pub fn query(&self, assertion: &str, timeout_ms: Option<u32>) -> String {
+        let mut lines = vec!["(set-logic QF_AUFBV)".into()];
+        if let Some(timeout_ms) = timeout_ms {
+            lines.push(format!("(set-option :timeout {timeout_ms})"));
+        }
         lines.extend(self.declarations.iter().cloned());
         lines.extend(self.assertions.iter().map(|a| format!("(assert {a})")));
         lines.push(format!("(assert {assertion})"));

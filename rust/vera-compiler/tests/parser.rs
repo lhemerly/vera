@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 use vera_compiler::ast::{Decl, Expr, Stmt};
-use vera_compiler::parser::{parse_source, MAX_EXPRESSION_NESTING};
+use vera_compiler::parser::parse_source;
 
 fn canonical(source: &str) -> Value {
     parse_source(source).unwrap().canonical_json()
@@ -297,25 +297,30 @@ fn spans_cover_native_source_but_do_not_change_canonical_identity() {
 }
 
 #[test]
-fn nesting_limits_reject_deep_canonical_and_infix_trees_without_overflow() {
-    let count = MAX_EXPRESSION_NESTING * 4;
-    let canonical = format!("{}1{}", "neg(".repeat(count), ")".repeat(count));
-    let groups = format!(
-        "invariant deep {{{}true{};}}",
-        "(".repeat(count),
-        ")".repeat(count)
-    );
-    let flat = format!(
-        "invariant deep {{{};}}",
-        std::iter::repeat_n("1", count)
-            .collect::<Vec<_>>()
-            .join("+")
-    );
-    for source in [body(&canonical), groups, flat] {
-        let error = parse_source(&source).unwrap_err();
-        assert_eq!(error.code, "D_PARSE");
-        assert!(error.message.contains("nesting"));
-    }
+fn expression_nesting_has_no_fixed_policy_limit() {
+    std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024)
+        .spawn(|| {
+            let count = 80;
+            let canonical = format!("{}1{}", "neg(".repeat(count), ")".repeat(count));
+            let groups = format!(
+                "invariant deep {{{}true{};}}",
+                "(".repeat(count),
+                ")".repeat(count)
+            );
+            let flat = format!(
+                "invariant deep {{{};}}",
+                std::iter::repeat_n("1", count)
+                    .collect::<Vec<_>>()
+                    .join("+")
+            );
+            for source in [body(&canonical), groups, flat] {
+                parse_source(&source).unwrap();
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]

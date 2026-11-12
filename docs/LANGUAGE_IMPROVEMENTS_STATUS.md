@@ -2,77 +2,108 @@
 
 Audit base: `0972d8be62466f2798c7654f46d9fd6a7c850c3a`.
 
-This increment improves VERA's observable transactional interface and repair
-feedback. It does not claim to implement the entire longer-term language plan.
+This work improves VERA's observable transactional interfaces, compositional
+verification and repair feedback. It does not claim that every longer-term
+language feature is implemented.
 
 ## Implemented
 
-- Typed postconditions over exact transaction-local effect count, variant,
-  order and named payload fields. These work in ordinary ensures and pure
-  bounded specification folds.
-- Shared SMT arrays, conditional prefix-count stores and explicit event budgets.
-  No enumeration of all effect sequences or payload combinations.
-- Interpreter/replay/native-fuzz semantics, exact GPU effect monitors and generated
-  Rust's explicit named postcondition-check API. Invalid optional accesses are
-  distinguishable from false laws; lazy selection remains essential.
-- Replay-derived repair JSON: ordered named typed effects, failed ensure values
-  versus evaluation errors, and precise source spans. Existing evidence fields
-  remain available. A committing non-vacuity witness does not masquerade as an
-  execution satisfying every ensure.
-- Independent expression, SMT-byte and effect-event budgets; incremental
-  candidate search; shared tracked-sum prefixes; removal of redundant row-local
-  all-row selection expansion. Exhaustion/unknown still rejects verification.
-- An additional runnable effect-counter example without changing historical
-  examples or their persisted intent identities. Contract changes themselves
-  participate in the normal semantic program fingerprint.
+- Exact transaction-local effect postconditions for count, variant, order and
+  named scalar payload fields, including pure specification folds.
+- Shared symbolic outbox arrays and conditional prefix-count stores rather than
+  enumeration of all event sequences or payload combinations.
+- Interpreter/replay/native-fuzz semantics, exact GPU monitors and generated
+  Rust's explicit named postcondition-check API.
+- Replay-derived JSON with ordered named typed effects, false versus undefined
+  ensures, concrete values/errors and precise source spans.
+- Pure, first-order, acyclic scalar functions with independently verified
+  contracts; source-order-independent dependency resolution; real-body runtime
+  execution; one generated helper per definition.
+- Private invocation-scoped proof admission. Callers check callee preconditions
+  as obligations and use admitted deterministic summaries, not inlined bodies.
+  Weak summaries fail closed as unknown when candidates cannot replay.
+- Iterative proof-DAG traversal and direct-edge dependency evidence. Each helper
+  is proved once per session; transitive proof graphs are not copied into every
+  caller's result.
+- CLI verification of functions as well as transitions, selected `--function`
+  verification, and function-aware artifact proof gates. Function-only programs
+  cannot pass vacuously because they have no transitions.
+- Shared tracked-sum prefixes, removal of redundant row-local all-row selection
+  expansion, incremental physical-witness candidate search and actual encoding
+  metrics.
 
-## Deliberate boundaries
+## No imposed validation ceilings
+
+The owner's correction supersedes the initial budget defaults. There is now no
+default solver timeout, state-cell, expression-step, SMT-byte, candidate-effect,
+fold-unroll or witness-attempt ceiling. All optional controls are absent by
+default (`None` / JSON `null`) and apply only when explicitly selected. The
+arbitrary fixed parser-nesting, fold-depth/product, function-count/call-depth,
+GPU effect-buffer and interpreter-state-byte policy ceilings have been removed.
+No large sentinel defaults stand in for unbounded configuration.
+
+Declared finite loop bounds, scalar/handle representations and soundness remain.
+Unknown/errors are never called proofs. Actual `u32` bound/product/GPU-index,
+`u64` instruction-cost, host address-space, allocation, target compiler/device and
+solver limits still exist and are reported rather than silently reducing state.
+Recursive expression parsing/evaluation remains dependent on available host
+stack; removing a policy check is not a claim of unlimited physical resources.
+Explicit host execution/batching configuration is separate from proof defaults.
+
+## Current scope and remaining work
 
 | Priority | Status |
 | --- | --- |
-| Effect postconditions and bounded symbolic outbox | Implemented for existing scalar effect parameters |
-| General structured record values and user-defined payload unions | Not implemented; distinct effect declarations remain existing typed outbox variants |
-| Reusable modular verified functions and stateful component contracts | Not implemented; implementation-ready design records required proof-admission boundaries |
-| Variable-length bounded bytes/strings and source-level codecs | Not implemented; existing `bytes32` and host persistence codecs are unchanged |
-| Predictable proof resource budgets | Implemented encoding limits, not an absolute RSS bound or a promise of constant solver time |
-| Autonomous AI repair | Better verifiable feedback, not an automatic law-rewriting or patch-admission system |
+| Effect postconditions and symbolic outbox | Implemented for existing scalar payloads |
+| Pure reusable verified functions | Implemented with independent dependency proofs and reusable summaries |
+| Stateful component contracts | Not implemented; need invariant ownership and explicit read/write/effect frames |
+| General records and user-defined tagged payload unions | Not implemented; distinct effect declarations remain typed outbox variants |
+| Variable-length bounded bytes/strings and source codecs | Not implemented; bytes32 and host persistence codecs remain existing facilities |
+| AI self-repair | Precise verifiable evidence and proof boundaries, not autonomous specification weakening or automatic patch admission |
 
-Do not implement function calls as unchecked assumed summaries or inline every
-callee at every use. The [function design](COMPOSITIONAL_FUNCTIONS.md) explains
-independent dependency proofs, private verified-contract admission, cache
-invalidation, abstract SAT replay and call-graph budgets. Structured values and
-codecs need one canonical type/layout/validation contract shared by runtime,
-SMT, generated targets and persistence. Cartesian expansion of input/output
-variants would work against the intended scaling goal.
+Structured values must share one canonical type/layout/validation contract across
+runtime, SMT, generated targets and persistence. Tagged variants should not be
+Cartesian-expanded merely to verify an interface. Bytes/codecs need explicit
+length, capacity, endianness, canonical representation, checked offsets and
+round-trip obligations. These are substantive remaining implementation, not
+capabilities implied by scalar functions.
 
-## Verification evidence
+## Validation and scaling evidence
 
-The complete workspace suite passed with real GPU tests required: 257 tests,
-zero failures and zero ignored tests. This included generated Rust execution,
-CUDA host execution, EGL GLSL and WGSL-to-GLSL execution, persistence vectors,
-verifier adversarial regressions and the 50,000-iteration runtime transfer test.
-After adding three proof-metrics tests, the entire compiler suite was rerun:
-255 passed, zero failed or ignored. Together with the five unchanged runtime
-tests from the full workspace run, all 260 tests are covered against their final
-source inputs. Effective proof configuration and completed encoding metrics are
-included in machine-readable verification results; incomplete encodings report
-no completed metrics.
+Tests cover independent function obligations, missing caller preconditions,
+invalid dependency admission, purity through dead code, deterministic UF
+congruence without conflating distinct arguments/functions, weak-summary replay,
+source order, binding isolation, atomic argument evaluation, named requirement
+traces, function-only CLI gates and actual generated artifacts.
 
-Formatting and whitespace checks passed. On installed Rust 1.95, strict Clippy
-encountered three existing `manual_is_multiple_of` warnings in unchanged
-`vera-rt` code. All-target workspace Clippy passed with only that lint allowed;
-no claim is made that the unmodified strict command passed on this toolchain.
+Scaling regressions retain one helper for 1/16/256 call sites; independently
+verify a 64-helper chain with exactly 63 direct evidence edges; preserve an
+identical caller SMT encoding as callee body unrolling grows from 8 to 128; and
+admit more than the removed function-count/fold/state-cell policy thresholds.
+These are structural tests, not a promise of linear solver runtime.
 
-For a fixed bounded emission loop with a symbolic queried position, measured
-safety-query sizes at bounds 8/16/32/64 were 12,430 / 23,243 / 44,859 / 88,091
-bytes. Sample proof times were 20 / 155 / 520 / 1188 milliseconds. Row-local
-state proof sizes at capacities 8/16/32/64 were approximately 10 / 20 / 40 / 80
-KB. Tests assert structural growth, not these machine-dependent timings.
+For fixed bounded emissions with a symbolic queried position, sampled safety
+SMT sizes at bounds 8/16/32/64 were 12,430 / 23,243 / 44,859 / 88,091 bytes.
+Row-local state proof sizes at capacities 8/16/32/64 were approximately
+10 / 20 / 40 / 80 KB. A complex 32-iteration symbolic-length/all-payload proof
+exceeded an explicitly selected 10-second timeout and remained unverified.
+There is no timeout by default.
 
-An 8-iteration symbolic-length contract checking every payload proves. A more
-complex 32-iteration version hit the default 10-second timeout and correctly
-remained unverified. Shared representation removes avoidable expansion; it does
-not establish general compositional proofs or eliminate hard bit-vector queries.
+Full validation includes generated Rust, CUDA host execution, real EGL GLSL and
+WGSL-to-GLSL execution, persistence/canonical-identity vectors, verifier review
+regressions and the 50,000-iteration runtime transfer test. Formatting and
+whitespace checks are required. On installed Rust 1.95, strict Clippy encounters
+three pre-existing `manual_is_multiple_of` warnings in unchanged `vera-rt` code;
+all-target workspace Clippy is run allowing only that legacy lint. The delivery
+report records the final test totals and actual outcomes.
 
-See [effect contracts](EFFECT_CONTRACTS.md) and
-[proof budgets](PROOF_BUDGETS.md) for precise semantics and APIs.
+See [effect contracts](EFFECT_CONTRACTS.md),
+[compositional functions](COMPOSITIONAL_FUNCTIONS.md) and
+[optional proof controls](PROOF_BUDGETS.md).
+
+Final validation for this increment: full workspace run 304 passed, zero failed
+or ignored, followed by a final compiler rerun after the direct-edge evidence
+regression: 300 passed, zero failed or ignored. Together with the five unchanged
+runtime tests, all 305 tests are covered against their final source inputs.
+The workspace runtime stress completed 50,000 iterations. Formatting, whitespace
+and all-target Clippy (with only the pre-existing lint noted above allowed) passed.

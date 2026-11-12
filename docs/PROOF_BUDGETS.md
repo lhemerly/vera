@@ -1,29 +1,52 @@
 # Proof budgets and scaling
 
-Proof-resource exhaustion rejects verification. It never reduces a declared
-capacity, drops an invariant, accepts a partial proof, or substitutes fuzzing for
-proof. These API fields in `VerifierConfig` are also available on `verify`,
-`run`, `replay`, and `codegen`:
+Verification has **no default policy limits** on solver time, state cells, fold
+unrolling, witness attempts, expression visits, SMT output, or effect candidates.
+Every `VerifierConfig` budget defaults to `None`, serialized as JSON `null`.
+Omitted CLI flags likewise leave the corresponding budget unset; no large sentinel
+value substitutes for an unlimited setting.
 
-| CLI option | Default | What it limits |
+The following diagnostic budgets are available only when a caller explicitly
+selects them on `verify`, `run`, `replay`, or `codegen`:
+
+| CLI option | Default | Unit / scope when explicitly selected |
 | --- | --- | --- |
-| `--timeout` | 10000 ms | Solver and witness-search elapsed time per obligation |
-| `--max-state-cells` | 4096 | Complete finite pre-state cells |
-| `--max-unroll` | 1024 | Fold bound / nested product |
-| `--witness-attempts` | 8 | Concrete witness candidates per obligation |
-| `--max-expression-steps` | 4194304 | Symbolic expression visits, including unrolled specification folds |
-| `--max-smt-bytes` | 67108864 | Generated query bytes, including witness-blocking clauses |
-| `--max-effect-events` | 4096 | Symbolic effect candidates, including inactive unrolled emissions |
+| `--timeout` | Unset | Milliseconds of solver/witness-search time per obligation |
+| `--max-state-cells` | Unset | Complete finite pre-state cells |
+| `--max-unroll` | Unset | Symbolic fold bound / nested product |
+| `--witness-attempts` | Unset | Concrete witness candidates per obligation |
+| `--max-expression-steps` | Unset | Symbolic expression visits, including repeated folds |
+| `--max-smt-bytes` | Unset | Generated query bytes, including witness-blocking clauses |
+| `--max-effect-events` | Unset | Symbolic candidates, including inactive unrolled emissions |
 
-Expression and output limits are independent of state capacity. Raising a state
-limit no longer silently increases the expression-expansion budget. A zero
-expression/effect limit allows no such visits/events; a zero SMT limit rejects
-all queries. The CLI requires a positive timeout.
+An explicitly selected limit fails closed when exhausted. It never reduces a
+declared capacity, drops an invariant, accepts a partial proof, or substitutes
+fuzzing for proof. Expression and output budgets are independent of state size.
+Explicit zero count/byte budgets allow no counted work; the CLI requires an
+explicit timeout to be positive. Without a timeout, no SMT timeout option is
+emitted or applied to the native solver. Without an attempt budget, nonphysical
+witnesses are blocked and search continues until a real witness, exhaustion of
+models, a solver result, or an external interruption. Solver `unknown`, errors,
+and invalid concrete replays are never accepted as a proof.
 
-The encoder accounts for retained SMT declarations/assertions while constructing
-them, checks the final obligation before constructing its query, and checks
-witness-blocking clauses before adding them. These limits bound the admitted
-encoding, not total process RSS: temporary expression strings, native solver
+Unlimited policy does not imply unlimited physical resources: native memory,
+address-space/index widths and the solver's supported numeric representations
+still apply. An explicit timeout uses Z3's unsigned 32-bit millisecond interface;
+explicit count/byte budgets use host `usize`. Declared finite table capacities,
+scalar widths and source fold iteration bounds still define program semantics.
+No model is silently shrunk to fit the host.
+`State::empty`, including concrete witness materialization, likewise has no
+implicit state-byte budget. `State::empty_with_limit` retains an explicit opt-in
+storage-estimate check. Default construction checks dimensions and uses fallible
+vector reservation, reporting `ERR_STATE_ALLOCATION` when reservation fails.
+Operating-system overcommit and later native allocation failures can still
+terminate a process; removing policy ceilings is not a guarantee that every
+representable program fits available RAM.
+
+When a byte budget is explicitly selected, the encoder accounts for retained
+SMT declarations/assertions during construction, checks the final obligation
+before constructing its query, and checks witness-blocking clauses before adding
+them. That opt-in budget bounds the admitted encoding, not total process RSS: temporary expression strings, native solver
 memory, concrete witness state and source parsing have separate costs.
 
 Row-local invariant instantiation uses the physical slot already known from

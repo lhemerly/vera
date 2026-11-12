@@ -5,9 +5,6 @@ use crate::diagnostic::{Diagnostic, Span};
 use crate::lexer::{tokenize, Token, TokenKind};
 use crate::literal::IntegerLiteral;
 
-/// A deterministic resource boundary for source nesting and constructed trees.
-pub const MAX_EXPRESSION_NESTING: usize = 64;
-
 type Result<T> = std::result::Result<T, Diagnostic>;
 
 pub fn parse_source(source: &str) -> Result<Module> {
@@ -15,7 +12,6 @@ pub fn parse_source(source: &str) -> Result<Module> {
         tokens: tokenize(source)?,
         position: 0,
         last_end: 0,
-        expression_nesting: 0,
     }
     .module()
 }
@@ -24,7 +20,6 @@ struct Parser {
     tokens: Vec<Token>,
     position: usize,
     last_end: usize,
-    expression_nesting: usize,
 }
 
 impl Parser {
@@ -188,6 +183,9 @@ impl Parser {
     }
 
     fn declaration(&mut self) -> Result<Decl> {
+        if matches!(&self.peek().kind, TokenKind::Ident(name) if name == "function") {
+            return self.function().map(Decl::Function);
+        }
         match &self.peek().kind {
             TokenKind::Keyword(name) => match name.as_str() {
                 "table" => self.table().map(Decl::Table),
@@ -453,6 +451,43 @@ impl Parser {
         })
     }
 
+    fn function(&mut self) -> Result<FunctionDecl> {
+        let start = self.advance().span;
+        let name = self.ident()?.0;
+        let params = self.params()?;
+        self.expect_punct("->")?;
+        let result_type = self.type_ref()?;
+        let mut requires = Vec::new();
+        let mut ensures = Vec::new();
+        while self.accept_keyword("require") {
+            let name = self.ident()?.0;
+            self.expect_punct(":")?;
+            requires.push((name, self.logic_expr()?));
+            self.expect_punct(";")?;
+        }
+        while self.accept_keyword("ensure") {
+            let name = self.ident()?.0;
+            self.expect_punct(":")?;
+            ensures.push((name, self.logic_expr()?));
+            self.expect_punct(";")?;
+        }
+        self.expect_keyword("body")?;
+        self.expect_punct("{")?;
+        self.expect_keyword("yield")?;
+        let body = self.pure_expr()?;
+        self.expect_punct(";")?;
+        self.expect_punct("}")?;
+        Ok(FunctionDecl {
+            name,
+            params,
+            result_type,
+            requires,
+            ensures,
+            body,
+            span: self.cover(start),
+        })
+    }
+
     fn effect(&mut self) -> Result<EffectDecl> {
         let start = self.expect_keyword("effect")?.span;
         let name = self.ident()?.0;
@@ -681,15 +716,7 @@ impl Parser {
     }
 
     fn nested<T>(&mut self, parser: fn(&mut Self) -> Result<T>) -> Result<T> {
-        if self.expression_nesting >= MAX_EXPRESSION_NESTING {
-            return Err(self.error(format!(
-                "expression nesting exceeds limit of {MAX_EXPRESSION_NESTING}"
-            )));
-        }
-        self.expression_nesting += 1;
-        let result = parser(self);
-        self.expression_nesting -= 1;
-        result
+        parser(self)
     }
 
     fn pure_expr(&mut self) -> Result<Expr> {
@@ -698,7 +725,7 @@ impl Parser {
     }
 
     fn effect_call(&self) -> bool {
-        matches!(&self.peek().kind, TokenKind::Ident(name) if matches!(name.as_str(), "effect_count" | "effect_is" | "effect_arg"))
+        matches!(&self.peek().kind, TokenKind::Ident(_))
             && self
                 .tokens
                 .get(self.position + 1)
@@ -947,6 +974,25 @@ impl Parser {
                 table,
                 key,
                 column,
+                span: self.cover(token.span),
+            }));
+        }
+        if matches!(&token.kind, TokenKind::Ident(_)) {
+            self.advance();
+            self.expect_punct("(")?;
+            let mut args = Vec::new();
+            if !self.accept_punct(")") {
+                loop {
+                    args.push(self.expression(logic)?);
+                    if !self.accept_punct(",") {
+                        break;
+                    }
+                }
+                self.expect_punct(")")?;
+            }
+            return Ok(Expr::Call(Call {
+                function: name.into(),
+                args,
                 span: self.cover(token.span),
             }));
         }
@@ -1212,12 +1258,6 @@ impl Parser {
     }
 
     fn checked_tree(&self, expr: Expr) -> Result<Expr> {
-        if exceeds_nesting(&expr, MAX_EXPRESSION_NESTING) {
-            return Err(Diagnostic::parse(
-                format!("expression tree nesting exceeds limit of {MAX_EXPRESSION_NESTING}"),
-                expr.span(),
-            ));
-        }
         Ok(expr)
     }
 }
@@ -1242,47 +1282,4 @@ fn is_binary(name: &str) -> bool {
             | "min"
             | "max"
     )
-}
-
-fn exceeds_nesting(expr: &Expr, remaining: usize) -> bool {
-    if remaining == 0 {
-        return true;
-    }
-    let remaining = remaining - 1;
-    let child = |expr: &Expr| exceeds_nesting(expr, remaining);
-    match expr {
-        Expr::Var(_) | Expr::Literal(_) | Expr::SumAgg(_) | Expr::EffectCount(_) => false,
-        Expr::EffectIs(v) => child(&v.index),
-        Expr::EffectArg(v) => child(&v.index),
-        Expr::Unary(v) => child(&v.operand),
-        Expr::Binary(v) => child(&v.left) || child(&v.right),
-        Expr::Select(v) => child(&v.cond) || child(&v.a) || child(&v.b),
-        Expr::TableGet(v) => child(&v.key),
-        Expr::TableExists(v) => child(&v.key),
-        Expr::TableExistsUnique(v) => child(&v.key),
-        Expr::TableLookup(v) => child(&v.key),
-        Expr::TableAccess(v) => v.key.as_deref().is_some_and(child),
-        Expr::Old(v) => v.access.key.as_deref().is_some_and(child),
-        Expr::KeyOf(v) => child(&v.expr),
-        Expr::Fold(v) => {
-            child(&v.init)
-                || child(&v.lo)
-                || child(&v.hi)
-                || child(&v.yield_expr)
-                || v.body.iter().any(|s| statement_exceeds(s, remaining))
-        }
-    }
-}
-
-fn statement_exceeds(statement: &Stmt, remaining: usize) -> bool {
-    let child = |expr: &Expr| exceeds_nesting(expr, remaining);
-    match statement {
-        Stmt::Let(v) => child(&v.value),
-        Stmt::Guard(v) => child(&v.cond),
-        Stmt::TableSet(v) => child(&v.key) || child(&v.value),
-        Stmt::TableAlloc(v) => v.fields.iter().any(|(_, expr)| child(expr)),
-        Stmt::Emit(v) => v.args.iter().any(child),
-        Stmt::Yield(v) => child(&v.value),
-        Stmt::Commit(_) => false,
-    }
 }

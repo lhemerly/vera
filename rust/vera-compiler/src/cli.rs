@@ -19,7 +19,7 @@ use vera_compiler::{
     semantic::analyze,
     types::ScalarType,
     value::{self, Value},
-    verifier::{verify_transition, VerifierConfig},
+    verifier::{verify_all, verify_function, verify_transition, VerifierConfig},
 };
 
 type Result<T> = std::result::Result<T, (u8, String)>;
@@ -36,11 +36,11 @@ Usage: vera <command> <file|-> [options]
   codegen   Emit rust|glsl|wgsl|cuda: vera codegen TARGET FILE
   fuzz      Search native execution traces for violations
 
-Common: --json, --timeout MS (10000), --setup FILE
-Proofs: --transition NAME, --emit-smt PREFIX, --max-state-cells N,
-        --max-unroll N, --witness-attempts N, --exact-sum
-        --max-expression-steps N (4194304), --max-smt-bytes N (67108864),
-        --max-effect-events N (4096)
+Common: --json, --setup FILE
+Proofs: --transition NAME or --function NAME, --emit-smt PREFIX, --exact-sum
+Optional proof budgets (all unset by default): --timeout MS,
+        --max-state-cells N, --max-unroll N, --witness-attempts N,
+        --max-expression-steps N, --max-smt-bytes N, --max-effect-events N
 Execution: --unverified (development), --snapshot-in FILE,
            --snapshot-out FILE, --wal FILE (recover, append and sync)
 Codegen: --out FILE, --no-main, --runtime-crate, --depth N
@@ -90,17 +90,25 @@ impl Options {
             })
             .unwrap_or(Ok(default))
     }
+    fn optional_number<T: std::str::FromStr>(&self, name: &str) -> Result<Option<T>> {
+        self.text(name)?
+            .map(|s| {
+                s.parse()
+                    .map_err(|_| input(format!("invalid {name}: {s:?}")))
+            })
+            .transpose()
+    }
     fn config(&self) -> Result<VerifierConfig> {
         let config = VerifierConfig {
-            timeout_ms: self.number("--timeout", 10_000)?,
-            max_state_cells: self.number("--max-state-cells", 4096)?,
-            max_unroll: self.number("--max-unroll", 1024)?,
-            witness_attempts: self.number("--witness-attempts", 8)?,
-            max_expression_steps: self.number("--max-expression-steps", 4_194_304)?,
-            max_smt_bytes: self.number("--max-smt-bytes", 64 * 1024 * 1024)?,
-            max_effect_events: self.number("--max-effect-events", 4096)?,
+            timeout_ms: self.optional_number("--timeout")?,
+            max_state_cells: self.optional_number("--max-state-cells")?,
+            max_unroll: self.optional_number("--max-unroll")?,
+            witness_attempts: self.optional_number("--witness-attempts")?,
+            max_expression_steps: self.optional_number("--max-expression-steps")?,
+            max_smt_bytes: self.optional_number("--max-smt-bytes")?,
+            max_effect_events: self.optional_number("--max-effect-events")?,
         };
-        if config.timeout_ms == 0 {
+        if config.timeout_ms == Some(0) {
             return Err(input("--timeout must be positive"));
         }
         Ok(config)
@@ -117,6 +125,7 @@ fn options(mut args: Vec<OsString>) -> Result<Options> {
             &["--json", "--exact-sum"],
             &[
                 "--transition",
+                "--function",
                 "--timeout",
                 "--emit-smt",
                 "--max-state-cells",
@@ -453,16 +462,25 @@ fn state_json(program: &CheckedProgram, state: &State) -> Json {
         .collect();
     json!({"tables":tables,"outbox":outbox})
 }
-fn proof_gate(program: &CheckedProgram, opts: &Options, names: &[&str]) -> Result<()> {
+fn proof_gate(program: &CheckedProgram, opts: &Options, names: &[&str], all: bool) -> Result<()> {
     if opts.flag("--unverified") {
         return Ok(());
     }
     let config = opts.config()?;
-    for name in names {
-        let result = verify_transition(program, name, &config);
+    let results = if all {
+        verify_all(program, &config)
+    } else {
+        names
+            .iter()
+            .map(|name| verify_transition(program, name, &config))
+            .collect()
+    };
+    for result in results {
         if !result.ok() {
             return Err(failure(format!(
-                "Compilation rejected: transition {name:?} is not verified.\n{}",
+                "Compilation rejected: {} {:?} is not verified.\n{}",
+                result.target_kind,
+                result.transition,
                 result.summary()
             )));
         }
@@ -550,10 +568,13 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         "check" => {
             let tables:Vec<_>=program.tables().iter().map(|t|json!({"name":t.name,"capacity":t.capacity,"bytes":t.layout.size,"columns":t.columns.iter().map(|c|json!({"name":c.name,"type":c.ty.to_string(),"tracked_sum":c.tracked_sum,"unique":c.unique})).collect::<Vec<_>>()})).collect();
             let transitions:Vec<_>=program.transitions().iter().map(|t|json!({"name":t.name,"tier":t.tier,"wcet_bound":t.wcet_bound,"reads":t.reads.len(),"writes":t.writes.len(),"fold_depth":t.fold_depth,"max_fold_product":t.max_fold_product})).collect();
+            let functions:Vec<_>=program.functions().iter().map(|f|json!({"name":f.name,"result_type":f.result_type.to_string(),"wcet_bound":f.wcet_bound,"dependencies":f.dependencies.iter().map(|id|program.function(*id).name.clone()).collect::<Vec<_>>()})).collect();
             if opts.flag("--json") {
-                print_json(
-                    json!({"ok":true,"tables":tables,"transitions":transitions,"invariants":program.invariants().len(),"projections":program.projections().len()}),
-                )?;
+                let mut report = json!({"ok":true,"tables":tables,"transitions":transitions,"invariants":program.invariants().len(),"projections":program.projections().len()});
+                if !functions.is_empty() {
+                    report["functions"] = json!(functions);
+                }
+                print_json(report)?;
             } else {
                 println!(
                     "OK: {} tables, {} transitions, {} invariants, {} projections",
@@ -571,18 +592,25 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             }
         }
         "verify" => {
-            let names = opts
-                .text("--transition")?
-                .map(|n| vec![n])
-                .unwrap_or(all_names);
-            if names.iter().any(|n| program.transition_id(n).is_none()) {
-                return Err(input("unknown transition"));
-            }
             let config = opts.config()?;
-            let results: Vec<_> = names
-                .iter()
-                .map(|n| verify_transition(&program, n, &config))
-                .collect();
+            let selected_transition = opts.text("--transition")?;
+            let selected_function = opts.text("--function")?;
+            if selected_transition.is_some() && selected_function.is_some() {
+                return Err(input("select --transition or --function, not both"));
+            }
+            let results = if let Some(name) = selected_transition {
+                if program.transition_id(name).is_none() {
+                    return Err(input("unknown transition"));
+                }
+                vec![verify_transition(&program, name, &config)]
+            } else if let Some(name) = selected_function {
+                if program.function_id(name).is_none() {
+                    return Err(input("unknown function"));
+                }
+                vec![verify_function(&program, name, &config)]
+            } else {
+                verify_all(&program, &config)
+            };
             for r in &results {
                 if let Some(prefix) = opts.values.get("--emit-smt") {
                     for (kind, script) in [
@@ -591,7 +619,11 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
                         ("liveness", &r.smt_liveness),
                     ] {
                         let mut path = prefix.clone();
-                        path.push(format!(".{}.{kind}.smt2", r.transition));
+                        if r.target_kind == "function" {
+                            path.push(format!(".function.{}.{kind}.smt2", r.transition));
+                        } else {
+                            path.push(format!(".{}.{kind}.smt2", r.transition));
+                        }
                         fs::write(path, script).map_err(failure)?;
                     }
                 }
@@ -650,6 +682,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
                     } else {
                         all_names
                     },
+                    transition.is_none() || opts.values.contains_key("--wal"),
                 )?;
             }
             let mut machine =
@@ -719,7 +752,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             if target != "rust" && (opts.flag("--no-main") || opts.flag("--runtime-crate")) {
                 return Err(input("--no-main and --runtime-crate apply to Rust"));
             }
-            proof_gate(&program, &opts, &all_names)?;
+            proof_gate(&program, &opts, &all_names, true)?;
             let text = if target == "rust" {
                 generate_rust(
                     &program,

@@ -364,9 +364,9 @@ transition noop() reads [] writes [] body {commit;}
 }
 
 #[test]
-fn huge_declared_capacity_reports_host_resource_limit_without_truncating() {
+fn explicit_state_budget_rejects_huge_capacity_without_allocating_or_truncating() {
     let program = checked("module Large;table T capacity 4294967296 {key id:id64<T>;col v:u64;}transition noop() reads [] writes [] body {commit;}");
-    let error = State::empty(&program).unwrap_err();
+    let error = State::empty_with_limit(&program, 256 * 1024 * 1024).unwrap_err();
     assert_eq!(error.code, "ERR_STATE_LIMIT");
     assert_eq!(error.kind, FailureKind::Resource);
     assert_eq!(program.tables()[0].capacity, 1u64 << 32);
@@ -503,4 +503,18 @@ let %v:i64=old(T[fold_bounded<1>(a:id64<T>=k,i in [0..0]) {
     machine.call("go", &args([("k", int(2))])).unwrap();
     assert_eq!(machine.state.tables[0].columns[0][0], int(3));
     assert_eq!(machine.state.tables[0].columns[2][0], int(7));
+}
+
+#[test]
+fn default_state_construction_has_no_inherited_opt_in_budget() {
+    let program = checked("table T capacity 8 {key id:id64<T>;col v:u64;}transition noop() reads [] writes [] body {commit;}");
+    assert_eq!(
+        State::empty_with_limit(&program, 0).unwrap_err().code,
+        "ERR_STATE_LIMIT"
+    );
+    let state = State::empty(&program).unwrap();
+    assert_eq!(state.tables[0].occupied.len(), 8);
+    assert_eq!(state.tables[0].generations.len(), 8);
+    assert_eq!(state.tables[0].columns[0].len(), 8);
+    assert_eq!(program.tables()[0].capacity, 8);
 }

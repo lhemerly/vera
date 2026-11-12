@@ -312,6 +312,7 @@ fn contains_binding(
         ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
             children.push(*index)
         }
+        ExprKind::Call { args, .. } => children.extend(args),
         ExprKind::Unary { operand, .. } => children.push(*operand),
         ExprKind::Binary { left, right, .. } => {
             children.push(*left);

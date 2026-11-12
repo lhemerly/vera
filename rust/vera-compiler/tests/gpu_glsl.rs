@@ -95,3 +95,15 @@ atomicAdd(violations,first);atomicAdd(committed,second);atomicAdd(effects,ctx.s.
         "violations=1 committed=1 reverted=0 effects=4",
     );
 }
+
+#[test]
+fn glsl_compositional_function_helpers_execute_success_and_failure() {
+    run(
+        include_str!("fixtures/functions.vera"),
+        r#"void main(){if(gl_GlobalInvocationID.x!=0u){return;}Ctx ctx;vera_init(ctx);
+V payload=v_make(1u,2u,3u,4u,5u,6u,7u,8u);
+uint first=transition_v_run(ctx,v_small(3u),payload);uint second=transition_v_lazy(ctx);uint bad=transition_v_bad_pre(ctx);
+atomicAdd(violations,first);atomicAdd(committed,second);atomicAdd(reverted,bad);atomicAdd(effects,ctx.s.effect_count);}"#,
+        "violations=1 committed=1 reverted=3 effects=2",
+    );
+}

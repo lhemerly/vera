@@ -208,7 +208,14 @@ fn exact_aggregates_include_rows_outside_the_transition_footprint() {
 #[test]
 fn timeout_and_model_resource_limits_fail_closed() {
     let checked = program("table T capacity 4294967296 {key id:id64<T>;col v:u8;} transition go() reads [] writes [] body {commit;}");
-    let result = verify_transition(&checked, "go", &VerifierConfig::default());
+    let result = verify_transition(
+        &checked,
+        "go",
+        &VerifierConfig {
+            max_state_cells: Some(4096),
+            ..VerifierConfig::default()
+        },
+    );
     assert!(!result.ok());
     assert!(result
         .diagnostics
@@ -219,7 +226,7 @@ fn timeout_and_model_resource_limits_fail_closed() {
         &checked,
         "go",
         &VerifierConfig {
-            timeout_ms: 0,
+            timeout_ms: Some(0),
             ..VerifierConfig::default()
         },
     );

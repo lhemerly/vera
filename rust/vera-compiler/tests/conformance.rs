@@ -66,7 +66,7 @@ fn complete_source_corpus_preserves_exact_syntax_and_semantic_contracts() {
     let cases = array(&fixture["cases"]);
     let metadata = array(&fixture["metadata"]);
     assert_eq!(cases.len(), 148);
-    assert_eq!(metadata.len(), 117);
+    assert_eq!(metadata.len(), 118);
     let mut outcomes = [0; 3];
     let mut unique = BTreeSet::new();
     for (case_index, case) in cases.iter().enumerate() {
@@ -123,7 +123,7 @@ fn complete_source_corpus_preserves_exact_syntax_and_semantic_contracts() {
             );
         }
     }
-    assert_eq!(outcomes, [128, 16, 4]);
+    assert_eq!(outcomes, [129, 15, 4]);
 }
 
 struct Temporary(PathBuf);

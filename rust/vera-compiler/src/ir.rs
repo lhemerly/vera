@@ -20,7 +20,8 @@ id!(
     BindingId,
     TransitionId,
     EffectId,
-    ProjectionId
+    ProjectionId,
+    FunctionId
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -204,6 +205,10 @@ pub enum ExprKind {
         value: ExprId,
     },
     Fold(Box<Fold>),
+    Call {
+        function: FunctionId,
+        args: Vec<ExprId>,
+    },
     EffectCount,
     EffectIs {
         effect: EffectId,
@@ -330,6 +335,7 @@ pub struct CheckedProgram {
     pub(crate) bindings: Vec<Binding>,
     pub(crate) expressions: Vec<TypedExpr>,
     pub(crate) transitions: Vec<Transition>,
+    pub(crate) functions: Vec<Function>,
     pub(crate) invariants: Vec<Invariant>,
     pub(crate) effects: Vec<Effect>,
     pub(crate) projections: Vec<Projection>,
@@ -343,6 +349,7 @@ impl CheckedProgram {
             bindings: Vec::new(),
             expressions: Vec::new(),
             transitions: Vec::new(),
+            functions: Vec::new(),
             invariants: Vec::new(),
             effects: Vec::new(),
             projections: Vec::new(),
@@ -357,6 +364,15 @@ impl CheckedProgram {
     }
     pub fn transitions(&self) -> &[Transition] {
         &self.transitions
+    }
+    pub fn functions(&self) -> &[Function] {
+        &self.functions
+    }
+    pub fn function(&self, id: FunctionId) -> &Function {
+        &self.functions[id.0]
+    }
+    pub fn function_id(&self, name: &str) -> Option<FunctionId> {
+        self.functions.iter().find(|f| f.name == name).map(|f| f.id)
     }
     pub fn invariants(&self) -> &[Invariant] {
         &self.invariants
@@ -412,4 +428,22 @@ impl CheckedProgram {
             .find(|t| t.name == name)
             .map(|t| t.id)
     }
+}
+
+/// Pure, acyclic functions appear in dependency-topological order.
+#[derive(Clone, Debug)]
+pub struct Function {
+    pub id: FunctionId,
+    pub name: String,
+    pub params: Vec<Param>,
+    pub result: BindingId,
+    pub result_type: ScalarType,
+    pub requires: Vec<NamedExpr>,
+    pub ensures: Vec<NamedExpr>,
+    pub body: ExprId,
+    pub dependencies: Vec<FunctionId>,
+    pub wcet_bound: u64,
+    pub fold_depth: u32,
+    pub max_fold_product: u32,
+    pub span: Span,
 }

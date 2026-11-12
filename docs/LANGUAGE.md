@@ -157,9 +157,22 @@ The inclusive integer range performs at most the declared number of iterations.
 The initializer evaluates first, followed by the lower and upper bounds.
 An empty range returns the initial accumulator. The index never wraps; reaching
 its type's maximum ends iteration. Accumulator, index and body bindings are
-lexically scoped. Up to two nested folds are admitted, with a maximum declared
-bound and nested bound product of 1024. Body folds may allocate, write and emit.
+lexically scoped. There is no fixed nesting or 1024-iteration policy ceiling. Declared bounds and
+bound products must fit the current checked `u32` metadata representation, and
+runtime instruction cost must fit `u64`. Body folds may allocate, write and emit.
 Specification/projection expressions may use only pure folds.
+
+## Pure verified functions
+
+`function name(parameters) -> Type require ...; ensure ...; body { yield value; }`
+defines a pure, acyclic scalar helper. Calls evaluate ordered arguments once;
+false function requirements trap. Functions can use pure bounded folds and other
+pure helpers, but not state/effects. Each dependency is independently proved once
+per session before callers may use its contract summary; caller proofs and
+generated code do not inline whole helper bodies. `result` names the return value
+in function ensures. See [compositional functions](COMPOSITIONAL_FUNCTIONS.md)
+for precise admission, replay and current scope, and `examples/functions.vera`
+for a runnable state-free effect protocol using nested helpers.
 
 ## Invariants and verification
 
@@ -189,7 +202,8 @@ implementation. Callers choose the invariants that express their application
 rules.
 
 See [proof budgets](PROOF_BUDGETS.md) for independent expression, script-byte,
-and candidate-effect limits. Resource exhaustion never weakens a proof.
+and candidate-effect controls. They are unset by default and apply only when
+explicitly selected. Resource exhaustion never weakens a proof.
 
 ## Projections
 
@@ -230,7 +244,7 @@ The CLI provides these commands:
 |---|---|
 | `parse` | Parse source syntax; `--json` emits its syntax tree |
 | `check` | Check types, declarations, footprints and bounds |
-| `verify` | Run all three proof obligations, or select `--transition NAME` |
+| `verify` | Run function and transition proofs, or select `--transition NAME` / `--function NAME` |
 | `run` | Execute a transition with `--transition NAME` and typed `--param NAME=VALUE` arguments |
 | `project` | Evaluate an authorized `--projection NAME` |
 | `replay` | Recover a `--wal PATH` from its original initial-state baseline |

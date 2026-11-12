@@ -11,7 +11,7 @@
 mod terms;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     panic::{catch_unwind, AssertUnwindSafe},
     time::Instant,
 };
@@ -39,33 +39,20 @@ use terms::{
     Script, Sort, Term,
 };
 
-/// Explicit resource bounds; no table capacity is ever reduced to fit a proof.
-#[derive(Clone, Debug, Serialize)]
+/// Optional, explicitly selected diagnostic budgets. None imposes no policy cap.
+/// Physical/numeric representation limits still apply; capacities are never reduced.
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct VerifierConfig {
-    pub timeout_ms: u32,
-    pub max_state_cells: usize,
-    pub max_unroll: u32,
-    pub witness_attempts: usize,
+    pub timeout_ms: Option<u32>,
+    pub max_state_cells: Option<usize>,
+    pub max_unroll: Option<u32>,
+    pub witness_attempts: Option<usize>,
     /// Maximum expression visits during symbolic lowering, independent of capacity.
-    pub max_expression_steps: usize,
+    pub max_expression_steps: Option<usize>,
     /// Maximum UTF-8 bytes retained in one generated SMT query.
-    pub max_smt_bytes: usize,
+    pub max_smt_bytes: Option<usize>,
     /// Maximum candidate effects, including inactive unrolled emissions.
-    pub max_effect_events: usize,
-}
-
-impl Default for VerifierConfig {
-    fn default() -> Self {
-        Self {
-            timeout_ms: 10_000,
-            max_state_cells: 4096,
-            max_unroll: 1024,
-            witness_attempts: 8,
-            max_expression_steps: 4_194_304,
-            max_smt_bytes: 64 * 1024 * 1024,
-            max_effect_events: 4096,
-        }
-    }
+    pub max_effect_events: Option<usize>,
 }
 
 /// Compatibility spelling for callers configuring SMT verification.
@@ -94,6 +81,8 @@ impl ObligationResult {
 /// generations and physical values even for unoccupied slots.
 #[derive(Clone, Debug, Serialize)]
 pub struct Counterexample {
+    pub target_kind: String,
+    pub return_value: Option<Value>,
     pub transition: String,
     pub obligation: String,
     pub law: String,
@@ -157,6 +146,9 @@ pub struct EncodingMetrics {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct VerificationResult {
+    pub target_kind: String,
+    /// Flat dependency evidence; never recursively duplicate a proof DAG.
+    pub contract_dependencies: Vec<ContractDependency>,
     pub transition: String,
     pub config: VerifierConfig,
     /// None when a complete encoding could not be constructed.
@@ -172,6 +164,15 @@ pub struct VerificationResult {
     pub witness: Option<Counterexample>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct ContractDependency {
+    pub function: String,
+    pub safety: String,
+    pub panic: String,
+    pub liveness: String,
+    pub ok: bool,
+}
+
 impl VerificationResult {
     pub fn ok(&self) -> bool {
         self.diagnostics.is_empty()
@@ -181,7 +182,7 @@ impl VerificationResult {
     }
 
     pub fn summary(&self) -> String {
-        let mut out = format!("transition {}:", self.transition);
+        let mut out = format!("{} {}:", self.target_kind, self.transition);
         for (index, result) in [&self.safety, &self.panic, &self.liveness]
             .into_iter()
             .enumerate()
@@ -243,7 +244,11 @@ struct Projected {
 
 struct Encoding<'a> {
     program: &'a CheckedProgram,
-    transition: &'a Transition,
+    transition: Transition,
+    target_function: Option<FunctionId>,
+    verified_functions: &'a BTreeSet<FunctionId>,
+    declared_functions: BTreeSet<FunctionId>,
+    summary_calls: usize,
     config: &'a VerifierConfig,
     script: Script,
     pre: SymbolicState,
@@ -290,11 +295,17 @@ fn scalar_sort(ty: &ScalarType) -> Sort {
 impl<'a> Encoding<'a> {
     fn new(
         program: &'a CheckedProgram,
-        transition: &'a Transition,
+        transition: &Transition,
         config: &'a VerifierConfig,
+        verified_functions: &'a BTreeSet<FunctionId>,
+        target_function: Option<FunctionId>,
     ) -> LowerResult<Self> {
-        let cells = program
-            .tables()
+        let tables = if target_function.is_some() {
+            &[][..]
+        } else {
+            program.tables()
+        };
+        let cells = tables
             .iter()
             .try_fold(0_usize, |total, table| {
                 let capacity = usize::try_from(table.capacity).ok()?;
@@ -307,29 +318,36 @@ impl<'a> Encoding<'a> {
                     transition.span,
                 )
             })?;
-        if cells > config.max_state_cells {
+        if let Some(limit) = config.max_state_cells.filter(|limit| cells > *limit) {
             return Err(diagnostic(
                 "D_VERIFY_RESOURCE",
                 format!(
                     "complete state requires {cells} cells; max_state_cells is {}",
-                    config.max_state_cells
+                    limit
                 ),
                 transition.span,
             ));
         }
-        if transition.max_fold_product > config.max_unroll {
+        if let Some(limit) = config
+            .max_unroll
+            .filter(|limit| transition.max_fold_product > *limit)
+        {
             return Err(diagnostic(
                 "D_VERIFY_RESOURCE",
                 format!(
                     "fold product {} exceeds max_unroll {}",
-                    transition.max_fold_product, config.max_unroll
+                    transition.max_fold_product, limit
                 ),
                 transition.span,
             ));
         }
         let mut this = Self {
             program,
-            transition,
+            transition: transition.clone(),
+            target_function,
+            verified_functions,
+            declared_functions: BTreeSet::new(),
+            summary_calls: 0,
             config,
             script: Script::with_budget(config.max_smt_bytes),
             pre: SymbolicState {
@@ -362,7 +380,7 @@ impl<'a> Encoding<'a> {
             effect_args: BTreeMap::new(),
             effect_count: Term::bits(bv(0, 64), 64),
         };
-        for table in program.tables() {
+        for table in tables {
             let mut rows = Vec::new();
             for slot in 0..table.capacity as usize {
                 this.check_script_budget(table.span)?;
@@ -458,14 +476,22 @@ impl<'a> Encoding<'a> {
             this.constrain_domain(&term, &Domain::scalar(parameter.ty.clone()));
             this.env.insert(parameter.binding, term);
         }
-        let pre_invariants = this.invariants(true)?;
+        let pre_invariants = if target_function.is_some() {
+            "true".into()
+        } else {
+            this.invariants(true)?
+        };
         this.script.assert(pre_invariants);
         for requirement in &transition.requires {
             let condition = this.expr(requirement.value)?;
             this.script.guard(&mut this.path, &condition.text);
         }
         this.statements(&transition.body)?;
-        let mut postconditions = vec![this.invariants(false)?];
+        let mut postconditions = vec![if target_function.is_some() {
+            "true".into()
+        } else {
+            this.invariants(false)?
+        }];
         for ensure in &transition.ensures {
             postconditions.push(this.spec(ensure.value, false)?);
         }
@@ -479,13 +505,13 @@ impl<'a> Encoding<'a> {
             .map(|value| value.len())
             .max()
             .unwrap_or(0);
-        if this
-            .script
-            .bytes()
-            .saturating_add(predicate_bytes)
-            .saturating_add(128)
-            > config.max_smt_bytes
-        {
+        if config.max_smt_bytes.is_some_and(|limit| {
+            this.script
+                .bytes()
+                .saturating_add(predicate_bytes)
+                .saturating_add(128)
+                > limit
+        }) {
             return Err(diagnostic(
                 "D_VERIFY_RESOURCE",
                 "SMT query exceeds max_smt_bytes",
@@ -702,12 +728,16 @@ impl<'a> Encoding<'a> {
 
     fn expr(&mut self, id: ExprId) -> LowerResult<Term> {
         self.check_script_budget(self.program.expr(id).span)?;
-        if self.work >= self.config.max_expression_steps {
+        if let Some(limit) = self
+            .config
+            .max_expression_steps
+            .filter(|limit| self.work >= *limit)
+        {
             return Err(diagnostic(
                 "D_VERIFY_RESOURCE",
                 format!(
                     "SMT expression expansion exceeds max_expression_steps {}",
-                    self.config.max_expression_steps
+                    limit
                 ),
                 self.program.expr(id).span,
             ));
@@ -860,6 +890,9 @@ impl<'a> Encoding<'a> {
                 let input_domain = &self.program.expr(value).domain;
                 self.coerce(&input, domain, input_domain.signed())
             }
+            ExprKind::Call { function, args } => {
+                self.function_call(function, &args, expression.span)?
+            }
             ExprKind::EffectCount => self.effect_count.clone(),
             ExprKind::EffectIs { effect, index } => {
                 let index = self.expr(index)?;
@@ -893,6 +926,80 @@ impl<'a> Encoding<'a> {
         };
         let value = self.coerce(&value, domain, domain.signed());
         Ok(if direct { value } else { self.bind(value) })
+    }
+
+    fn function_call(&mut self, id: FunctionId, args: &[ExprId], span: Span) -> LowerResult<Term> {
+        if !self.verified_functions.contains(&id) {
+            return Err(diagnostic(
+                "D_VERIFY_DEPENDENCY",
+                format!(
+                    "function {:?} has no independently verified contract",
+                    self.program.function(id).name
+                ),
+                span,
+            ));
+        }
+        let function = self.program.function(id).clone();
+        let mut values = Vec::new();
+        for (argument, parameter) in args.iter().zip(&function.params) {
+            let value = self.expr(*argument)?;
+            values.push(self.narrow(value, &parameter.ty));
+        }
+        let saved_env = self.env.clone();
+        for (parameter, value) in function.params.iter().zip(&values) {
+            self.env.insert(parameter.binding, value.clone());
+        }
+        // A call's precondition is an obligation of its caller, not an assumption.
+        for requirement in &function.requires {
+            let condition = self.expr(requirement.value)?;
+            self.script.trap_if(&mut self.path, &not(&condition.text));
+        }
+        let symbol = format!("function_{}", id.0);
+        if self.declared_functions.insert(id) {
+            let parameters = function
+                .params
+                .iter()
+                .map(|p| scalar_sort(&p.ty).smt())
+                .collect::<Vec<_>>()
+                .join(" ");
+            self.script.declaration(format!(
+                "(declare-fun {symbol} ({parameters}) {})",
+                scalar_sort(&function.result_type).smt()
+            ));
+        }
+        let application = if values.is_empty() {
+            symbol
+        } else {
+            format!(
+                "({symbol} {})",
+                values
+                    .iter()
+                    .map(|v| v.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            )
+        };
+        let result = self.bind(Term {
+            text: application,
+            sort: scalar_sort(&function.result_type),
+        });
+        let active = and([self.path.live.clone(), self.path.active.clone()]);
+        if let ScalarType::Enum(tags) = &function.result_type {
+            if tags.len() < 256 {
+                self.script.assert(implies(
+                    &active,
+                    &cmp("lt", &result.text, &bv(tags.len(), result.width()), false),
+                ));
+            }
+        }
+        self.env.insert(function.result, result.clone());
+        for ensure in &function.ensures {
+            let condition = self.spec(ensure.value, false)?;
+            self.script.assert(implies(&active, &condition));
+        }
+        self.env = saved_env;
+        self.summary_calls += 1;
+        Ok(result)
     }
 
     fn empty_effect_array(element: Sort) -> String {
@@ -977,7 +1084,11 @@ impl<'a> Encoding<'a> {
                     fields,
                 } => self.allocate(*table, *binding, fields)?,
                 StmtKind::Emit { effect, args } => {
-                    if self.effect_events >= self.config.max_effect_events {
+                    if self
+                        .config
+                        .max_effect_events
+                        .is_some_and(|limit| self.effect_events >= limit)
+                    {
                         return Err(diagnostic(
                             "D_VERIFY_RESOURCE",
                             "symbolic outbox exceeds max_effect_events",
@@ -993,7 +1104,11 @@ impl<'a> Encoding<'a> {
                     }
                     // Arguments may themselves emit. Check again at the actual
                     // append boundary, not only on entry to the outer emit.
-                    if self.effect_events >= self.config.max_effect_events {
+                    if self
+                        .config
+                        .max_effect_events
+                        .is_some_and(|limit| self.effect_events >= limit)
+                    {
                         return Err(diagnostic(
                             "D_VERIFY_RESOURCE",
                             "symbolic outbox exceeds max_effect_events",
@@ -1181,7 +1296,11 @@ impl<'a> Encoding<'a> {
     }
 
     fn fold(&mut self, fold: &Fold) -> LowerResult<Term> {
-        if fold.limit > self.config.max_unroll {
+        if self
+            .config
+            .max_unroll
+            .is_some_and(|limit| fold.limit > limit)
+        {
             return Err(diagnostic(
                 "D_VERIFY_RESOURCE",
                 "fold exceeds max_unroll",
@@ -1360,7 +1479,10 @@ fn row_local(
                 || (stable_occupancy.contains(target)
                     && row_local(program, *key, table, quantifier, stable_occupancy))
         }
-        ExprKind::EffectCount | ExprKind::EffectIs { .. } | ExprKind::EffectArg { .. } => false,
+        ExprKind::Call { .. }
+        | ExprKind::EffectCount
+        | ExprKind::EffectIs { .. }
+        | ExprKind::EffectArg { .. } => false,
         ExprKind::UniqueLookup { .. }
         | ExprKind::Sum { .. }
         | ExprKind::KeyOf { .. }
@@ -1467,8 +1589,15 @@ fn signed_value(value: Value, ty: &ScalarType) -> Value {
 }
 
 fn project(encoding: &Encoding<'_>, model: &z3::Model) -> Result<Candidate, String> {
-    let mut state = State::empty(encoding.program)
-        .map_err(|error| format!("state allocation: {}", error.code))?;
+    let mut state = if encoding.target_function.is_some() {
+        State {
+            tables: Vec::new(),
+            outbox: Vec::new(),
+        }
+    } else {
+        State::empty(encoding.program)
+            .map_err(|error| format!("state allocation: {}", error.code))?
+    };
     let mut params = BTreeMap::new();
     for variable in &encoding.projections {
         let value = model_term(model, &variable.term)?;
@@ -1489,6 +1618,9 @@ fn project(encoding: &Encoding<'_>, model: &z3::Model) -> Result<Candidate, Stri
                 state.tables[column.table.0].columns[column.index][*slot] = signed_value(value, ty);
             }
         }
+    }
+    if encoding.target_function.is_some() {
+        return Ok(Candidate { params, state });
     }
     recompute_aggregates(encoding.program, &mut state)
         .map_err(|error| format!("aggregate materialization: {}", error.code))?;
@@ -1604,11 +1736,95 @@ fn violated_postconditions(
     (violated, failed_ensures)
 }
 
+fn replay_function(
+    encoding: &Encoding<'_>,
+    candidate: &Candidate,
+    obligation: Obligation,
+    id: FunctionId,
+) -> Result<Counterexample, String> {
+    let function = encoding.program.function(id);
+    let args = function
+        .params
+        .iter()
+        .map(|p| candidate.params[&p.name].clone())
+        .collect::<Vec<_>>();
+    let executed = crate::runtime::eval_function(encoding.program, id, &args);
+    let mut bindings = function
+        .params
+        .iter()
+        .zip(&args)
+        .map(|(p, v)| (p.binding, v.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let mut return_value = None;
+    let mut failure = None;
+    let mut details = Vec::new();
+    let mut violated = Vec::new();
+    let mut trace = Vec::new();
+    match (obligation, executed) {
+        (Obligation::Panic, Err(error)) if error.kind == FailureKind::Trap => {
+            violated.push(error.code.clone());
+            trace.push(TraceStep {
+                span: error.span.unwrap_or(function.span),
+                kind: "trap".into(),
+                text: error.code.clone(),
+                value: None,
+            });
+            failure = Some(error);
+        }
+        (Obligation::Panic, _) => {
+            return Err("function trap candidate does not replay as a trap".into())
+        }
+        (_, Ok(value)) => {
+            bindings.insert(function.result, value.clone());
+            trace.push(TraceStep {
+                span: encoding.program.expr(function.body).span,
+                kind: "return".into(),
+                text: format!("return {}", function.name),
+                value: Some(value.clone()),
+            });
+            return_value = Some(value);
+            details = failed_ensures(
+                encoding.program,
+                &encoding.transition,
+                &candidate.state,
+                &candidate.state,
+                &bindings,
+            );
+            if matches!(obligation, Obligation::Safety) {
+                violated = details
+                    .iter()
+                    .map(|detail| format!("ensure {}", detail.name))
+                    .collect();
+                if violated.is_empty() {
+                    return Err(
+                        "function postcondition candidate is not reproduced by concrete evaluation"
+                            .into(),
+                    );
+                }
+            }
+        }
+        (_, Err(error)) => {
+            return Err(format!(
+                "function committing candidate replays as {}",
+                error.code
+            ))
+        }
+    }
+    let law = violated
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "concrete returning function execution".into());
+    Ok(Counterexample {target_kind:"function".into(),return_value,transition:function.name.clone(),obligation:obligation.name().into(),law,params:candidate.params.clone(),pre_state:candidate.state.clone(),trace,failure,violated,emitted_effects:Vec::new(),failed_ensures:details,directive:"Correct the function body or its independently justified contract; callers cannot assume an unproved summary.".into()})
+}
+
 fn replay(
     encoding: &Encoding<'_>,
     candidate: &Candidate,
     obligation: Obligation,
 ) -> Result<Counterexample, String> {
+    if let Some(function) = encoding.target_function {
+        return replay_function(encoding, candidate, obligation, function);
+    }
     let mut machine = Machine::with_state(encoding.program, candidate.state.clone())
         .map_err(|error| format!("native state admission: {}", error.code))?;
     let execution = machine.execute(&encoding.transition.name, &candidate.params, true);
@@ -1637,7 +1853,7 @@ fn replay(
         (Obligation::Safety, Ok(execution)) => {
             let (violated, details) = violated_postconditions(
                 encoding.program,
-                encoding.transition,
+                &encoding.transition,
                 &candidate.state,
                 &machine.state,
                 &execution.bindings,
@@ -1660,7 +1876,7 @@ fn replay(
         (Obligation::Liveness, Ok(execution)) => {
             ensure_failures = failed_ensures(
                 encoding.program,
-                encoding.transition,
+                &encoding.transition,
                 &candidate.state,
                 &machine.state,
                 &execution.bindings,
@@ -1681,6 +1897,8 @@ fn replay(
         }
     };
     Ok(Counterexample {
+        target_kind: "transition".into(),
+        return_value: None,
         transition: encoding.transition.name.clone(),
         obligation: obligation.name().into(),
         law,
@@ -1709,15 +1927,32 @@ fn solve(
         let solver = Solver::new();
         solver.from_string(base_script.clone());
         let mut params = z3::Params::new();
-        for attempt in 0..encoding.config.witness_attempts.max(1) {
-            let remaining = u128::from(encoding.config.timeout_ms)
-                .saturating_sub(started.elapsed().as_millis());
-            if remaining == 0 {
-                return ("unknown", Some("verification timeout".into()), None);
+        let mut attempt = 0_usize;
+        loop {
+            if encoding
+                .config
+                .witness_attempts
+                .is_some_and(|limit| attempt >= limit)
+            {
+                return (
+                    "unknown",
+                    Some(format!(
+                        "no realizable witness after {attempt} candidates: {}",
+                        last_spurious.unwrap_or_else(|| "candidate budget exhausted".into())
+                    )),
+                    None,
+                );
+            }
+            if let Some(timeout_ms) = encoding.config.timeout_ms {
+                let remaining =
+                    u128::from(timeout_ms).saturating_sub(started.elapsed().as_millis());
+                if remaining == 0 {
+                    return ("unknown", Some("verification timeout".into()), None);
+                }
+                params.set_u32("timeout", remaining as u32);
+                solver.set_params(&params);
             }
             exported_script = base_script.clone() + &blocks.join("\n") + "\n(check-sat)\n";
-            params.set_u32("timeout", remaining.min(u128::from(u32::MAX)) as u32);
-            solver.set_params(&params);
             match solver.check() {
                 SatResult::Unsat if attempt == 0 => return ("unsat", None, None),
                 SatResult::Unsat => {
@@ -1767,6 +2002,15 @@ fn solve(
                         .and_then(|candidate| replay(encoding, &candidate, obligation))
                     {
                         Ok(witness) => return ("sat", None, Some(witness)),
+                        Err(reason) if encoding.summary_calls > 0 => {
+                            return (
+                                "unknown",
+                                Some(format!(
+                                    "contract summary candidate could not replay: {reason}"
+                                )),
+                                None,
+                            );
+                        }
                         Err(reason) => {
                             last_spurious = Some(reason);
                         }
@@ -1781,7 +2025,11 @@ fn solve(
                         .len()
                         .saturating_add(clause.len())
                         .saturating_add(1);
-                    if next_bytes > encoding.config.max_smt_bytes {
+                    if encoding
+                        .config
+                        .max_smt_bytes
+                        .is_some_and(|limit| next_bytes > limit)
+                    {
                         return (
                             "unknown",
                             Some("witness search exceeds max_smt_bytes".into()),
@@ -1801,16 +2049,15 @@ fn solve(
                     blocks.push(clause);
                 }
             }
+            let Some(next_attempt) = attempt.checked_add(1) else {
+                return (
+                    "unknown",
+                    Some("witness attempt count exceeds host address space".into()),
+                    None,
+                );
+            };
+            attempt = next_attempt;
         }
-        (
-            "unknown",
-            Some(format!(
-                "no realizable witness after {} candidates: {}",
-                encoding.config.witness_attempts.max(1),
-                last_spurious.unwrap_or_else(|| "native replay failed".into())
-            )),
-            None,
-        )
     }));
     let (status, reason, witness) = result.unwrap_or_else(|_| {
         (
@@ -1834,6 +2081,8 @@ fn solve(
 fn failed(transition: &str, diagnostic: Diagnostic, config: &VerifierConfig) -> VerificationResult {
     let reason = Some(diagnostic.message.clone());
     VerificationResult {
+        target_kind: "transition".into(),
+        contract_dependencies: Vec::new(),
         transition: transition.into(),
         config: config.clone(),
         encoding_metrics: None,
@@ -1849,8 +2098,261 @@ fn failed(transition: &str, diagnostic: Diagnostic, config: &VerifierConfig) -> 
     }
 }
 
-/// Prove all three obligations for one resolved transition. A solver failure,
-/// explicit resource limit or unvalidated SAT candidate always fails closed.
+/// A private invocation-scoped cache is the only authority to instantiate a
+/// function contract. CheckedProgram alone grants no such authority.
+struct VerificationSession<'a> {
+    program: &'a CheckedProgram,
+    config: &'a VerifierConfig,
+    results: BTreeMap<FunctionId, VerificationResult>,
+    verified: BTreeSet<FunctionId>,
+}
+
+impl<'a> VerificationSession<'a> {
+    fn new(program: &'a CheckedProgram, config: &'a VerifierConfig) -> Self {
+        Self {
+            program,
+            config,
+            results: BTreeMap::new(),
+            verified: BTreeSet::new(),
+        }
+    }
+    fn function(&mut self, id: FunctionId) {
+        let mut needed = BTreeSet::new();
+        let mut todo = vec![id];
+        while let Some(current) = todo.pop() {
+            if !self.results.contains_key(&current) && needed.insert(current) {
+                todo.extend(self.program.function(current).dependencies.iter().copied());
+            }
+        }
+        // Semantic analysis assigns IDs in dependency-topological order. This
+        // avoids recursive proof traversal and verifies each DAG node once.
+        for id in needed {
+            let function = self.program.function(id).clone();
+            let wrapper = function_transition(&function);
+            let mut result = if function
+                .dependencies
+                .iter()
+                .any(|id| !self.verified.contains(id))
+            {
+                failed(
+                    &function.name,
+                    diagnostic(
+                        "D_VERIFY_DEPENDENCY",
+                        "a function dependency failed verification; its contract cannot be assumed",
+                        function.span,
+                    ),
+                    self.config,
+                )
+            } else {
+                verify_target(
+                    self.program,
+                    &wrapper,
+                    self.config,
+                    &self.verified,
+                    Some(id),
+                )
+            };
+            result.target_kind = "function".into();
+            result.contract_dependencies = self.dependency_evidence(&function.dependencies);
+            if result.ok() {
+                self.verified.insert(id);
+            }
+            self.results.insert(id, result);
+        }
+    }
+    fn dependency_evidence(&self, roots: &[FunctionId]) -> Vec<ContractDependency> {
+        // Retain only direct DAG edges. Transitive evidence is shared by the
+        // separately emitted function proofs, not copied into every caller.
+        let ids = roots.iter().copied().collect::<BTreeSet<_>>();
+        ids.into_iter()
+            .filter_map(|id| {
+                self.results.get(&id).map(|result| ContractDependency {
+                    function: self.program.function(id).name.clone(),
+                    safety: result.safety.status.clone(),
+                    panic: result.panic.status.clone(),
+                    liveness: result.liveness.status.clone(),
+                    ok: result.ok(),
+                })
+            })
+            .collect()
+    }
+    fn transition(&mut self, transition: &Transition) -> VerificationResult {
+        let dependencies = transition_dependencies(self.program, transition);
+        for dependency in &dependencies {
+            self.function(*dependency);
+        }
+        let mut result = if dependencies.iter().any(|id| !self.verified.contains(id)) {
+            failed(&transition.name,diagnostic("D_VERIFY_DEPENDENCY","a called function failed verification; no caller proof may assume its contract",transition.span),self.config)
+        } else {
+            verify_target(self.program, transition, self.config, &self.verified, None)
+        };
+        result.contract_dependencies = self.dependency_evidence(&dependencies);
+        result
+    }
+}
+
+fn function_transition(function: &Function) -> Transition {
+    Transition {
+        id: TransitionId(usize::MAX),
+        name: function.name.clone(),
+        params: function.params.clone(),
+        reads: Vec::new(),
+        writes: Vec::new(),
+        requires: function.requires.clone(),
+        ensures: function.ensures.clone(),
+        body: vec![
+            Stmt {
+                kind: StmtKind::Let {
+                    binding: function.result,
+                    value: function.body,
+                },
+                span: function.span,
+            },
+            Stmt {
+                kind: StmtKind::Commit,
+                span: function.span,
+            },
+        ],
+        wcet_bound: function.wcet_bound,
+        fold_depth: function.fold_depth,
+        max_fold_product: function.max_fold_product,
+        tier: 1,
+        span: function.span,
+    }
+}
+
+fn statement_dependencies(
+    program: &CheckedProgram,
+    statements: &[Stmt],
+    out: &mut BTreeSet<FunctionId>,
+) {
+    for statement in statements {
+        let expressions = match &statement.kind {
+            StmtKind::Let { value, .. } | StmtKind::Eval(value) => vec![*value],
+            StmtKind::Guard { condition, .. } => vec![*condition],
+            StmtKind::TableSet { key, value, .. } => vec![*key, *value],
+            StmtKind::Allocate { fields, .. } => fields.iter().map(|(_, value)| *value).collect(),
+            StmtKind::Emit { args, .. } => args.clone(),
+            StmtKind::Commit => Vec::new(),
+        };
+        for expression in expressions {
+            expression_dependencies(program, expression, out);
+        }
+    }
+}
+fn expression_dependencies(program: &CheckedProgram, id: ExprId, out: &mut BTreeSet<FunctionId>) {
+    let mut children = Vec::new();
+    match &program.expr(id).kind {
+        ExprKind::Call { function, args } => {
+            out.insert(*function);
+            children.extend(args);
+        }
+        ExprKind::Unary { operand, .. } => children.push(*operand),
+        ExprKind::Binary { left, right, .. } => children.extend([*left, *right]),
+        ExprKind::Select { condition, yes, no } => children.extend([*condition, *yes, *no]),
+        ExprKind::TableGet { key, .. }
+        | ExprKind::SlotRead { key, .. }
+        | ExprKind::TableExists { key, .. } => children.push(*key),
+        ExprKind::UniqueLookup { value, .. } | ExprKind::KeyOf { value, .. } => {
+            children.push(*value)
+        }
+        ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
+            children.push(*index)
+        }
+        ExprKind::Fold(fold) => {
+            children.extend([fold.init, fold.lo, fold.hi, fold.yield_value]);
+            statement_dependencies(program, &fold.body, out);
+        }
+        ExprKind::Constant(_)
+        | ExprKind::Binding(_)
+        | ExprKind::Sum { .. }
+        | ExprKind::EffectCount => {}
+    }
+    for child in children {
+        expression_dependencies(program, child, out);
+    }
+}
+fn transition_dependencies(program: &CheckedProgram, transition: &Transition) -> Vec<FunctionId> {
+    let mut out = BTreeSet::new();
+    for invariant in program.invariants() {
+        expression_dependencies(program, invariant.condition, &mut out);
+    }
+    for access in transition.reads.iter().chain(&transition.writes) {
+        if let Some(key) = access.key {
+            expression_dependencies(program, key, &mut out);
+        }
+    }
+    for expression in transition.requires.iter().chain(&transition.ensures) {
+        expression_dependencies(program, expression.value, &mut out);
+    }
+    statement_dependencies(program, &transition.body, &mut out);
+    out.into_iter().collect()
+}
+
+fn verify_target(
+    program: &CheckedProgram,
+    transition: &Transition,
+    config: &VerifierConfig,
+    verified: &BTreeSet<FunctionId>,
+    function: Option<FunctionId>,
+) -> VerificationResult {
+    let encoding = match Encoding::new(program, transition, config, verified, function) {
+        Ok(encoding) => encoding,
+        Err(diagnostic) => return failed(&transition.name, diagnostic, config),
+    };
+    let (safety, smt_safety, safety_witness) = solve(&encoding, Obligation::Safety);
+    let (panic, smt_panic, panic_witness) = solve(&encoding, Obligation::Panic);
+    let (liveness, smt_liveness, witness) = solve(&encoding, Obligation::Liveness);
+    let mut diagnostics = Vec::new();
+    for result in [&safety, &panic, &liveness] {
+        if result.status == "error" {
+            diagnostics.push(diagnostic(
+                "D_SOLVER",
+                result
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "native solver error".into()),
+                transition.span,
+            ));
+        }
+    }
+    let encoding_metrics = Some(EncodingMetrics {
+        state_cells: encoding.state_cells,
+        expression_steps: encoding.work,
+        effect_events: encoding.effect_events,
+        retained_smt_bytes: encoding.script.bytes(),
+        max_query_bytes: [&smt_safety, &smt_panic, &smt_liveness]
+            .into_iter()
+            .map(|query| query.len())
+            .max()
+            .unwrap_or(0),
+    });
+    VerificationResult {
+        target_kind: if function.is_some() {
+            "function"
+        } else {
+            "transition"
+        }
+        .into(),
+        contract_dependencies: Vec::new(),
+        transition: transition.name.clone(),
+        config: config.clone(),
+        encoding_metrics,
+        safety,
+        panic,
+        liveness,
+        smt_safety,
+        smt_panic,
+        smt_liveness,
+        diagnostics,
+        counterexample: safety_witness.or(panic_witness),
+        witness,
+    }
+}
+
+/// Prove a transition and each reachable pure function independently. A private
+/// per-invocation session reuses dependencies; no persistent or supplied proof
+/// token is trusted. Solver UNKNOWN/error and unvalidated SAT fail closed.
 pub fn verify_transition(
     program: &CheckedProgram,
     name: &str,
@@ -1867,53 +2369,31 @@ pub fn verify_transition(
             config,
         );
     };
-    let encoding = match Encoding::new(program, program.transition(id), config) {
-        Ok(encoding) => encoding,
-        Err(diagnostic) => return failed(name, diagnostic, config),
-    };
-    let (safety, smt_safety, safety_witness) = solve(&encoding, Obligation::Safety);
-    let (panic, smt_panic, panic_witness) = solve(&encoding, Obligation::Panic);
-    let (liveness, smt_liveness, witness) = solve(&encoding, Obligation::Liveness);
-    let mut diagnostics = Vec::new();
-    for result in [&safety, &panic, &liveness] {
-        if result.status == "error" {
-            diagnostics.push(diagnostic(
-                "D_SOLVER",
-                result
-                    .reason
-                    .clone()
-                    .unwrap_or_else(|| "native solver error".into()),
-                program.transition(id).span,
-            ));
-        }
-    }
-    let encoding_metrics = Some(EncodingMetrics {
-        state_cells: encoding.state_cells,
-        expression_steps: encoding.work,
-        effect_events: encoding.effect_events,
-        retained_smt_bytes: encoding.script.bytes(),
-        max_query_bytes: [&smt_safety, &smt_panic, &smt_liveness]
-            .into_iter()
-            .map(|query| query.len())
-            .max()
-            .unwrap_or(0),
-    });
-    VerificationResult {
-        transition: name.into(),
-        config: config.clone(),
-        encoding_metrics,
-        safety,
-        panic,
-        liveness,
-        smt_safety,
-        smt_panic,
-        smt_liveness,
-        diagnostics,
-        counterexample: safety_witness.or(panic_witness),
-        witness,
-    }
+    VerificationSession::new(program, config).transition(program.transition(id))
 }
-
+/// Independently verify one pure function and its reachable dependencies.
+pub fn verify_function(
+    program: &CheckedProgram,
+    name: &str,
+    config: &VerifierConfig,
+) -> VerificationResult {
+    let Some(id) = program.function_id(name) else {
+        let mut result = failed(
+            name,
+            diagnostic(
+                "D_UNKNOWN_FUNCTION",
+                format!("unknown function {name:?}"),
+                Span::default(),
+            ),
+            config,
+        );
+        result.target_kind = "function".into();
+        return result;
+    };
+    let mut session = VerificationSession::new(program, config);
+    session.function(id);
+    session.results[&id].clone()
+}
 pub fn verify_transition_dual(
     program: &CheckedProgram,
     name: &str,
@@ -1921,11 +2401,16 @@ pub fn verify_transition_dual(
 ) -> VerificationResult {
     verify_transition(program, name, config)
 }
-
 pub fn verify_all(program: &CheckedProgram, config: &VerifierConfig) -> Vec<VerificationResult> {
-    program
-        .transitions()
+    let mut session = VerificationSession::new(program, config);
+    for function in program.functions() {
+        session.function(function.id);
+    }
+    let mut results = program
+        .functions()
         .iter()
-        .map(|transition| verify_transition(program, &transition.name, config))
-        .collect()
+        .map(|f| session.results[&f.id].clone())
+        .collect::<Vec<_>>();
+    results.extend(program.transitions().iter().map(|t| session.transition(t)));
+    results
 }

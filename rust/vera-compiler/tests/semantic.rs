@@ -224,12 +224,12 @@ fn fold_bindings_are_scoped_and_bounds_have_matching_integer_types() {
 }
 
 #[test]
-fn fold_depth_and_product_limits_cover_nested_operand_expressions() {
-    for bound in ["0", "1025", "18446744073709551616"] {
+fn fold_representation_bounds_do_not_impose_validation_policy_limits() {
+    for bound in ["0", "18446744073709551616"] {
         reject(&format!("transition go() reads [] writes [] body {{let %x:u64=fold_bounded<{bound}>(acc:u64=0,i in [0..1]) {{yield acc;}};commit;}}"), "D_FOLD_BOUND");
     }
-    reject("transition go() reads [] writes [] body {let %x:u64=fold_bounded<32>(a:u64=0,i in [0..31]) {let %b:u64=fold_bounded<33>(b:u64=0,j in [0..32]) {yield b;};yield a;};commit;}", "D_FOLD_BOUND");
-    reject("transition go() reads [] writes [] body {let %x:u64=fold_bounded<1>(a:u64=0,i in [0..0]) {let %b:u64=fold_bounded<1>(b:u64=0,j in [0..0]) {let %c:u64=fold_bounded<1>(c:u64=0,k in [0..0]) {yield c;};yield b;};yield a;};commit;}", "D_FOLD_DEPTH");
+    accept("transition go() reads [] writes [] body {let %x:u64=fold_bounded<32>(a:u64=0,i in [0..31]) {let %b:u64=fold_bounded<33>(b:u64=0,j in [0..32]) {yield b;};yield a;};commit;}");
+    accept("transition go() reads [] writes [] body {let %x:u64=fold_bounded<1>(a:u64=0,i in [0..0]) {let %b:u64=fold_bounded<1>(b:u64=0,j in [0..0]) {let %c:u64=fold_bounded<1>(c:u64=0,k in [0..0]) {yield c;};yield b;};yield a;};commit;}");
 }
 
 #[test]

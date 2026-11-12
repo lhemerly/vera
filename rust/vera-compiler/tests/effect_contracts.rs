@@ -274,7 +274,7 @@ fn nested_emitting_arguments_cannot_exceed_event_budget() {
         &checked,
         "go",
         &VerifierConfig {
-            max_effect_events: 1,
+            max_effect_events: Some(1),
             ..VerifierConfig::default()
         },
     );
@@ -291,7 +291,7 @@ fn nested_emitting_arguments_cannot_exceed_event_budget() {
         &checked,
         "go",
         &VerifierConfig {
-            max_effect_events: 2,
+            max_effect_events: Some(2),
             ..VerifierConfig::default()
         },
     ));
