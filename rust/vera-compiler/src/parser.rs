@@ -212,6 +212,7 @@ impl Parser {
             TokenKind::Ident(name) => name.clone(),
             _ => return Err(self.error(format!("expected type but found {:?}", token.text))),
         };
+        let mut capacity = None;
         let mut type_args = Vec::new();
         let mut enum_tags = Vec::new();
         match name.as_str() {
@@ -219,11 +220,18 @@ impl Parser {
             | "bytes32" => {
                 self.advance();
             }
+            "bytes" => {
+                self.advance();
+                self.expect_punct("<")?;
+                capacity = Some(self.integer()?);
+                self.expect_punct(">")?;
+            }
             "id64" => {
                 self.advance();
                 self.expect_punct("<")?;
                 let (table, span) = self.ident()?;
                 type_args.push(TypeRef {
+                    capacity: None,
                     name: table,
                     type_args: Vec::new(),
                     enum_tags: Vec::new(),
@@ -248,6 +256,7 @@ impl Parser {
             _ => return Err(self.error(format!("unknown type {name:?}"))),
         }
         Ok(TypeRef {
+            capacity,
             name,
             type_args,
             enum_tags,
@@ -480,6 +489,81 @@ impl Parser {
             })
         })
     }
+    fn bytes_expression(&mut self, logic: bool) -> Result<Option<Expr>> {
+        let token = self.peek().clone();
+        let op = token.text.as_str();
+        let generic = matches!(
+            op,
+            "hex"
+                | "bytes_slice"
+                | "bytes_concat"
+                | "bytes_resize"
+                | "encode"
+                | "decode"
+                | "can_decode"
+        );
+        if !generic && !matches!(op, "bytes_len" | "bytes_get") {
+            return Ok(None);
+        }
+        if generic
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_none_or(|t| t.text != "<")
+        {
+            return Ok(None);
+        }
+        self.advance();
+        if matches!(op, "encode" | "decode" | "can_decode") {
+            self.expect_punct("<")?;
+            let ty = self.type_ref()?;
+            self.expect_punct(">")?;
+            self.expect_punct("(")?;
+            let value = Box::new(self.expression(logic)?);
+            self.expect_punct(")")?;
+            return Ok(Some(Expr::Codec(CodecExpr {
+                op: op.to_owned(),
+                ty,
+                value,
+                span: self.cover(token.span),
+            })));
+        }
+        let capacity = if generic {
+            self.expect_punct("<")?;
+            let n = self.integer()?;
+            self.expect_punct(">")?;
+            Some(n)
+        } else {
+            None
+        };
+        self.expect_punct("(")?;
+        let mut hex = None;
+        let mut args = Vec::new();
+        if op == "hex" {
+            let value = self.advance();
+            let TokenKind::String(text) = value.kind else {
+                return Err(self.error("hex requires a hexadecimal string literal"));
+            };
+            hex = Some(text);
+            self.expect_punct(")")?;
+        } else if !self.accept_punct(")") {
+            loop {
+                args.push(self.expression(logic)?);
+                if self.accept_punct(")") {
+                    break;
+                }
+                self.expect_punct(",")?;
+            }
+        }
+        Ok(Some(Expr::Bytes(BytesExpr {
+            op: op.to_owned(),
+            capacity,
+            hex,
+            args,
+            span: self.cover(token.span),
+        })))
+    }
+
     fn structured_expression(&mut self, logic: bool) -> Result<Option<Expr>> {
         let token = self.peek().clone();
         let name = token.text.as_str();
@@ -840,7 +924,7 @@ impl Parser {
             && self
                 .tokens
                 .get(self.position + 1)
-                .is_some_and(|t| matches!(&t.kind, TokenKind::Punct(p) if p == "(" || (p=="<" && matches!(self.peek().text.as_str(),"record"|"variant"|"is_variant"|"payload"))))
+                .is_some_and(|t| matches!(&t.kind, TokenKind::Punct(p) if p == "(" || (p=="<" && matches!(self.peek().text.as_str(),"record"|"variant"|"is_variant"|"payload"|"hex"|"bytes_slice"|"bytes_concat"|"bytes_resize"|"encode"|"decode"|"can_decode"))))
     }
 
     fn pure_expr_inner(&mut self) -> Result<Expr> {
@@ -933,6 +1017,9 @@ impl Parser {
     }
 
     fn call(&mut self, logic: bool) -> Result<Expr> {
+        if let Some(value) = self.bytes_expression(logic)? {
+            return Ok(value);
+        }
         if let Some(value) = self.structured_expression(logic)? {
             return Ok(value);
         }

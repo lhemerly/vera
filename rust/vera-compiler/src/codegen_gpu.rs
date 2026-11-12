@@ -4,6 +4,8 @@
 //! exact without requiring native 64-bit shader integers. Arithmetic templates
 //! are target syntax, not an interpreter or a compiler subprocess bridge.
 
+mod bounded;
+
 use std::collections::{BTreeMap, BTreeSet};
 
 use num_bigint::BigInt;
@@ -50,6 +52,7 @@ struct PreambleLayout {
     aggregates: usize,
     hashes: usize,
     effects: Option<(usize, usize)>,
+    byte_capacities: BTreeSet<u64>,
     named_types: Vec<(String, Vec<(String, String)>)>,
     named_columns: Vec<(String, String, usize)>,
     named_effects: Vec<(String, String, usize)>,
@@ -121,6 +124,7 @@ fn declaration<'a>(source: &'a str, mut next: usize, ty: &str) -> Option<Declara
     if !matches!(ty, "u32" | "bool" | "V" | "W" | "R" | "D" | "Ctx" | "State")
         && !ty.starts_with("VeraT")
         && !ty.starts_with("VeraR")
+        && !ty.starts_with("VeraB")
     {
         return None;
     }
@@ -292,6 +296,7 @@ impl Output {
             aggregates,
             hashes,
             effects,
+            byte_capacities,
             named_types,
             named_columns,
             named_effects,
@@ -306,6 +311,20 @@ impl Output {
         self.structure("W", &[("w", "u32", Some(16))]);
         self.structure("R", &[("value", "V", None), ("ok", "bool", None)]);
         self.structure("D", &[("q", "W", None), ("r", "W", None)]);
+        for capacity in byte_capacities {
+            let name = format!("VeraB{capacity}");
+            self.structure(
+                &name,
+                &[
+                    ("len", "u32", None),
+                    ("data", "u32", Some(capacity as usize)),
+                ],
+            );
+            self.structure(
+                &format!("VeraBR{capacity}"),
+                &[("value", name.as_str(), None), ("ok", "bool", None)],
+            );
+        }
         for (name, fields) in &named_types {
             self.structure(
                 name,
@@ -392,6 +411,21 @@ pub fn generate_cuda(program: &CheckedProgram, depth: u32) -> Result<String, Dia
 fn expression_emissions(program: &CheckedProgram, id: ExprId) -> usize {
     let child = |id| expression_emissions(program, id);
     match &program.expr(id).kind {
+        ExprKind::BytesLen { value }
+        | ExprKind::BytesResize { value, .. }
+        | ExprKind::Encode { value, .. }
+        | ExprKind::CanDecode { value, .. }
+        | ExprKind::Decode { value, .. } => child(*value),
+        ExprKind::BytesGet { value, index } => child(*value).saturating_add(child(*index)),
+        ExprKind::BytesConcat { left, right, .. } => child(*left).saturating_add(child(*right)),
+        ExprKind::BytesSlice {
+            value,
+            start,
+            count,
+            ..
+        } => child(*value)
+            .saturating_add(child(*start))
+            .saturating_add(child(*count)),
         ExprKind::Record { fields, .. } => fields
             .iter()
             .fold(0usize, |sum, (_, id)| sum.saturating_add(child(*id))),
@@ -450,6 +484,19 @@ fn emission_bound(program: &CheckedProgram, statements: &[Stmt]) -> usize {
 fn effect_stride(program: &CheckedProgram, id: ExprId) -> Option<usize> {
     let child = |id| effect_stride(program, id);
     match &program.expr(id).kind {
+        ExprKind::BytesLen { value }
+        | ExprKind::BytesResize { value, .. }
+        | ExprKind::Encode { value, .. }
+        | ExprKind::CanDecode { value, .. }
+        | ExprKind::Decode { value, .. } => child(*value),
+        ExprKind::BytesGet { value, index } => child(*value).max(child(*index)),
+        ExprKind::BytesConcat { left, right, .. } => child(*left).max(child(*right)),
+        ExprKind::BytesSlice {
+            value,
+            start,
+            count,
+            ..
+        } => child(*value).max(child(*start)).max(child(*count)),
         ExprKind::Record { fields, .. } => fields.iter().filter_map(|(_, id)| child(*id)).max(),
         ExprKind::Field { record, .. } => child(*record),
         ExprKind::Variant { payload, .. } => child(*payload),
@@ -512,6 +559,8 @@ struct Generator<'a> {
     function_result: Option<ValueType>,
     named_effects: BTreeSet<(usize, usize)>,
     type_order: Vec<TypeId>,
+    byte_capacities: BTreeSet<u64>,
+    codec_types: Vec<ValueType>,
 }
 
 impl<'a> Generator<'a> {
@@ -546,6 +595,8 @@ impl<'a> Generator<'a> {
             function_result: None,
             named_effects: BTreeSet::new(),
             type_order: Vec::new(),
+            byte_capacities: BTreeSet::new(),
+            codec_types: Vec::new(),
         };
         for table in program.tables() {
             if table.key_bits() >= 32 {
@@ -635,7 +686,7 @@ impl<'a> Generator<'a> {
             {
                 if matches!(
                     program.effect(effect).params[parameter].ty,
-                    ValueType::Named(_)
+                    ValueType::Named(_) | ValueType::Bytes { .. }
                 ) {
                     result.named_effects.insert((effect.0, parameter));
                 }
@@ -669,6 +720,7 @@ impl<'a> Generator<'a> {
         for definition in program.types() {
             visit(program, definition.id, &mut seen, &mut result.type_order);
         }
+        result.collect_byte_types()?;
         Ok(result)
     }
 
@@ -775,6 +827,7 @@ impl<'a> Generator<'a> {
     fn feed_code(ty: &ValueType, value: &str) -> String {
         match ty {
             ValueType::Named(id) => format!("h=vera_type_{}_feed(h,{value});", id.0),
+            ValueType::Bytes { capacity } => format!("h=vera_bytes_{capacity}_feed(h,{value});"),
             ValueType::Scalar(ty) => {
                 let mut body = String::new();
                 for byte in 0..ty.byte_width() {
@@ -790,12 +843,13 @@ impl<'a> Generator<'a> {
     }
 
     fn type_helpers(&mut self) {
-        if self.type_order.is_empty() {
+        if self.type_order.is_empty() && self.byte_capacities.is_empty() {
             return;
         }
         // The FNV prime is 2^40 + 435. Two 16-bit products carry into
         // the high word without requiring a general 512-bit multiply per byte.
         self.output.function("vera_fnv_byte","V",&[("h".into(),"V".into()),("byte_".into(),"u32".into())],"V x=h;u32 lo=x.w[0]^byte_;u32 p0=(lo&65535u)*435u;u32 p1=(lo>>16u)*435u+(p0>>16u);x.w[0]=(p1<<16u)|(p0&65535u);x.w[1]=x.w[1]*435u+(p1>>16u)+(lo<<8u);return x;");
+        self.byte_helpers();
         for id in self.type_order.clone() {
             let definition = self.program.type_definition(id);
             let name = format!("VeraT{}", id.0);
@@ -929,6 +983,7 @@ impl<'a> Generator<'a> {
             aggregates: self.aggregates,
             hashes: self.hashes,
             effects: self.effect_storage,
+            byte_capacities: self.byte_capacities.clone(),
             named_types: self.type_structures(),
             named_columns: self
                 .program
@@ -937,7 +992,7 @@ impl<'a> Generator<'a> {
                 .flat_map(|t| {
                     t.columns
                         .iter()
-                        .filter(|col| matches!(col.ty, ValueType::Named(_)))
+                        .filter(|col| !matches!(col.ty, ValueType::Scalar(_)))
                         .map(|col| {
                             (
                                 self.column_array(col.id),
@@ -960,6 +1015,7 @@ impl<'a> Generator<'a> {
                 .collect(),
         });
         self.type_helpers();
+        self.codec_helpers();
         self.table_helpers();
         for function in self.program.functions() {
             self.function(function);
@@ -1095,55 +1151,64 @@ impl<'a> Generator<'a> {
     fn gpu_type(ty: &ValueType) -> String {
         match ty {
             ValueType::Scalar(_) => "V".into(),
+            ValueType::Bytes { capacity } => format!("VeraB{capacity}"),
             ValueType::Named(id) => format!("VeraT{}", id.0),
         }
     }
     fn result_type(ty: &ValueType) -> String {
         match ty {
             ValueType::Scalar(_) => "R".into(),
+            ValueType::Bytes { capacity } => format!("VeraBR{capacity}"),
             ValueType::Named(id) => format!("VeraR{}", id.0),
         }
     }
     fn zero(ty: &ValueType) -> String {
         match ty {
             ValueType::Scalar(_) => "v_zero()".into(),
+            ValueType::Bytes { capacity } => format!("vera_bytes_{capacity}_zero()"),
             ValueType::Named(id) => format!("vera_type_{}_zero()", id.0),
         }
     }
     fn result(ty: &ValueType, value: &str, ok: &str) -> String {
         match ty {
             ValueType::Scalar(_) => format!("v_result({value},{ok})"),
+            ValueType::Bytes { capacity } => format!("vera_bytes_{capacity}_result({value},{ok})"),
             ValueType::Named(id) => format!("vera_type_{}_result({value},{ok})", id.0),
         }
     }
     fn accepts(value: &str, ty: &ValueType) -> String {
         match ty {
             ValueType::Scalar(ty) => Self::scalar_accepts(value, ty),
+            ValueType::Bytes { capacity } => format!("vera_bytes_{capacity}_accepts({value})"),
             ValueType::Named(id) => format!("vera_type_{}_accepts({value})", id.0),
         }
     }
     fn equal(ty: &ValueType, left: &str, right: &str) -> String {
         match ty {
             ValueType::Scalar(_) => format!("v_eq({left},{right})"),
+            ValueType::Bytes { capacity } => format!("vera_bytes_{capacity}_eq({left},{right})"),
             ValueType::Named(id) => format!("vera_type_{}_eq({left},{right})", id.0),
         }
     }
     fn hash(ty: &ValueType, value: &str) -> String {
         match ty {
             ValueType::Scalar(_) => format!("vera_mix({value})"),
+            ValueType::Bytes { capacity } => format!("vera_bytes_{capacity}_hash({value})"),
             ValueType::Named(id) => format!("vera_type_{}_hash({value})", id.0),
         }
     }
     fn column_array(&self, column: ColumnId) -> String {
         match self.program.column(column).ty {
             ValueType::Scalar(_) => "cols".into(),
-            ValueType::Named(_) => format!("col_{}_{}", column.table.0, column.index),
+            ValueType::Named(_) | ValueType::Bytes { .. } => {
+                format!("col_{}_{}", column.table.0, column.index)
+            }
         }
     }
     fn column_offset(&self, column: ColumnId) -> usize {
         match self.program.column(column).ty {
             ValueType::Scalar(_) => self.column_offsets[column.table.0][column.index],
-            ValueType::Named(_) => 0,
+            ValueType::Named(_) | ValueType::Bytes { .. } => 0,
         }
     }
     fn failure_return(&self) -> String {
@@ -1206,6 +1271,14 @@ impl<'a> Generator<'a> {
 
     fn constant_value(&mut self, value: &Value, ty: &ValueType) -> String {
         match value {
+            Value::Bytes(bytes) => {
+                let out = self.temporary(&Self::gpu_type(ty), Self::zero(ty));
+                self.push(format!("{out}.len={}u;", bytes.len()));
+                for (i, byte) in bytes.iter().enumerate() {
+                    self.push(format!("{out}.data[{i}]={byte}u;"));
+                }
+                out
+            }
             Value::Bool(v) => self.temporary("V", Self::constant(&BigInt::from(u8::from(*v)))),
             Value::Int(v) => self.temporary("V", Self::constant(v)),
             Value::Record { ty: id, fields } => {
@@ -1242,6 +1315,14 @@ impl<'a> Generator<'a> {
         let c = self.context();
         let failure = self.failure_return();
         match &expression.kind {
+            ExprKind::BytesLen { .. }
+            | ExprKind::BytesGet { .. }
+            | ExprKind::BytesSlice { .. }
+            | ExprKind::BytesConcat { .. }
+            | ExprKind::BytesResize { .. }
+            | ExprKind::Encode { .. }
+            | ExprKind::CanDecode { .. }
+            | ExprKind::Decode { .. } => self.byte_expression(id, env),
             ExprKind::Record { ty, fields } => {
                 let TypeDefinitionKind::Record(definition) =
                     &self.program.type_definition(*ty).kind
@@ -1342,7 +1423,7 @@ impl<'a> Generator<'a> {
                     self.push(format!("if(!{found}){{{c}.trap=1u;{failure}}}"));
                     let stride = self.effect_stride;
                     let ty = &self.program.effect(*effect).params[*parameter].ty;
-                    let access = if matches!(ty, ValueType::Named(_)) {
+                    let access = if !matches!(ty, ValueType::Scalar(_)) {
                         format!("{c}.emitted_e{}_p{parameter}[{index}.w[0]]", effect.0)
                     } else {
                         format!("{c}.emitted_args[{index}.w[0]*{stride}u+{parameter}u]")
@@ -1754,6 +1835,10 @@ impl<'a> Generator<'a> {
     fn sample(&self, ty: &ValueType, seed: bool, slot: &str) -> String {
         match ty {
             ValueType::Scalar(ty) => self.scalar_sample(ty, seed, slot),
+            ValueType::Bytes { capacity } => format!(
+                "vera_bytes_{capacity}_sample(ctx,{},({slot}))",
+                Self::bool_text(seed)
+            ),
             ValueType::Named(id) => format!(
                 "vera_type_{}_sample(ctx,{},({slot}))",
                 id.0,
@@ -1763,6 +1848,7 @@ impl<'a> Generator<'a> {
     }
 
     fn type_samplers(&mut self) {
+        self.byte_samplers();
         for id in self.type_order.clone() {
             let ty = ValueType::Named(id);
             let mut body = format!("{} value={};", Self::gpu_type(&ty), Self::zero(&ty));
@@ -1861,7 +1947,7 @@ impl<'a> Generator<'a> {
         let mut named_init = String::new();
         for table in self.program.tables() {
             for column in &table.columns {
-                if matches!(column.ty, ValueType::Named(_)) {
+                if !matches!(column.ty, ValueType::Scalar(_)) {
                     named_init.push_str(&format!(
                         "for(u32 i=0u;i<{}u;i=i+1u){{{c}.s.{}[i]={};}}",
                         table.capacity,

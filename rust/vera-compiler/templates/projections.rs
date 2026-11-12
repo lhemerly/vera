@@ -1,5 +1,5 @@
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum ProjectionValue { Bool(bool), Integer(I256), Bytes32([u8;32]), Record { ty: &'static str, fields: Vec<(&'static str,ProjectionValue)> }, Variant { ty: &'static str, tag: &'static str, payload: Box<ProjectionValue> } }
+pub enum ProjectionValue { Bool(bool), Integer(I256), Bytes32([u8;32]), Bytes(Vec<u8>), Record { ty: &'static str, fields: Vec<(&'static str,ProjectionValue)> }, Variant { ty: &'static str, tag: &'static str, payload: Box<ProjectionValue> } }
 impl ProjectionValue {fn offset(self,n:i128)->Option<Self>{match self{Self::Integer(v)=>v.checked_add(I256::from_i128(n)).map(Self::Integer),v if n==0=>Some(v),_=>None}}}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionCell {pub table:&'static str,pub column:&'static str,pub requested:Option<u64>,pub id:u64,pub live:bool,pub value:Option<ProjectionValue>}

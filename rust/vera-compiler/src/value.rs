@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Value {
+    Bytes(Vec<u8>),
     Record {
         ty: TypeId,
         fields: Vec<Value>,
@@ -48,7 +49,7 @@ impl Value {
     }
     pub fn to_json(&self, ty: &ScalarType) -> serde_json::Value {
         match self {
-            Self::Record { .. } | Self::Variant { .. } => {
+            Self::Bytes(_) | Self::Record { .. } | Self::Variant { .. } => {
                 panic!("structured JSON requires value_to_json with its type arena")
             }
             Self::Bool(v) => serde_json::Value::Bool(*v),
@@ -239,7 +240,7 @@ pub fn checked_binary(
 
 pub fn low_u64(value: &Value) -> u64 {
     match value {
-        Value::Record { .. } | Value::Variant { .. } => {
+        Value::Bytes(_) | Value::Record { .. } | Value::Variant { .. } => {
             panic!("structured values require canonical hashing")
         }
         Value::Bool(v) => u64::from(*v),
@@ -357,6 +358,11 @@ pub fn validate_value(
     ty: &ValueType,
 ) -> Result<(), String> {
     match ty {
+        ValueType::Bytes { capacity } => match value {
+            Value::Bytes(bytes) if (bytes.len() as u128) <= u128::from(*capacity) => Ok(()),
+            Value::Bytes(_) => Err("byte length exceeds capacity".into()),
+            _ => Err("expected bytes".into()),
+        },
         ValueType::Scalar(t) => {
             if t.is_bool() {
                 value.boolean()?;
@@ -406,6 +412,7 @@ pub fn coerce_value(
 }
 pub fn zero_value(program: &CheckedProgram, ty: &ValueType) -> Value {
     match ty {
+        ValueType::Bytes { .. } => Value::Bytes(Vec::new()),
         ValueType::Scalar(t) => Value::zero(t),
         ValueType::Named(id) => match &program.type_definition(*id).kind {
             TypeDefinitionKind::Record(fields) => Value::Record {
@@ -422,6 +429,15 @@ pub fn zero_value(program: &CheckedProgram, ty: &ValueType) -> Value {
 }
 pub fn value_to_json(program: &CheckedProgram, value: &Value, ty: &ValueType) -> serde_json::Value {
     match ty {
+        ValueType::Bytes { .. } => {
+            let Value::Bytes(bytes) = value else {
+                panic!("validated bytes required for JSON conversion")
+            };
+            serde_json::Value::String(format!(
+                "0x{}",
+                bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ))
+        }
         ValueType::Scalar(t) => value.to_json(t),
         ValueType::Named(id) => match (&program.type_definition(*id).kind, value) {
             (TypeDefinitionKind::Record(defs), Value::Record { fields, .. }) => {
@@ -445,6 +461,20 @@ pub fn value_from_json(
     ty: &ValueType,
 ) -> Result<Value, String> {
     match ty {
+        ValueType::Bytes { capacity } => {
+            let text = json
+                .as_str()
+                .ok_or("bytes require a 0x-prefixed hexadecimal string")?;
+            let hex = text
+                .strip_prefix("0x")
+                .ok_or("bytes require a 0x-prefixed hexadecimal string")?;
+            if (hex.len() / 2) as u128 > u128::from(*capacity) {
+                return Err("byte length exceeds capacity".into());
+            }
+            let value = Value::Bytes(parse_hex_bytes(hex)?);
+            validate_value(program, &value, ty)?;
+            Ok(value)
+        }
         ValueType::Scalar(t) => from_json(t, json),
         ValueType::Named(id) => match &program.type_definition(*id).kind {
             TypeDefinitionKind::Record(defs) => {
@@ -507,6 +537,27 @@ pub fn encode_value(
         out: &mut Vec<u8>,
     ) -> Result<(), String> {
         match ty {
+            ValueType::Bytes { capacity } => {
+                let Value::Bytes(bytes) = value else {
+                    return Err("expected bytes".into());
+                };
+                out.extend(
+                    u64::try_from(bytes.len())
+                        .map_err(|_| "byte length exceeds u64")?
+                        .to_le_bytes(),
+                );
+                out.extend(bytes);
+                let padding = usize::try_from(*capacity)
+                    .map_err(|_| "byte capacity exceeds usize")?
+                    .checked_sub(bytes.len())
+                    .ok_or("byte length exceeds capacity")?;
+                out.resize(
+                    out.len()
+                        .checked_add(padding)
+                        .ok_or("wire length exceeds usize")?,
+                    0,
+                );
+            }
             ValueType::Scalar(t) => out.extend(to_le_bytes(value, t.byte_width(), t.signed())?),
             ValueType::Named(id) => match (&program.type_definition(*id).kind, value) {
                 (TypeDefinitionKind::Record(defs), Value::Record { fields, .. }) => {
@@ -550,6 +601,22 @@ pub fn decode_value(
         return Err("canonical value width mismatch".into());
     }
     match ty {
+        ValueType::Bytes { capacity } => {
+            let len = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+            if len > *capacity {
+                return Err("byte length exceeds capacity".into());
+            }
+            let len = usize::try_from(len).map_err(|_| "byte length exceeds usize")?;
+            if bytes[8 + len..].iter().any(|b| *b != 0) {
+                return Err("noncanonical byte padding".into());
+            }
+            let mut value = Vec::new();
+            value
+                .try_reserve_exact(len)
+                .map_err(|_| "cannot allocate decoded bytes")?;
+            value.extend_from_slice(&bytes[8..8 + len]);
+            Ok(Value::Bytes(value))
+        }
         ValueType::Scalar(t) => from_le_bytes(bytes, t),
         ValueType::Named(id) => match &program.type_definition(*id).kind {
             TypeDefinitionKind::Record(defs) => {
@@ -578,4 +645,28 @@ pub fn decode_value(
             }
         },
     }
+}
+
+/// Parse exact hexadecimal bytes without integer conversion or leading-zero loss.
+pub fn parse_hex_bytes(text: &str) -> Result<Vec<u8>, String> {
+    if !text.is_ascii() || !text.len().is_multiple_of(2) {
+        return Err("hexadecimal bytes require an even number of ASCII hex digits".into());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(text.len() / 2)
+        .map_err(|_| "cannot allocate hexadecimal bytes")?;
+    for pair in text.as_bytes().chunks_exact(2) {
+        let digit = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            b'A'..=b'F' => Some(c - b'A' + 10),
+            _ => None,
+        };
+        bytes.push(
+            digit(pair[0]).ok_or("invalid hexadecimal byte")? * 16
+                + digit(pair[1]).ok_or("invalid hexadecimal byte")?,
+        );
+    }
+    Ok(bytes)
 }

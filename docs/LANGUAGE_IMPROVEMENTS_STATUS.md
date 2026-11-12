@@ -118,3 +118,20 @@ Final structured milestone validation: 356 workspace tests passed, zero failed
 and zero ignored, with real GPU execution required and Mesa shader caching
 disabled. All-target lint passed allowing only the pre-existing runtime lint
 noted above; formatting and whitespace checks passed.
+
+The bounded-byte milestone adds `bytes<N>` and composable canonical source codecs
+across native execution, persistence, proof, Rust, CUDA, GLSL, and WGSL. Decoder-only
+huge-capacity formulas do not materialize unused encoders. Exact relational zero
+padding and primitive sequence-boundary facts avoid the reproduced packet
+round-trip capacity casework without assuming round-trip laws. The byte/packet
+4/8/16/32 regression completed in about one second total on the development host.
+
+Final byte milestone validation: 407 workspace tests passed, zero failed and zero
+ignored, with `RUST_MIN_STACK` unset and real GPU execution required. This includes
+the default-stack 80-function regression and the 50,000-iteration runtime stress.
+Final hex-admission parity cleanup was rechecked by the 18 frontend/runtime byte
+tests. Formatting, whitespace checks and all-target Clippy passed with only the
+same three unchanged runtime-lint warnings allowed as above. Independent static
+review found no circular decoder/round-trip assumption in the encoding.
+UTF-8 strings and stateful component ownership/frame contracts are not part of
+this completed byte milestone.

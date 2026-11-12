@@ -123,3 +123,19 @@ atomicAdd(violations,saved);atomicAdd(committed,found);atomicAdd(reverted,bad);a
         "violations=1 committed=1 reverted=3 effects=25",
     );
 }
+
+#[test]
+fn glsl_bounded_bytes_and_shared_canonical_codecs_execute() {
+    run(
+        include_str!("fixtures/gpu_bounded_bytes.vera"),
+        r#"
+void main(){if(gl_GlobalInvocationID.x!=0u){return;}Ctx ctx;vera_init(ctx);
+VeraB4 x=vera_bytes_4_zero();x.len=3u;x.data[0]=1u;x.data[1]=2u;x.data[2]=3u;
+uint saved=transition_v_save(ctx,x);uint found=transition_v_lookup(ctx,x);
+VeraB17 bad=vera_bytes_17_zero();bad.len=17u;bad.data[0]=99u;
+uint failed=transition_v_invalid(ctx,bad);uint lazy=transition_v_lazy(ctx,bad);uint empty=transition_v_empty(ctx);
+atomicAdd(violations,saved);atomicAdd(committed,found);atomicAdd(reverted,failed);atomicAdd(effects,lazy+empty+ctx.s.col_0_1[0].f_1.data[0]);}
+"#,
+        "violations=1 committed=1 reverted=3 effects=257",
+    );
+}

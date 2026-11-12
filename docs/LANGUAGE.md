@@ -64,6 +64,17 @@ Wrong-tag payload access traps; lazy selection can protect an optional read.
 See [structured values](STRUCTURED_VALUES.md) for canonical codecs, JSON,
 uniqueness, layout and non-Cartesian proof representation.
 
+## Bounded bytes and codecs
+
+`bytes<N>` is a logical byte sequence with static capacity, including N=0.
+`hex<N>("00ff")` constructs exact bytes. Length/index/slice/concat/resize
+operations are checked and preserve logical contents. `encode<T>`,
+`can_decode<T>` and partial `decode<T>` compose the same canonical scalar,
+record/union and byte codecs used by persistence. Decoder validity is a total
+predicate; malformed lengths/domains/tags/padding/trailing bytes are rejected.
+See [bounded bytes](BOUNDED_BYTES.md) for syntax, round-trip proofs and scaling.
+These are byte semantics, not implicit UTF-8 or Unicode string semantics.
+
 ## Expressions and evaluation
 
 Canonical operators use prefix notation. Specifications such as invariants,

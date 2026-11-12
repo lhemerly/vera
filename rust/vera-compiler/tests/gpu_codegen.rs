@@ -818,3 +818,150 @@ for(unsigned i=0;i<10000;++i){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;uint64_t a=r
 "#,
     );
 }
+
+#[test]
+fn gpu_bounded_bytes_and_nested_canonical_codecs_execute() {
+    let source = include_str!("fixtures/gpu_bounded_bytes.vera");
+    run_cpp(
+        source,
+        r#"
+Ctx ctx{};vera_init(&ctx);VeraB4 x=vera_bytes_4_zero();x.len=3u;x.data[0]=1u;x.data[1]=2u;x.data[2]=3u;
+assert(transition_v_save(&ctx,x)==1u);assert(transition_v_lookup(&ctx,x)==1u);
+assert(ctx.s.col_0_1[0].f_1.len==3u&&ctx.s.col_0_1[0].f_1.data[0]==255u);
+assert(transition_v_empty(&ctx)==1u);assert(transition_v_get(&ctx,x,v_small(2u))==1u);
+assert(transition_v_get(&ctx,x,v_small(3u))==3u);assert(transition_v_narrow(&ctx,x)==3u);
+VeraB17 bad=vera_bytes_17_zero();bad.len=17u;bad.data[0]=99u;
+assert(transition_v_invalid(&ctx,bad)==3u);assert(transition_v_lazy(&ctx,bad)==1u);
+bad.data[0]=0u;bad.data[4]=2u;assert(transition_v_invalid(&ctx,bad)==3u);
+bad.data[4]=1u;bad.data[5]=5u;assert(transition_v_invalid(&ctx,bad)==3u);
+bad.data[5]=1u;bad.data[13]=7u;bad.data[16]=1u;assert(transition_v_invalid(&ctx,bad)==3u);
+bad.data[16]=0u;assert(transition_v_invalid(&ctx,bad)==1u);
+bad.data[0]=1u;assert(transition_v_invalid(&ctx,bad)==3u);
+bad=vera_bytes_17_zero();bad.len=17u;bad.data[0]=1u;assert(transition_v_invalid(&ctx,bad)==1u);
+bad.len=16u;assert(transition_v_invalid(&ctx,bad)==3u);
+"#,
+    );
+    let code = generate_wgsl(&checked(source), 2).unwrap();
+    let module = naga::front::wgsl::parse_str(&code)
+        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&code)));
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+#[test]
+fn gpu_byte_indices_preserve_wide_aggregate_carriers() {
+    run_cpp(r#"table T capacity 2 {key id:id64<T>;col v:u64 [tracked_sum];}
+table B capacity 2 {key id:id64<B>;col v:u8 [tracked_sum];}
+transition fill_byte() reads [] writes [B[*].v] body {let %k:id64<B>=table_alloc(B,{v:255});commit;}
+transition fill() reads [] writes [T[*].v] body {let %k:id64<T>=table_alloc(T,{v:9223372036854775808});commit;}
+transition get() reads [T[*].v] writes [] body {let %x:u8=bytes_get(hex<1>("ff"),sum(T.v));commit;}
+transition slice() reads [T[*].v] writes [] body {let %x:bytes<1>=bytes_slice<1>(hex<1>("ff"),sum(T.v),0);commit;}
+transition count() reads [T[*].v] writes [] body {let %x:bytes<1>=bytes_slice<1>(hex<1>("ff"),0,sum(T.v));commit;}
+transition promote() reads [T[*].v,B[*].v] writes [] body {guard(gt(add(sum(T.v),bytes_len(hex<1>("01"))),sum(T.v)),ERR_BAD);guard(gt(add(sum(B.v),bytes_get(hex<1>("ff"),0)),sum(B.v)),ERR_BAD);commit;}"#,
+"Ctx ctx{};vera_init(&ctx);assert(transition_v_fill(&ctx)==1u);assert(transition_v_fill(&ctx)==1u);assert(transition_v_get(&ctx)==3u);assert(transition_v_slice(&ctx)==3u);assert(transition_v_count(&ctx)==3u);assert(transition_v_fill_byte(&ctx)==1u);assert(transition_v_fill_byte(&ctx)==1u);assert(transition_v_promote(&ctx)==1u);");
+}
+
+#[test]
+fn gpu_canonical_byte_hash_and_scalar_wire_vectors_match_native() {
+    use vera_compiler::{
+        types::{mix64, ValueType},
+        value::{encode_value, Value},
+    };
+    let source = include_str!("fixtures/gpu_bounded_bytes.vera");
+    let program = checked(source);
+    let wire = encode_value(
+        &program,
+        &Value::Bytes(vec![1, 2, 3]),
+        &ValueType::Bytes { capacity: 4 },
+    )
+    .unwrap();
+    let hash = mix64(wire.iter().fold(14695981039346656037u64, |h, b| {
+        (h ^ u64::from(*b)).wrapping_mul(1099511628211)
+    }));
+    run_cpp(source,&format!(r#"Ctx ctx{{}};vera_init(&ctx);VeraB4 x=vera_bytes_4_zero();x.len=3u;x.data[0]=1u;x.data[1]=2u;x.data[2]=3u;
+V h=vera_bytes_4_hash(x);assert(h.w[0]=={}u&&h.w[1]=={}u);assert(transition_v_save(&ctx,x)==1u);
+uint32_t expected[17]={{0,0,0,0,1,3,0,0,0,0,0,0,0,255,2,3,0}};
+for(unsigned i=0;i<17;i++){{assert(ctx.emitted_e0_p0.data[i]==expected[i]);}}
+"#,hash as u32,hash>>32).replace("emitted_e0_p0.data", "emitted_e0_p0[0].data"));
+    run_cpp(
+        r#"transition go() reads [] writes [] body {
+ guard(eq(encode<i64>(-3),hex<8>("fdffffffffffffff")),ERR_BAD);
+ guard(eq(decode<i64>(hex<8>("fdffffffffffffff")),-3),ERR_BAD);
+ guard(eq(encode<bytes<2>>(hex<2>("ff")),hex<10>("0100000000000000ff00")),ERR_BAD);
+ guard(not(can_decode<bool>(hex<1>("02"))),ERR_BAD);
+ guard(not(can_decode<bytes<2>>(hex<10>("0100000001000000ff00"))),ERR_BAD);
+ guard(not(can_decode<bytes<2>>(hex<10>("0100000000000000ff01"))),ERR_BAD);
+ guard(eq(decode<bytes<2>>(hex<10>("0100000000000000ff00")),hex<2>("ff")),ERR_BAD);
+ commit; }"#,
+        "Ctx ctx{};vera_init(&ctx);assert(transition_v_go(&ctx)==1u);",
+    );
+}
+
+#[test]
+fn gpu_byte_capacity_and_codec_schema_growth_stays_structural() {
+    let mut baseline = None;
+    for capacity in [0, 64, 1024, 8192] {
+        let source=format!("function cycle(x:bytes<{capacity}>)->bytes<{capacity}> body {{yield decode<bytes<{capacity}>>(encode<bytes<{capacity}>>(x));}} transition go(x:bytes<{capacity}>) reads [] writes [] body {{let %v:bytes<{capacity}>=cycle(x);commit;}}");
+        let start = std::time::Instant::now();
+        let code = generate_wgsl(&checked(&source), 2).unwrap();
+        let module = naga::front::wgsl::parse_str(&code).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+        let expressions = module
+            .functions
+            .iter()
+            .map(|(_, f)| f.expressions.len())
+            .sum::<usize>();
+        eprintln!("byte capacity={capacity} source_bytes={} functions={} expressions={expressions} generate_validate={:?}",code.len(),module.functions.len(),start.elapsed());
+        if let Some(bytes) = baseline {
+            assert!(code.len() < bytes * 2);
+        } else {
+            baseline = Some(code.len());
+        }
+    }
+    let mut previous = None;
+    for depth in [2, 4, 8] {
+        let mut source = String::from("record R0 {data:bytes<4>;} ");
+        for n in 1..depth {
+            source.push_str(&format!("record R{n} {{a:R{};b:R{};}}", n - 1, n - 1));
+        }
+        source.push_str(&format!("transition go(x:R{}) reads [] writes [] body {{let %x:R{}=decode<R{}>(encode<R{}>(x));commit;}}",depth-1,depth-1,depth-1,depth-1));
+        let start = std::time::Instant::now();
+        let code = generate_wgsl(&checked(&source), 2).unwrap();
+        let module = naga::front::wgsl::parse_str(&code).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+        eprintln!(
+            "codec DAG depth={depth} source_bytes={} functions={} generate_validate={:?}",
+            code.len(),
+            module.functions.len(),
+            start.elapsed()
+        );
+        if let Some(bytes) = previous {
+            assert!(code.len() < bytes * 2);
+        }
+        previous = Some(code.len());
+    }
+}
+
+#[test]
+fn gpu_byte_seed_uniqueness_and_real_index_limits_are_explicit() {
+    run_cpp(include_str!("fixtures/gpu_bounded_bytes.vera"),"Ctx ctx{};vera_init(&ctx);assert(vera_seed(&ctx));assert(ctx.s.occ[0]==1u&&ctx.s.occ[1]==1u);assert(!vera_bytes_4_eq(ctx.s.col_0_0[0],ctx.s.col_0_0[1]));");
+    run_cpp("table T capacity 2 {key id:id64<T>;col value:bytes<0> [unique];}","Ctx ctx{};vera_init(&ctx);assert(!vera_seed(&ctx));vera_init(&ctx);assert(ctx.s.occ[0]==0u&&ctx.s.occ[1]==0u);");
+    let p = checked("transition go(x:bytes<4294967296>) reads [] writes [] body {commit;}");
+    let error = generate_wgsl(&p, 2).unwrap_err();
+    assert_eq!(error.code, "D_GPU_RESOURCE");
+    assert!(error.message.contains("32-bit indexing"));
+}

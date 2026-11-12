@@ -947,3 +947,83 @@ assert_eq!(union_overflow(&mut state),Err(ErrorCode::ArithOverflow));assert_eq!(
 }"#,
     );
 }
+
+#[test]
+fn native_bounded_bytes_codecs_match_interpreter_and_trap_atomically() {
+    use std::collections::BTreeMap;
+    use vera_compiler::{
+        persistence::{encode_state, Intent},
+        runtime::Machine,
+        value::Value,
+    };
+    let source = include_str!("fixtures/bytes_rust.vera");
+    let program = analyze(parse_source(source).unwrap()).unwrap();
+    let params = BTreeMap::from([("b".into(), Value::Bytes(vec![0, 255, 16]))]);
+    let expected_intent = Intent::from_parameters(&program, "save", &params)
+        .unwrap()
+        .encode(&program)
+        .unwrap()
+        .1;
+    let mut machine = Machine::new(&program).unwrap();
+    machine.call("save", &params).unwrap();
+    let expected_state = encode_state(&program, &machine.state).unwrap();
+    run_case(
+        source,
+        &format!(
+            r#"fn main(){{
+assert_eq!(std::mem::size_of::<VeraBytes<0>>(),8);assert_eq!(std::mem::size_of::<VeraBytes<8>>(),16);
+let b=VeraBytes::<8>::from_slice(&[0,255,16]).unwrap();let intent=Params::Save{{b}};let(tag,wire)=intent.encode();assert_eq!(wire,vec!{expected_intent:?});assert_eq!(Params::decode(tag,wire).unwrap(),intent);
+let mut state=State::default();let pre=state.clone();intent.execute(&mut state).unwrap();intent.check_postconditions(&pre,&state).unwrap();assert_eq!(state.encode(),vec!{expected_state:?});assert_eq!(State::decode(state.encode()).unwrap(),state);
+let saved=state.clone();assert_eq!(save(&mut state,b),Err(ErrorCode::DuplicateKey));assert_eq!(state,saved);
+let good=Params::Good{{}};good.execute(&mut state).unwrap();good.check_postconditions(&saved,&state).unwrap();
+assert_eq!(bad_get(&mut state),Err(ErrorCode::BytesBounds));assert_eq!(bad_slice(&mut state),Err(ErrorCode::BytesBounds));assert_eq!(bad_capacity(&mut state),Err(ErrorCode::BytesCapacity));assert_eq!(bad_resize(&mut state),Err(ErrorCode::BytesCapacity));assert_eq!(bad_decode(&mut state),Err(ErrorCode::Decode));assert_eq!(state,saved);lazy(&mut state).unwrap();
+let view=project_View(&state,4).unwrap();assert_eq!(view.cells[0].value,Some(ProjectionValue::Bytes(vec![0,255,16])));
+let nested=Params::NestedWire{{}};nested.execute(&mut state).unwrap();nested.check_postconditions(&saved,&state).unwrap();
+let mut blob=vec![0u8;16];blob[0]=1;blob[8]=255;decode_blob(&mut state,VeraBytes::from_slice(&blob).unwrap()).unwrap();
+blob[15]=1;assert_eq!(decode_blob(&mut state,VeraBytes::from_slice(&blob).unwrap()),Err(ErrorCode::Decode));blob[15]=0;blob[0]=9;assert_eq!(decode_blob(&mut state,VeraBytes::from_slice(&blob).unwrap()),Err(ErrorCode::Decode));blob[0]=1;blob.push(0);assert_eq!(decode_blob(&mut state,VeraBytes::from_slice(&blob).unwrap()),Err(ErrorCode::Decode));
+assert_eq!(decode_blob(&mut state,VeraBytes::from_slice(&[0;7]).unwrap()),Err(ErrorCode::Decode));
+let mut union_wire=vec![0u8;21];union_wire[0]=1;decode_message(&mut state,VeraBytes::from_slice(&union_wire).unwrap()).unwrap();union_wire[20]=1;assert_eq!(decode_message(&mut state,VeraBytes::from_slice(&union_wire).unwrap()),Err(ErrorCode::Decode));union_wire[20]=0;union_wire[0]=2;assert_eq!(decode_message(&mut state,VeraBytes::from_slice(&union_wire).unwrap()),Err(ErrorCode::Decode));
+
+let mut invalid=b;invalid.data[7]=1;assert_eq!(save(&mut state,invalid),Err(ErrorCode::InvalidEncoding));invalid=b;invalid.len=9;assert_eq!(save(&mut state,invalid),Err(ErrorCode::InvalidEncoding));
+}}"#
+        ),
+    );
+}
+
+#[test]
+fn native_byte_scalar_outputs_promote_and_wide_indices_do_not_truncate() {
+    run_case(
+        r#"table T capacity 2 {key id:id64<T>;col v:u64 [tracked_sum];col small:u8 [tracked_sum];}
+transition init() reads [] writes [T[*].v,T[*].small] body {let %a:id64<T>=table_alloc(T,{v:18446744073709551615,small:255});let %b:id64<T>=table_alloc(T,{v:1,small:1});commit;}
+transition good() reads [] writes [] ensure lengths:eq(add(bytes_len(hex<1>("01")),sum(T.v)),add(sum(T.v),1));ensure elements:eq(add(bytes_get(hex<1>("01"),0),sum(T.small)),add(sum(T.small),1));body {commit;}
+transition bad_index() reads [T[*].v] writes [] body {let %x:u8=bytes_get(hex<1>("01"),sum(T.v));commit;}
+transition bad_start() reads [T[*].v] writes [] body {let %x:bytes<1>=bytes_slice<1>(hex<1>("01"),sum(T.v),0);commit;}
+transition ordered() reads [T[*].v] writes [] body {let %x:bytes<1>=bytes_slice<1>(hex<1>("01"),sum(T.v),div(1,0));commit;}"#,
+        r#"fn main(){let mut state=State::default();init(&mut state).unwrap();let saved=state.clone();let good=Params::Good{};good.execute(&mut state).unwrap();good.check_postconditions(&saved,&state).unwrap();assert_eq!(bad_index(&mut state),Err(ErrorCode::BytesBounds));assert_eq!(bad_start(&mut state),Err(ErrorCode::BytesBounds));assert_eq!(ordered(&mut state),Err(ErrorCode::ArithOverflow));assert_eq!(state,saved);}"#,
+    );
+}
+
+#[test]
+fn bounded_byte_capacity_does_not_unroll_rust_codec_source() {
+    let mut sizes = Vec::new();
+    for capacity in [0, 8, 1024, 65536] {
+        let source=format!("function echo(b:bytes<{capacity}>)->bytes<{capacity}> body {{yield decode<bytes<{capacity}>>(encode<bytes<{capacity}>>(b));}} transition go(b:bytes<{capacity}>) reads [] writes [] body {{let %a:bytes<{capacity}>=echo(b);let %c:bytes<{capacity}>=echo(%a);commit;}}");
+        let program = analyze(parse_source(&source).unwrap()).unwrap();
+        let code = generate_rust(
+            &program,
+            RustOptions {
+                use_rt: false,
+                include_main: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(code.matches("fn vera_source_encode_0(").count(), 1);
+        assert_eq!(code.matches("fn vera_source_decode_0(").count(), 1);
+        assert_eq!(code.matches("fn vera_function_0(").count(), 1);
+        sizes.push(code.len());
+    }
+    assert!(
+        sizes.iter().max().unwrap() - sizes.iter().min().unwrap() < 1024,
+        "capacity expanded helper source: {sizes:?}"
+    );
+}

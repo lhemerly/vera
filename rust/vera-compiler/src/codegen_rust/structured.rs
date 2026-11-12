@@ -6,6 +6,7 @@ impl Generator<'_> {
     pub(super) fn value_rust_type(&self, ty: &ValueType) -> String {
         match ty {
             ValueType::Scalar(ty) => rust_type(ty).into(),
+            ValueType::Bytes { capacity } => format!("VeraBytes<{capacity}>"),
             ValueType::Named(id) => format!("VeraValue_{}", self.program.type_definition(*id).name),
         }
     }
@@ -13,7 +14,9 @@ impl Generator<'_> {
     pub(super) fn value_zero(&self, ty: &ValueType) -> String {
         match ty {
             ValueType::Scalar(ty) => zero(ty).into(),
-            ValueType::Named(_) => format!("{}::zero()", self.value_rust_type(ty)),
+            ValueType::Named(_) | ValueType::Bytes { .. } => {
+                format!("<{}>::zero()", self.value_rust_type(ty))
+            }
         }
     }
 
@@ -23,6 +26,7 @@ impl Generator<'_> {
                 format!("(({value}) as usize)<{}", tags.len())
             }
             ValueType::Scalar(_) => "true".into(),
+            ValueType::Bytes { .. } => format!("({value}).valid()"),
             ValueType::Named(id) => format!("vera_valid_type_{}(&({value}))", id.0),
         }
     }
@@ -30,6 +34,7 @@ impl Generator<'_> {
     pub(super) fn value_encode(&self, value: &str, ty: &ValueType) -> String {
         match ty {
             ValueType::Scalar(ty) => encode_scalar(value, ty),
+            ValueType::Bytes { .. } => format!("vera_encode_bytes(&({value}),&mut out);"),
             ValueType::Named(id) => format!("vera_encode_type_{}(&({value}),&mut out);", id.0),
         }
     }
@@ -37,6 +42,7 @@ impl Generator<'_> {
     pub(super) fn value_decode(&self, ty: &ValueType) -> String {
         match ty {
             ValueType::Scalar(ty) => decode_scalar(ty),
+            ValueType::Bytes { capacity } => format!("vera_decode_bytes::<{capacity}>(&mut r)?"),
             ValueType::Named(id) => format!("vera_decode_type_{}(&mut r)?", id.0),
         }
     }
@@ -67,6 +73,11 @@ impl Generator<'_> {
 
     pub(super) fn value_literal(&self, value: &Value, ty: &ExprType) -> String {
         match value {
+            Value::Bytes(bytes) => format!(
+                "<{}>::from_slice(&{:?}).expect(\"checked literal\")",
+                self.value_rust_type(&ty.value_type()),
+                bytes
+            ),
             Value::Record { ty, fields } => {
                 let TypeDefinitionKind::Record(definitions) =
                     &self.program.type_definition(*ty).kind
@@ -87,6 +98,9 @@ impl Generator<'_> {
                                     ValueType::Scalar(s) =>
                                         ExprType::Scalar(Domain::scalar(s.clone())),
                                     ValueType::Named(t) => ExprType::Named(*t),
+                                    ValueType::Bytes { capacity } => ExprType::Bytes {
+                                        capacity: *capacity
+                                    },
                                 }
                             )
                         )
@@ -106,6 +120,9 @@ impl Generator<'_> {
                 let payload_type = match &variants[tag.0].payload {
                     ValueType::Scalar(s) => ExprType::Scalar(Domain::scalar(s.clone())),
                     ValueType::Named(t) => ExprType::Named(*t),
+                    ValueType::Bytes { capacity } => ExprType::Bytes {
+                        capacity: *capacity,
+                    },
                 };
                 format!(
                     "{}::{}({})",

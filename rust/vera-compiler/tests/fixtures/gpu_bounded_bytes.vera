@@ -1,0 +1,31 @@
+record Unit {}
+record Packet {flag:bool;payload:bytes<4>;}
+union Message {Data:Packet;Empty:Unit;}
+function roundtrip(p:Packet)->Packet body {yield decode<Packet>(encode<Packet>(p));}
+function reshape(x:bytes<4>)->bytes<4>
+ require enough:ge(bytes_len(x),2);
+ body {yield bytes_concat<4>(hex<1>("ff"),bytes_slice<3>(x,1,sub(bytes_len(x),1)));}
+table Store capacity 2 {key id:id64<Store>;col identity:bytes<4> [unique];col packet:Packet;}
+effect Sent(wire:bytes<17>,packet:Packet);
+transition save(x:bytes<4>) reads [] writes [Store[*].identity,Store[*].packet]
+ ensure count:eq(effect_count(),1);
+ ensure bytes:eq(bytes_len(effect_arg(Sent,0,wire)),17);
+ ensure valid:can_decode<Message>(effect_arg(Sent,0,wire));
+ ensure same:eq(payload<Message,Data>(decode<Message>(effect_arg(Sent,0,wire))),effect_arg(Sent,0,packet));
+ body {
+ let %p:Packet=roundtrip(record<Packet>(flag:true,payload:reshape(x)));
+ let %k:id64<Store>=table_alloc(Store,{identity:x,packet:%p});
+ emit Sent(encode<Message>(variant<Message,Data>(%p)),%p);commit;
+ }
+transition lookup(x:bytes<4>) reads [Store[*].identity] writes [] body {guard(table_exists_unique(Store,identity,x),ERR_MISSING);commit;}
+transition invalid(wire:bytes<17>) reads [] writes [] body {let %m:Message=decode<Message>(wire);commit;}
+transition lazy(wire:bytes<17>) reads [] writes [] body {
+ let %m:Message=select(can_decode<Message>(wire),decode<Message>(wire),variant<Message,Empty>(record<Unit>()));commit;
+}
+transition empty() reads [] writes [] body {
+ let %e:bytes<0>=bytes_concat<0>(hex<0>(""),bytes_slice<0>(hex<1>("01"),1,0));
+ let %u:Unit=decode<Unit>(encode<Unit>(record<Unit>()));
+ guard(eq(bytes_len(bytes_resize<0>(%e)),0),ERR_BAD);commit;
+}
+transition get(x:bytes<4>,i:u64) reads [] writes [] body {let %b:u8=bytes_get(x,i);commit;}
+transition narrow(x:bytes<4>) reads [] writes [] body {let %b:bytes<1>=bytes_resize<1>(x);commit;}

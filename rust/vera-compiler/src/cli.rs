@@ -325,6 +325,9 @@ fn parameters(
             .ok_or_else(|| input(format!("unknown parameter {name:?}")))?;
         let value = match &param.ty {
             ValueType::Scalar(ty) => parameter(text, ty),
+            ValueType::Bytes { .. } => {
+                value::value_from_json(program, &Json::String(text.into()), &param.ty)
+            }
             ValueType::Named(_) => serde_json::from_str::<Json>(text)
                 .map_err(|e| e.to_string())
                 .and_then(|json| value::value_from_json(program, &json, &param.ty)),

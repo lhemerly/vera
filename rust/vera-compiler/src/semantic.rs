@@ -172,7 +172,12 @@ impl Analyzer {
                 }
                 if matches!(
                     function.name.as_str(),
-                    "effect_count" | "effect_is" | "effect_arg" | "field"
+                    "effect_count"
+                        | "effect_is"
+                        | "effect_arg"
+                        | "field"
+                        | "bytes_len"
+                        | "bytes_get"
                 ) {
                     return Err(diagnostic(
                         "D_FUNCTION_NAME",
@@ -631,7 +636,56 @@ impl Analyzer {
         Ok(())
     }
 
+    fn bytes_capacity(
+        &self,
+        capacity: Option<&crate::literal::IntegerLiteral>,
+        span: Span,
+    ) -> Result<u64> {
+        let capacity = capacity
+            .and_then(|n| n.as_decimal().parse::<u64>().ok())
+            .ok_or_else(|| {
+                diagnostic(
+                    "D_BYTES_CAPACITY",
+                    "byte capacity must be a u64 integer",
+                    span,
+                )
+            })?;
+        self.program
+            .value_storage_width(&ValueType::Bytes { capacity })
+            .map_err(|m| diagnostic("D_TYPE_REPRESENTATION", m, span))?;
+        Ok(capacity)
+    }
+    fn require_bytes(&self, expression: ExprId, span: Span) -> Result<u64> {
+        match self.program.expr(expression).domain {
+            ExprType::Bytes { capacity } => Ok(capacity),
+            _ => Err(diagnostic(
+                "D_TYPE_MISMATCH",
+                "operation requires bytes<N>",
+                span,
+            )),
+        }
+    }
+    fn codec_width(&self, ty: &ValueType, span: Span) -> Result<u64> {
+        u64::try_from(
+            self.program
+                .value_wire_width(ty)
+                .map_err(|m| diagnostic("D_TYPE_REPRESENTATION", m, span))?,
+        )
+        .map_err(|_| diagnostic("D_TYPE_REPRESENTATION", "codec width exceeds u64", span))
+    }
+
     fn resolve_type(&self, reference: &a::TypeRef) -> Result<ValueType> {
+        if reference.name == "bytes" {
+            let capacity = self.bytes_capacity(reference.capacity.as_ref(), reference.span)?;
+            return Ok(ValueType::Bytes { capacity });
+        }
+        if reference.capacity.is_some() {
+            return Err(diagnostic(
+                "D_TYPE_MISMATCH",
+                "capacity is only valid on bytes<N>",
+                reference.span,
+            ));
+        }
         if let Some(id) = self.program.type_id(&reference.name) {
             return Ok(ValueType::Named(id));
         }
@@ -1105,6 +1159,165 @@ impl Analyzer {
     ) -> Result<Lowered> {
         let span = expression.span();
         let (domain, kind, dependent, cost) = match expression {
+            a::Expr::Bytes(bytes) => {
+                let capacity = bytes
+                    .capacity
+                    .as_ref()
+                    .map(|n| self.bytes_capacity(Some(n), span))
+                    .transpose()?;
+                if bytes.op == "hex" {
+                    let capacity = capacity.ok_or_else(|| {
+                        diagnostic("D_BYTES_CAPACITY", "hex requires capacity", span)
+                    })?;
+                    let data =
+                        crate::value::parse_hex_bytes(bytes.hex.as_deref().ok_or_else(|| {
+                            diagnostic("D_LITERAL_RANGE", "hex requires a literal", span)
+                        })?)
+                        .map_err(|m| diagnostic("D_LITERAL_RANGE", m, span))?;
+                    if data.len() as u128 > u128::from(capacity) {
+                        return Err(diagnostic(
+                            "D_LITERAL_RANGE",
+                            "hex literal exceeds its byte capacity",
+                            span,
+                        ));
+                    }
+                    (
+                        ExprType::Bytes { capacity },
+                        ExprKind::Constant(Value::Bytes(data)),
+                        false,
+                        0,
+                    )
+                } else {
+                    let arity = match bytes.op.as_str() {
+                        "bytes_len" | "bytes_resize" => 1,
+                        "bytes_get" | "bytes_concat" => 2,
+                        "bytes_slice" => 3,
+                        _ => {
+                            return Err(diagnostic("D_BAD_OPERAND", "unknown byte operation", span))
+                        }
+                    };
+                    if bytes.args.len() != arity {
+                        return Err(diagnostic(
+                            "D_ARITY",
+                            format!("{} requires {arity} arguments", bytes.op),
+                            span,
+                        ));
+                    }
+                    let first = self.expression(&bytes.args[0], scope, None, context)?;
+                    self.require_bytes(first.id, span)?;
+                    let mut args = vec![first.id];
+                    let mut cost = first.cost;
+                    for (i, argument) in bytes.args.iter().enumerate().skip(1) {
+                        let expected = if bytes.op == "bytes_concat" {
+                            None
+                        } else {
+                            Some(ExprType::scalar(ScalarType::U64))
+                        };
+                        let arg = self.expression(argument, scope, expected, context)?;
+                        if bytes.op == "bytes_concat" && i == 1 {
+                            self.require_bytes(arg.id, span)?;
+                        }
+                        cost = add_cost(cost, arg.cost, span)?;
+                        args.push(arg.id);
+                    }
+                    let dependent = args.iter().any(|id| self.program.expr(*id).state_dependent);
+                    let (domain, kind) = match bytes.op.as_str() {
+                        "bytes_len" => (
+                            Self::promote(ExprType::scalar(ScalarType::U64), expected.as_ref()),
+                            ExprKind::BytesLen { value: args[0] },
+                        ),
+                        "bytes_get" => (
+                            Self::promote(ExprType::scalar(ScalarType::U8), expected.as_ref()),
+                            ExprKind::BytesGet {
+                                value: args[0],
+                                index: args[1],
+                            },
+                        ),
+                        _ => {
+                            let capacity = capacity.ok_or_else(|| {
+                                diagnostic(
+                                    "D_BYTES_CAPACITY",
+                                    "byte operation requires destination capacity",
+                                    span,
+                                )
+                            })?;
+                            cost = add_cost(cost, capacity, span)?;
+                            let kind = match bytes.op.as_str() {
+                                "bytes_slice" => ExprKind::BytesSlice {
+                                    value: args[0],
+                                    start: args[1],
+                                    count: args[2],
+                                    capacity,
+                                },
+                                "bytes_concat" => ExprKind::BytesConcat {
+                                    left: args[0],
+                                    right: args[1],
+                                    capacity,
+                                },
+                                _ => ExprKind::BytesResize {
+                                    value: args[0],
+                                    capacity,
+                                },
+                            };
+                            (ExprType::Bytes { capacity }, kind)
+                        }
+                    };
+                    (domain, kind, dependent, cost)
+                }
+            }
+            a::Expr::Codec(codec) => {
+                let ty = self.resolve_type(&codec.ty)?;
+                let width = self.codec_width(&ty, span)?;
+                let value = self.expression(
+                    &codec.value,
+                    scope,
+                    if codec.op == "encode" {
+                        Some(ExprType::scalar(ty.clone()))
+                    } else {
+                        None
+                    },
+                    context,
+                )?;
+                if codec.op != "encode" {
+                    self.require_bytes(value.id, span)?;
+                }
+                let (domain, kind) = match codec.op.as_str() {
+                    "encode" => {
+                        self.program
+                            .value_storage_width(&ValueType::Bytes { capacity: width })
+                            .map_err(|m| diagnostic("D_TYPE_REPRESENTATION", m, span))?;
+                        (
+                            ExprType::Bytes { capacity: width },
+                            ExprKind::Encode {
+                                value: value.id,
+                                ty,
+                            },
+                        )
+                    }
+                    "decode" => (
+                        Self::promote(ExprType::scalar(ty.clone()), expected.as_ref()),
+                        ExprKind::Decode {
+                            value: value.id,
+                            ty,
+                        },
+                    ),
+                    "can_decode" => (
+                        ExprType::scalar(ScalarType::Bool),
+                        ExprKind::CanDecode {
+                            value: value.id,
+                            ty,
+                        },
+                    ),
+                    _ => return Err(diagnostic("D_BAD_OPERAND", "unknown codec operation", span)),
+                };
+                (
+                    domain,
+                    kind,
+                    self.program.expr(value.id).state_dependent,
+                    add_cost(value.cost, width, span)?,
+                )
+            }
+
             a::Expr::Record(record) => {
                 let ty = self.named_type(&record.ty, span)?;
                 let definitions = self.record_fields(ty, span)?.to_vec();
@@ -1757,6 +1970,21 @@ impl Analyzer {
 
     fn concrete(&self, expression: &a::Expr, scope: &Scope) -> Result<Option<ExprType>> {
         Ok(match expression {
+            a::Expr::Bytes(bytes) => Some(match bytes.op.as_str() {
+                "bytes_len" => ExprType::scalar(ScalarType::U64),
+                "bytes_get" => ExprType::scalar(ScalarType::U8),
+                _ => ExprType::Bytes {
+                    capacity: self.bytes_capacity(bytes.capacity.as_ref(), bytes.span)?,
+                },
+            }),
+            a::Expr::Codec(codec) => Some(match codec.op.as_str() {
+                "can_decode" => ExprType::scalar(ScalarType::Bool),
+                "encode" => ExprType::Bytes {
+                    capacity: self.codec_width(&self.resolve_type(&codec.ty)?, codec.span)?,
+                },
+                _ => ExprType::scalar(self.resolve_type(&codec.ty)?),
+            }),
+
             a::Expr::Record(record) => {
                 Some(ExprType::Named(self.named_type(&record.ty, record.span)?))
             }
@@ -2406,6 +2634,9 @@ impl Analyzer {
 
     fn source_state_dependent(&self, expression: &a::Expr, scope: &Scope) -> bool {
         match expression {
+            a::Expr::Bytes(v) => v.args.iter().any(|e| self.source_state_dependent(e, scope)),
+            a::Expr::Codec(v) => self.source_state_dependent(&v.value, scope),
+
             a::Expr::Record(v) => v
                 .fields
                 .iter()
@@ -2479,6 +2710,29 @@ impl Analyzer {
     fn collect_reads(&self, id: ExprId, reads: &mut Vec<Access>, tier_two: &mut bool) {
         let expression = self.program.expr(id);
         match &expression.kind {
+            ExprKind::BytesLen { value }
+            | ExprKind::BytesResize { value, .. }
+            | ExprKind::Encode { value, .. }
+            | ExprKind::CanDecode { value, .. }
+            | ExprKind::Decode { value, .. } => self.collect_reads(*value, reads, tier_two),
+            ExprKind::BytesGet { value, index } => {
+                self.collect_reads(*value, reads, tier_two);
+                self.collect_reads(*index, reads, tier_two);
+            }
+            ExprKind::BytesConcat { left, right, .. } => {
+                self.collect_reads(*left, reads, tier_two);
+                self.collect_reads(*right, reads, tier_two);
+            }
+            ExprKind::BytesSlice {
+                value,
+                start,
+                count,
+                ..
+            } => {
+                for child in [value, start, count] {
+                    self.collect_reads(*child, reads, tier_two);
+                }
+            }
             ExprKind::Record { fields, .. } => {
                 for (_, child) in fields {
                     self.collect_reads(*child, reads, tier_two);
@@ -2533,6 +2787,31 @@ impl Analyzer {
 
     fn collect_expression_writes(&self, id: ExprId, writes: &mut Vec<Access>, tier_two: &mut bool) {
         match &self.program.expr(id).kind {
+            ExprKind::BytesLen { value }
+            | ExprKind::BytesResize { value, .. }
+            | ExprKind::Encode { value, .. }
+            | ExprKind::CanDecode { value, .. }
+            | ExprKind::Decode { value, .. } => {
+                self.collect_expression_writes(*value, writes, tier_two)
+            }
+            ExprKind::BytesGet { value, index } => {
+                self.collect_expression_writes(*value, writes, tier_two);
+                self.collect_expression_writes(*index, writes, tier_two);
+            }
+            ExprKind::BytesConcat { left, right, .. } => {
+                self.collect_expression_writes(*left, writes, tier_two);
+                self.collect_expression_writes(*right, writes, tier_two);
+            }
+            ExprKind::BytesSlice {
+                value,
+                start,
+                count,
+                ..
+            } => {
+                for child in [value, start, count] {
+                    self.collect_expression_writes(*child, writes, tier_two);
+                }
+            }
             ExprKind::Record { fields, .. } => {
                 for (_, child) in fields {
                     self.collect_expression_writes(*child, writes, tier_two);
@@ -2647,6 +2926,53 @@ impl Analyzer {
         }
         let eq = |left, right| self.same_expression(left, right, bindings);
         match (&left.kind, &right.kind) {
+            (ExprKind::BytesLen { value: a }, ExprKind::BytesLen { value: b }) => eq(*a, *b),
+            (
+                ExprKind::BytesGet { value: a, index: x },
+                ExprKind::BytesGet { value: b, index: y },
+            ) => eq(*a, *b) && eq(*x, *y),
+            (
+                ExprKind::BytesSlice {
+                    value: a,
+                    start: x,
+                    count: y,
+                    capacity: c,
+                },
+                ExprKind::BytesSlice {
+                    value: b,
+                    start: u,
+                    count: v,
+                    capacity: d,
+                },
+            ) => c == d && eq(*a, *b) && eq(*x, *u) && eq(*y, *v),
+            (
+                ExprKind::BytesConcat {
+                    left: a,
+                    right: x,
+                    capacity: c,
+                },
+                ExprKind::BytesConcat {
+                    left: b,
+                    right: y,
+                    capacity: d,
+                },
+            ) => c == d && eq(*a, *b) && eq(*x, *y),
+            (
+                ExprKind::BytesResize {
+                    value: a,
+                    capacity: c,
+                },
+                ExprKind::BytesResize {
+                    value: b,
+                    capacity: d,
+                },
+            ) => c == d && eq(*a, *b),
+            (ExprKind::Encode { value: a, ty: c }, ExprKind::Encode { value: b, ty: d })
+            | (ExprKind::CanDecode { value: a, ty: c }, ExprKind::CanDecode { value: b, ty: d })
+            | (ExprKind::Decode { value: a, ty: c }, ExprKind::Decode { value: b, ty: d }) => {
+                c == d && eq(*a, *b)
+            }
+
             (ExprKind::Record { ty: a, fields: x }, ExprKind::Record { ty: b, fields: y }) => {
                 a == b
                     && x.len() == y.len()
@@ -2910,6 +3236,14 @@ fn function_expression_dependencies(
 ) -> Result<()> {
     let mut child = |e: &a::Expr| function_expression_dependencies(e, calls, deps);
     match expression {
+        a::Expr::Bytes(v) => {
+            for e in &v.args {
+                child(e)?;
+            }
+            Ok(())
+        }
+        a::Expr::Codec(v) => child(&v.value),
+
         a::Expr::Record(v) => {
             for (_, e) in &v.fields {
                 child(e)?;

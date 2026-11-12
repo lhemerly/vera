@@ -7,6 +7,8 @@
 //! global and cross-row specifications still use the complete finite state.
 //! Every SAT answer is admitted only after concrete state validation and replay.
 
+#[path = "smt/codecs.rs"]
+mod codecs;
 #[path = "smt/terms.rs"]
 mod terms;
 
@@ -270,6 +272,11 @@ struct Encoding<'a> {
     effect_tags: String,
     effect_args: BTreeMap<(EffectId, usize), String>,
     effect_count: Term,
+    codecs: BTreeMap<ValueType, usize>,
+    codec_encoders: BTreeSet<usize>,
+    codec_decoders: BTreeSet<usize>,
+    codec_padding_helpers: BTreeSet<usize>,
+    zero_padding_declared: bool,
 }
 
 type LowerResult<T> = Result<T, Diagnostic>;
@@ -284,6 +291,7 @@ fn diagnostic(code: &str, message: impl Into<String>, span: Span) -> Diagnostic 
 
 fn sort(domain: &ExprType) -> Sort {
     match domain {
+        ExprType::Bytes { .. } => Sort::Bytes,
         ExprType::Named(id) => Sort::Named(*id),
         ExprType::Scalar(domain) if domain.scalar.is_bool() => Sort::Bool,
         ExprType::Scalar(domain) => Sort::Bits(u32::from(domain.width)),
@@ -291,6 +299,7 @@ fn sort(domain: &ExprType) -> Sort {
 }
 fn value_sort(ty: &ValueType) -> Sort {
     match ty {
+        ValueType::Bytes { .. } => Sort::Bytes,
         ValueType::Named(id) => Sort::Named(*id),
         ValueType::Scalar(ty) if ty.is_bool() => Sort::Bool,
         ValueType::Scalar(ty) => Sort::Bits(u32::from(ty.bits())),
@@ -326,6 +335,7 @@ fn application(name: &str, args: &[String]) -> String {
 }
 fn valid_value(ty: &ValueType, text: &str) -> String {
     match ty {
+        ValueType::Bytes { capacity } => format!("(<= (seq.len {text}) {capacity})"),
         ValueType::Named(id) => format!("(valid_{} {text})", id.0),
         ValueType::Scalar(ScalarType::Enum(tags)) if tags.len() < 256 => {
             cmp("lt", text, &bv(tags.len(), 8), false)
@@ -335,6 +345,7 @@ fn valid_value(ty: &ValueType, text: &str) -> String {
 }
 fn zero_term(ty: &ValueType) -> String {
     match ty {
+        ValueType::Bytes { .. } => codecs::empty(),
         ValueType::Named(id) => format!("zero_{}", id.0),
         ValueType::Scalar(ty) if ty.is_bool() => "false".into(),
         ValueType::Scalar(ty) => bv(0, u32::from(ty.bits())),
@@ -342,6 +353,12 @@ fn zero_term(ty: &ValueType) -> String {
 }
 fn value_literal(program: &CheckedProgram, value: &Value, ty: &ValueType) -> String {
     match (value, ty) {
+        (Value::Bytes(value), _) => codecs::concat(
+            value
+                .iter()
+                .map(|b| format!("(seq.unit {})", bv(*b, 8)))
+                .collect(),
+        ),
         (Value::Bool(value), _) => boolean(*value),
         (Value::Int(value), ValueType::Scalar(ty)) => bv(value.clone(), u32::from(ty.bits())),
         (Value::Record { ty, fields }, _) => {
@@ -457,8 +474,21 @@ impl<'a> Encoding<'a> {
             ),
             effect_args: BTreeMap::new(),
             effect_count: Term::bits(bv(0, 64), 64),
+            codecs: BTreeMap::new(),
+            codec_encoders: BTreeSet::new(),
+            codec_decoders: BTreeSet::new(),
+            codec_padding_helpers: BTreeSet::new(),
+            zero_padding_declared: false,
         };
         this.declare_types()?;
+        // Sequence operations and their integer lengths require a general logic.
+        if program
+            .expressions()
+            .iter()
+            .any(|e| matches!(e.domain, ExprType::Bytes { .. }))
+        {
+            this.script.enable_datatypes();
+        }
         for table in tables {
             let mut rows = Vec::new();
             for slot in 0..table.capacity as usize {
@@ -620,6 +650,9 @@ impl<'a> Encoding<'a> {
     }
 
     fn input(&mut self, name: &str, kind: Sort, location: Location) -> Term {
+        if kind == Sort::Bytes {
+            self.script.enable_datatypes();
+        }
         let term = self.script.declare(name, kind);
         self.projections.push(Projected {
             term: term.clone(),
@@ -761,7 +794,8 @@ impl<'a> Encoding<'a> {
     }
 
     fn coerce(&self, value: &Term, domain: &ExprType, signed: bool) -> Term {
-        if value.sort == Sort::Bool || matches!(domain, ExprType::Named(_)) {
+        if value.sort == Sort::Bool || matches!(domain, ExprType::Named(_) | ExprType::Bytes { .. })
+        {
             return value.clone();
         }
         let width = u32::from(scalar_domain(domain).width);
@@ -780,7 +814,7 @@ impl<'a> Encoding<'a> {
     }
 
     fn narrow(&mut self, value: Term, target: &ValueType) -> Term {
-        if let ValueType::Named(_) = target {
+        if matches!(target, ValueType::Named(_) | ValueType::Bytes { .. }) {
             self.script
                 .trap_if(&mut self.path, &not(&valid_value(target, &value.text)));
             return value;
@@ -973,6 +1007,97 @@ impl<'a> Encoding<'a> {
                     sort: sort(domain),
                 }
             }
+            ExprKind::BytesLen { value } => {
+                let value = self.expr(value)?;
+                Term::bits(format!("((_ int_to_bv 64) (seq.len {}))", value.text), 64)
+            }
+            ExprKind::BytesGet { value, index } => {
+                let value = self.expr(value)?;
+                let index = self.expr(index)?;
+                let index = format!("(ubv_to_int {})", index.text);
+                self.script.trap_if(
+                    &mut self.path,
+                    &not(&format!("(< {index} (seq.len {}))", value.text)),
+                );
+                Term::bits(format!("(seq.nth {} {index})", value.text), 8)
+            }
+            ExprKind::BytesSlice {
+                value,
+                start,
+                count,
+                capacity,
+            } => {
+                let value = self.expr(value)?;
+                let start = self.expr(start)?;
+                let count = self.expr(count)?;
+                let start = format!("(ubv_to_int {})", start.text);
+                let count = format!("(ubv_to_int {})", count.text);
+                self.script.trap_if(
+                    &mut self.path,
+                    &not(&and([
+                        format!("(<= (+ {start} {count}) (seq.len {}))", value.text),
+                        format!("(<= {count} {capacity})"),
+                    ])),
+                );
+                Term {
+                    text: format!("(seq.extract {} {start} {count})", value.text),
+                    sort: Sort::Bytes,
+                }
+            }
+            ExprKind::BytesConcat {
+                left,
+                right,
+                capacity,
+            } => {
+                let left = self.expr(left)?;
+                let right = self.expr(right)?;
+                self.script.trap_if(
+                    &mut self.path,
+                    &not(&format!(
+                        "(<= (+ (seq.len {}) (seq.len {})) {capacity})",
+                        left.text, right.text
+                    )),
+                );
+                Term {
+                    text: codecs::concat(vec![left.text, right.text]),
+                    sort: Sort::Bytes,
+                }
+            }
+            ExprKind::BytesResize { value, capacity } => {
+                let value = self.expr(value)?;
+                self.script.trap_if(
+                    &mut self.path,
+                    &not(&valid_value(&ValueType::Bytes { capacity }, &value.text)),
+                );
+                value
+            }
+            ExprKind::Encode { value, ty } => {
+                let value = self.expr(value)?;
+                let value = self.narrow(value, &ty);
+                let codec = self.encoder(&ty)?;
+                self.encoder_padding_facts(&ty, &value.text)?;
+                Term {
+                    text: format!("(encode_{codec} {})", value.text),
+                    sort: Sort::Bytes,
+                }
+            }
+            ExprKind::CanDecode { value, ty } => {
+                let value = self.expr(value)?;
+                let codec = self.codec(&ty)?;
+                Term::boolean(format!("(decode_valid_{codec} {})", value.text))
+            }
+            ExprKind::Decode { value, ty } => {
+                let value = self.expr(value)?;
+                let codec = self.codec(&ty)?;
+                self.script.trap_if(
+                    &mut self.path,
+                    &not(&format!("(decode_valid_{codec} {})", value.text)),
+                );
+                Term {
+                    text: format!("(decode_{codec} {})", value.text),
+                    sort: value_sort(&ty),
+                }
+            }
             ExprKind::Record { ty, fields } => {
                 let TypeDefinitionKind::Record(definitions) =
                     &self.program.type_definition(ty).kind
@@ -1100,7 +1225,7 @@ impl<'a> Encoding<'a> {
                 } else if op.comparison() {
                     let left_domain = &self.program.expr(left).domain;
                     let right_domain = &self.program.expr(right).domain;
-                    if a.sort == Sort::Bool || matches!(a.sort, Sort::Named(_)) {
+                    if a.sort == Sort::Bool || matches!(a.sort, Sort::Named(_) | Sort::Bytes) {
                         Term::boolean(if op == BinaryOp::Eq {
                             eq(&a.text, &b.text)
                         } else {
@@ -1321,22 +1446,11 @@ impl<'a> Encoding<'a> {
     }
 
     fn empty_effect_array(element: Sort) -> String {
-        let zero = if element == Sort::Bool {
-            "false".into()
-        } else {
-            bv(
-                0,
-                match element {
-                    Sort::Bits(w) => w,
-                    Sort::Bool => 1,
-                    Sort::Named(id) => {
-                        return format!(
-                            "((as const (Array (_ BitVec 64) type_{})) zero_{})",
-                            id.0, id.0
-                        )
-                    }
-                },
-            )
+        let zero = match element {
+            Sort::Bool => "false".into(),
+            Sort::Bits(width) => bv(0, width),
+            Sort::Named(id) => format!("zero_{}", id.0),
+            Sort::Bytes => codecs::empty(),
         };
         format!(
             "((as const (Array (_ BitVec 64) {})) {zero})",
@@ -1788,6 +1902,27 @@ fn row_local(
     let own_key =
         |key| matches!(program.expr(key).kind, ExprKind::Binding(binding) if binding == quantifier);
     match &program.expr(expression).kind {
+        ExprKind::BytesLen { value }
+        | ExprKind::BytesResize { value, .. }
+        | ExprKind::Encode { value, .. }
+        | ExprKind::CanDecode { value, .. }
+        | ExprKind::Decode { value, .. } => {
+            row_local(program, *value, table, quantifier, stable_occupancy)
+        }
+        ExprKind::BytesGet { value, index } => [value, index]
+            .into_iter()
+            .all(|e| row_local(program, *e, table, quantifier, stable_occupancy)),
+        ExprKind::BytesSlice {
+            value,
+            start,
+            count,
+            ..
+        } => [value, start, count]
+            .into_iter()
+            .all(|e| row_local(program, *e, table, quantifier, stable_occupancy)),
+        ExprKind::BytesConcat { left, right, .. } => [left, right]
+            .into_iter()
+            .all(|e| row_local(program, *e, table, quantifier, stable_occupancy)),
         ExprKind::Record { fields, .. } => fields
             .iter()
             .all(|(_, e)| row_local(program, *e, table, quantifier, stable_occupancy)),
@@ -1892,6 +2027,32 @@ fn model_value(
         .eval(expression, true)
         .ok_or("missing structured model value")?;
     let result = match ty {
+        ValueType::Bytes { capacity } => {
+            let seq = value.as_seq().ok_or("model byte sequence sort mismatch")?;
+            let length = model
+                .eval(&seq.length(), true)
+                .and_then(|n| n.as_u64())
+                .ok_or("invalid model byte sequence length")?;
+            if length > *capacity {
+                return Err("model byte sequence exceeds capacity".into());
+            }
+            let length = usize::try_from(length)
+                .map_err(|_| "model byte sequence exceeds host address space")?;
+            let mut bytes = Vec::new();
+            bytes
+                .try_reserve_exact(length)
+                .map_err(|_| "model byte sequence exceeds available memory")?;
+            for i in 0..length {
+                let byte = model
+                    .eval(&seq.nth(z3::ast::Int::from_u64(i as u64)), true)
+                    .and_then(|v| v.as_bv())
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| u8::try_from(v).ok())
+                    .ok_or("invalid model byte sequence element")?;
+                bytes.push(byte);
+            }
+            Value::Bytes(bytes)
+        }
         ValueType::Scalar(ScalarType::Bool) => Value::Bool(
             value
                 .as_bool()
@@ -1963,12 +2124,21 @@ fn model_named_constant(model: &z3::Model, name: &str) -> Option<Dynamic> {
 fn typed_signed_value(value: Value, ty: &ValueType) -> Value {
     match ty {
         ValueType::Scalar(ty) => scalar_signed_value(value, ty),
-        ValueType::Named(_) => value,
+        ValueType::Named(_) | ValueType::Bytes { .. } => value,
     }
 }
 
 fn model_term(program: &CheckedProgram, model: &z3::Model, term: &Term) -> Result<Value, String> {
     match term.sort {
+        Sort::Bytes => {
+            let expression = z3::ast::Seq::new_const(term.text.as_str(), &z3::Sort::bitvector(8));
+            model_value(
+                program,
+                model,
+                &Dynamic::from_ast(&expression),
+                &ValueType::Bytes { capacity: u64::MAX },
+            )
+        }
         Sort::Named(id) => {
             let Some(expression) = model_named_constant(model, &term.text) else {
                 // Z3 omits unconstrained constants; canonical zero is one valid
@@ -1997,7 +2167,7 @@ fn model_term(program: &CheckedProgram, model: &z3::Model, term: &Term) -> Resul
 
 fn model_equality(model: &z3::Model, term: &Term) -> Result<Bool, String> {
     match term.sort {
-        Sort::Named(_) => {
+        Sort::Named(_) | Sort::Bytes => {
             let expression = model_named_constant(model, &term.text)
                 .ok_or("unconstrained datatype has no blocking declaration")?;
             model
@@ -2444,6 +2614,11 @@ fn solve(
                         .map(|variable| {
                             model_term(encoding.program, &model, &variable.term).map(|value| {
                                 let literal = match value {
+                                    Value::Bytes(bytes) => value_literal(
+                                        encoding.program,
+                                        &Value::Bytes(bytes),
+                                        &ValueType::Bytes { capacity: 0 },
+                                    ),
                                     Value::Bool(value) => boolean(value),
                                     Value::Int(value) => bv(value, variable.term.width()),
                                     value @ (Value::Record { ty, .. }
@@ -2704,6 +2879,19 @@ fn statement_dependencies(
 fn expression_dependencies(program: &CheckedProgram, id: ExprId, out: &mut BTreeSet<FunctionId>) {
     let mut children = Vec::new();
     match &program.expr(id).kind {
+        ExprKind::BytesLen { value }
+        | ExprKind::BytesResize { value, .. }
+        | ExprKind::Encode { value, .. }
+        | ExprKind::CanDecode { value, .. }
+        | ExprKind::Decode { value, .. } => children.push(*value),
+        ExprKind::BytesGet { value, index } => children.extend([*value, *index]),
+        ExprKind::BytesSlice {
+            value,
+            start,
+            count,
+            ..
+        } => children.extend([*value, *start, *count]),
+        ExprKind::BytesConcat { left, right, .. } => children.extend([*left, *right]),
         ExprKind::Record { fields, .. } => children.extend(fields.iter().map(|(_, e)| *e)),
         ExprKind::Field { record, .. } => children.push(*record),
         ExprKind::Variant { payload, .. } => children.push(*payload),

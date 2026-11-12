@@ -110,7 +110,7 @@ rustc --edition 2021 --crate-type lib counter.rs
 | Feature | What it provides |
 |---|---|
 | Tables | Fixed capacity, typed generation-checked handles, unique secondary keys |
-| Values | Booleans, fixed-width integers, exact decimals, symbols, bytes32, enums, nominal records and tagged unions |
+| Values | Booleans, fixed-width integers, exact decimals, symbols, bytes32, bounded bytes, enums, records and tagged unions |
 | Specifications | Row/global invariants, preconditions, postconditions, old-state values |
 | Transactions | Checked reads and writes, allocation, guards, atomic commit, typed effects |
 | Folds | Inclusive declared-bounded iteration with scoped accumulator and index bindings |
@@ -141,6 +141,8 @@ ceiling is imposed by default. [Pure functions](docs/COMPOSITIONAL_FUNCTIONS.md)
 reuse verified summaries rather than inlining callee bodies into caller proofs.
 [Structured values](docs/STRUCTURED_VALUES.md) share canonical type definitions
 across functions, effects, storage and codecs without variant-product expansion.
+[Bounded bytes and source codecs](docs/BOUNDED_BYTES.md) add checked byte operations
+and reusable canonical encoders/decoders with definitional round-trip proofs.
 
 ## Explore a program
 

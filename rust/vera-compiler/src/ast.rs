@@ -62,12 +62,25 @@ node_enum!(Decl {
 
 #[derive(Clone, Debug)]
 pub struct TypeRef {
+    pub capacity: Option<IntegerLiteral>,
     pub name: String,
     pub type_args: Vec<TypeRef>,
     pub enum_tags: Vec<String>,
     pub span: Span,
 }
-serialize_node!(TypeRef, "TypeRef", name => "name", type_args => "type_args", enum_tags => "enum_tags");
+impl Serialize for TypeRef {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("node", "TypeRef")?;
+        map.serialize_entry("name", &self.name)?;
+        map.serialize_entry("type_args", &self.type_args)?;
+        map.serialize_entry("enum_tags", &self.enum_tags)?;
+        if let Some(capacity) = &self.capacity {
+            map.serialize_entry("capacity", capacity)?;
+        }
+        map.end()
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ColumnDecl {
@@ -183,6 +196,8 @@ node_enum!(Expr {
     Fold(Box<Fold>),
     Call(Call),
     Record(RecordExpr),
+    Bytes(BytesExpr),
+    Codec(CodecExpr),
     Field(FieldExpr),
     Variant(VariantExpr),
     IsVariant(VariantAccess),
@@ -211,6 +226,8 @@ impl Expr {
             Self::Fold(v) => v.span,
             Self::Call(v) => v.span,
             Self::Record(v) => v.span,
+            Self::Bytes(v) => v.span,
+            Self::Codec(v) => v.span,
             Self::Field(v) => v.span,
             Self::Variant(v) => v.span,
             Self::IsVariant(v) | Self::Payload(v) => v.span,
@@ -506,3 +523,21 @@ pub struct VariantAccess {
     pub span: Span,
 }
 serialize_node!(VariantAccess,"VariantAccess",ty=>"type",variant=>"variant",value=>"value");
+
+#[derive(Clone, Debug)]
+pub struct BytesExpr {
+    pub op: String,
+    pub capacity: Option<IntegerLiteral>,
+    pub hex: Option<String>,
+    pub args: Vec<Expr>,
+    pub span: Span,
+}
+serialize_node!(BytesExpr,"BytesExpr",op=>"op",capacity=>"capacity",hex=>"hex",args=>"args");
+#[derive(Clone, Debug)]
+pub struct CodecExpr {
+    pub op: String,
+    pub ty: TypeRef,
+    pub value: Box<Expr>,
+    pub span: Span,
+}
+serialize_node!(CodecExpr,"CodecExpr",op=>"op",ty=>"type",value=>"value");

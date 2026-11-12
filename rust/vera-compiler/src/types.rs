@@ -266,6 +266,7 @@ pub fn mix64(mut z: u64) -> u64 {
 /// A scalar leaf or a reference to a shared nominal finite product/sum type.
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
 pub enum ValueType {
+    Bytes { capacity: u64 },
     Scalar(ScalarType),
     Named(TypeId),
 }
@@ -278,7 +279,7 @@ impl ValueType {
     pub fn as_scalar(&self) -> Option<&ScalarType> {
         match self {
             Self::Scalar(t) => Some(t),
-            Self::Named(_) => None,
+            Self::Named(_) | Self::Bytes { .. } => None,
         }
     }
     pub fn is_numeric(&self) -> bool {
@@ -302,6 +303,7 @@ impl fmt::Display for ValueType {
         match self {
             Self::Scalar(t) => t.fmt(f),
             Self::Named(id) => write!(f, "type#{}", id.0),
+            Self::Bytes { capacity } => write!(f, "bytes<{capacity}>"),
         }
     }
 }
@@ -317,6 +319,7 @@ impl PartialEq<ValueType> for ScalarType {
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum ExprType {
+    Bytes { capacity: u64 },
     Scalar(Domain),
     Named(TypeId),
 }
@@ -325,12 +328,15 @@ impl ExprType {
         match self {
             Self::Scalar(d) => ValueType::Scalar(d.scalar.clone()),
             Self::Named(id) => ValueType::Named(*id),
+            Self::Bytes { capacity } => ValueType::Bytes {
+                capacity: *capacity,
+            },
         }
     }
     pub fn scalar_domain(&self) -> Option<&Domain> {
         match self {
             Self::Scalar(d) => Some(d),
-            Self::Named(_) => None,
+            Self::Named(_) | Self::Bytes { .. } => None,
         }
     }
     pub fn as_scalar(&self) -> Option<&ScalarType> {
@@ -343,6 +349,7 @@ impl ExprType {
         match ty.into() {
             ValueType::Scalar(t) => Self::Scalar(Domain::scalar(t)),
             ValueType::Named(id) => Self::Named(id),
+            ValueType::Bytes { capacity } => Self::Bytes { capacity },
         }
     }
     pub fn aggregate(ty: ScalarType) -> Self {

@@ -1,0 +1,24 @@
+record Packet{flag:bool;data:bytes<8>;}
+union Message{Data:Packet;Empty:bytes<0>;}
+table Store capacity 4 {key id:id64<Store>;col payload:bytes<8> [unique];col message:Message;}
+effect Sent(payload:bytes<8>,message:Message);
+function identity(b:bytes<8>)->bytes<8> ensure exact:eq(result,b);body {yield b;}
+function roundtrip(m:Message)->Message body {yield decode<Message>(encode<Message>(m));}
+transition save(b:bytes<8>) reads [] writes [Store[*].payload,Store[*].message]
+ensure sent:eq(effect_arg(Sent,0,payload),b);
+body {let %m:Message=variant<Message,Data>(record<Packet>(flag:true,data:identity(b)));let %k:id64<Store>=table_alloc(Store,{payload:b,message:roundtrip(%m)});emit Sent(b,%m);commit;}
+transition good() reads [] writes []
+ensure wire:eq(encode<u16>(4660),hex<2>("3412"));
+ensure valid:can_decode<bool>(hex<1>("01"));
+ensure invalid:not(can_decode<bool>(hex<1>("02")));
+body {let %a:bytes<8>=bytes_concat<8>(hex<3>("00ff"),hex<4>("10"));let %b:bytes<8>=bytes_resize<8>(bytes_slice<2>(%a,1,2));guard(eq(%b,hex<8>("ff10")),BAD);let %empty:bytes<0>=bytes_slice<0>(%a,3,0);guard(eq(bytes_len(%empty),0),BAD);guard(eq(bytes_get(%a,1),255),BAD);commit;}
+transition bad_get() reads [] writes [] body {let %x:u8=bytes_get(hex<0>(""),0);commit;}
+transition bad_slice() reads [] writes [] body {let %x:bytes<1>=bytes_slice<1>(hex<2>("00"),2,0);commit;}
+transition bad_capacity() reads [] writes [] body {let %x:bytes<1>=bytes_concat<1>(hex<1>("00"),hex<1>("01"));commit;}
+transition bad_resize() reads [] writes [] body {let %x:bytes<0>=bytes_resize<0>(hex<1>("01"));commit;}
+transition bad_decode() reads [] writes [] body {let %x:bool=decode<bool>(hex<1>("02"));commit;}
+transition lazy() reads [] writes [] body {let %x:bool=select(false,decode<bool>(hex<1>("02")),true);commit;}
+projection View(k:id64<Store>){allow_if:table_exists(Store,k);expose:[Store[k].payload];enable_intents:[];}
+transition decode_blob(raw:bytes<32>) reads [] writes [] body {let %b:bytes<8>=decode<bytes<8>>(raw);commit;}
+transition decode_message(raw:bytes<64>) reads [] writes [] body {let %m:Message=decode<Message>(raw);commit;}
+transition nested_wire() reads [] writes [] ensure exact:eq(encode<bytes<0>>(hex<0>("")),hex<8>("0000000000000000"));body {commit;}

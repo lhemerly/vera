@@ -162,6 +162,40 @@ pub struct TypedExpr {
 }
 #[derive(Clone, Debug)]
 pub enum ExprKind {
+    BytesLen {
+        value: ExprId,
+    },
+    BytesGet {
+        value: ExprId,
+        index: ExprId,
+    },
+    BytesSlice {
+        value: ExprId,
+        start: ExprId,
+        count: ExprId,
+        capacity: u64,
+    },
+    BytesConcat {
+        left: ExprId,
+        right: ExprId,
+        capacity: u64,
+    },
+    BytesResize {
+        value: ExprId,
+        capacity: u64,
+    },
+    Encode {
+        value: ExprId,
+        ty: ValueType,
+    },
+    CanDecode {
+        value: ExprId,
+        ty: ValueType,
+    },
+    Decode {
+        value: ExprId,
+        ty: ValueType,
+    },
     Record {
         ty: TypeId,
         fields: Vec<(FieldId, ExprId)>,
@@ -515,6 +549,7 @@ impl CheckedProgram {
     pub fn value_type_name(&self, ty: &ValueType) -> String {
         match ty {
             ValueType::Scalar(t) => t.to_string(),
+            ValueType::Bytes { capacity } => format!("bytes<{capacity}>"),
             ValueType::Named(id) => self.type_definition(*id).name.clone(),
         }
     }
@@ -526,6 +561,10 @@ impl CheckedProgram {
         }
         match ty {
             ValueType::Scalar(t) => Ok(t.byte_width()),
+            ValueType::Bytes { capacity } => usize::try_from(*capacity)
+                .ok()
+                .and_then(|n| n.checked_add(8))
+                .ok_or_else(|| "bytes canonical wire width exceeds usize".into()),
             ValueType::Named(id) => match &self.type_definition(*id).kind {
                 TypeDefinitionKind::Record(fields) => fields.iter().try_fold(0usize, |n, f| {
                     n.checked_add(self.value_wire_width(&f.ty)?)
@@ -550,6 +589,7 @@ impl CheckedProgram {
             }
         }
         match ty {
+            ValueType::Bytes { .. } => Ok(8),
             ValueType::Scalar(crate::types::ScalarType::Bytes32) => Ok(1),
             ValueType::Scalar(t) => Ok(t.align()),
             ValueType::Named(id) => match &self.type_definition(*id).kind {
@@ -583,6 +623,7 @@ impl CheckedProgram {
                 .ok_or_else(|| "type layout exceeds usize".into())
         }
         match ty {
+            ValueType::Bytes { .. } => align(self.value_wire_width(ty)?, 8),
             ValueType::Scalar(t) => Ok(t.byte_width()),
             ValueType::Named(id) => {
                 let alignment = usize::try_from(self.value_alignment(ty)?)

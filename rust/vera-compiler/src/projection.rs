@@ -335,6 +335,19 @@ fn contains_binding(
         ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
             children.push(*index)
         }
+        ExprKind::BytesLen { value }
+        | ExprKind::BytesResize { value, .. }
+        | ExprKind::Encode { value, .. }
+        | ExprKind::CanDecode { value, .. }
+        | ExprKind::Decode { value, .. } => children.push(*value),
+        ExprKind::BytesGet { value, index } => children.extend([*value, *index]),
+        ExprKind::BytesSlice {
+            value,
+            start,
+            count,
+            ..
+        } => children.extend([*value, *start, *count]),
+        ExprKind::BytesConcat { left, right, .. } => children.extend([*left, *right]),
         ExprKind::Record { fields, .. } => children.extend(fields.iter().map(|(_, value)| *value)),
         ExprKind::Field { record, .. } => children.push(*record),
         ExprKind::Variant { payload, .. } => children.push(*payload),

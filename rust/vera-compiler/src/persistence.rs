@@ -89,6 +89,7 @@ fn schema_type(program: &CheckedProgram, ty: &ValueType) -> String {
             format!("id64<{}>", program.table(*table).name)
         }
         ValueType::Scalar(ty) => ty.to_string(),
+        ValueType::Bytes { capacity } => format!("bytes<{capacity}>"),
         ValueType::Named(id) => format!("named<{}>", program.type_definition(*id).name),
     }
 }

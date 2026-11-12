@@ -839,8 +839,131 @@ impl Evaluator<'_, '_> {
 
     fn value(&mut self, expression: ExprId, context: Snapshot) -> Result<Value, RuntimeError> {
         let expr = self.program.expr(expression).clone();
-        let result = self.value_inner(expr.kind, &expr.domain, context);
+        // Dispatch before entering the large ordinary-expression frame: byte
+        // temporaries must not enlarge every recursive scalar/function call.
+        let result = match expr.kind {
+            ExprKind::BytesLen { .. }
+            | ExprKind::BytesGet { .. }
+            | ExprKind::BytesSlice { .. }
+            | ExprKind::BytesConcat { .. }
+            | ExprKind::BytesResize { .. }
+            | ExprKind::Encode { .. }
+            | ExprKind::CanDecode { .. }
+            | ExprKind::Decode { .. } => self.value_bytes(expr.kind, context),
+            kind => self.value_inner(kind, &expr.domain, context),
+        };
         result.map_err(|error| error.at(expr.span))
+    }
+
+    #[inline(never)]
+    fn value_bytes(&mut self, kind: ExprKind, context: Snapshot) -> Result<Value, RuntimeError> {
+        match kind {
+            ExprKind::BytesLen { value } => {
+                let Value::Bytes(bytes) = self.value(value, context)? else {
+                    return Err(arithmetic());
+                };
+                Ok(Value::Int(BigInt::from(bytes.len())))
+            }
+            ExprKind::BytesGet { value, index } => {
+                let Value::Bytes(bytes) = self.value(value, context)? else {
+                    return Err(arithmetic());
+                };
+                let index = self.value(index, context)?;
+                let index = index
+                    .as_u64()
+                    .and_then(|i| usize::try_from(i).ok())
+                    .ok_or_else(|| RuntimeError::new("ERR_BYTES_BOUNDS", FailureKind::Trap))?;
+                bytes
+                    .get(index)
+                    .copied()
+                    .map(|v| Value::Int(BigInt::from(v)))
+                    .ok_or_else(|| RuntimeError::new("ERR_BYTES_BOUNDS", FailureKind::Trap))
+            }
+            ExprKind::BytesSlice {
+                value,
+                start,
+                count,
+                capacity,
+            } => {
+                let Value::Bytes(bytes) = self.value(value, context)? else {
+                    return Err(arithmetic());
+                };
+                let start = self.value(start, context)?;
+                let count = self.value(count, context)?;
+                let bounds = || RuntimeError::new("ERR_BYTES_BOUNDS", FailureKind::Trap);
+                let start = start
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(bounds)?;
+                let count = count
+                    .as_u64()
+                    .and_then(|n| usize::try_from(n).ok())
+                    .ok_or_else(bounds)?;
+                let end = start.checked_add(count).ok_or_else(bounds)?;
+                let slice = bytes.get(start..end).ok_or_else(bounds)?;
+                if count as u128 > u128::from(capacity) {
+                    return Err(RuntimeError::new("ERR_BYTES_CAPACITY", FailureKind::Trap));
+                }
+                let mut result = reserved(count).map_err(|_| resource("ERR_BYTES_ALLOCATION"))?;
+                result.extend_from_slice(slice);
+                Ok(Value::Bytes(result))
+            }
+            ExprKind::BytesConcat {
+                left,
+                right,
+                capacity,
+            } => {
+                let Value::Bytes(left) = self.value(left, context)? else {
+                    return Err(arithmetic());
+                };
+                let Value::Bytes(right) = self.value(right, context)? else {
+                    return Err(arithmetic());
+                };
+                let total = left
+                    .len()
+                    .checked_add(right.len())
+                    .ok_or_else(|| resource("ERR_BYTES_ALLOCATION"))?;
+                if total as u128 > u128::from(capacity) {
+                    return Err(RuntimeError::new("ERR_BYTES_CAPACITY", FailureKind::Trap));
+                }
+                let mut result = reserved(total).map_err(|_| resource("ERR_BYTES_ALLOCATION"))?;
+                result.extend_from_slice(&left);
+                result.extend_from_slice(&right);
+                Ok(Value::Bytes(result))
+            }
+            ExprKind::BytesResize { value, capacity } => {
+                let Value::Bytes(bytes) = self.value(value, context)? else {
+                    return Err(arithmetic());
+                };
+                if bytes.len() as u128 > u128::from(capacity) {
+                    return Err(RuntimeError::new("ERR_BYTES_CAPACITY", FailureKind::Trap));
+                }
+                Ok(Value::Bytes(bytes))
+            }
+            ExprKind::Encode { value, ty } => {
+                let value = self.value(value, context)?;
+                let value = coerce_value(self.program, &value, &ty).map_err(|_| arithmetic())?;
+                let bytes = crate::value::encode_value(self.program, &value, &ty)
+                    .map_err(|_| resource("ERR_BYTES_ALLOCATION"))?;
+                Ok(Value::Bytes(bytes))
+            }
+            ExprKind::CanDecode { value, ty } => {
+                let Value::Bytes(bytes) = self.value(value, context)? else {
+                    return Err(arithmetic());
+                };
+                Ok(Value::Bool(
+                    crate::value::decode_value(self.program, &bytes, &ty).is_ok(),
+                ))
+            }
+            ExprKind::Decode { value, ty } => {
+                let Value::Bytes(bytes) = self.value(value, context)? else {
+                    return Err(arithmetic());
+                };
+                crate::value::decode_value(self.program, &bytes, &ty)
+                    .map_err(|_| RuntimeError::new("ERR_DECODE", FailureKind::Trap))
+            }
+            _ => unreachable!("only byte expressions enter value_bytes"),
+        }
     }
 
     fn value_inner(
@@ -913,6 +1036,16 @@ impl Evaluator<'_, '_> {
                     return Err(RuntimeError::new("ERR_VARIANT_ACCESS", FailureKind::Trap));
                 }
                 Ok(*payload)
+            }
+            ExprKind::BytesLen { .. }
+            | ExprKind::BytesGet { .. }
+            | ExprKind::BytesSlice { .. }
+            | ExprKind::BytesConcat { .. }
+            | ExprKind::BytesResize { .. }
+            | ExprKind::Encode { .. }
+            | ExprKind::CanDecode { .. }
+            | ExprKind::Decode { .. } => {
+                unreachable!("byte expressions dispatch before value_inner")
             }
             ExprKind::Constant(value) => Ok(value),
             ExprKind::Binding(binding) => self

@@ -5,6 +5,7 @@ use num_bigint::BigInt;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Sort {
     Bool,
+    Bytes,
     Bits(u32),
     Named(crate::ir::TypeId),
 }
@@ -13,6 +14,7 @@ impl Sort {
     pub fn smt(self) -> String {
         match self {
             Self::Bool => "Bool".into(),
+            Self::Bytes => "(Seq (_ BitVec 8))".into(),
             Self::Bits(width) => format!("(_ BitVec {width})"),
             Self::Named(id) => format!("type_{}", id.0),
         }
@@ -44,6 +46,7 @@ impl Term {
         match self.sort {
             Sort::Bits(width) => width,
             Sort::Bool => 1,
+            Sort::Bytes => panic!("byte sequence has no numeric width"),
             Sort::Named(_) => panic!("named value has no numeric width"),
         }
     }

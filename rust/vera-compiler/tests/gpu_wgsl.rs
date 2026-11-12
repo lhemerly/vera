@@ -272,3 +272,21 @@ atomicAdd(&output.violations,saved);atomicAdd(&output.committed,found);atomicAdd
         [1, 1, 3, 25],
     );
 }
+
+#[test]
+fn wgsl_bounded_bytes_and_shared_canonical_codecs_execute() {
+    expect(
+        include_str!("fixtures/gpu_bounded_bytes.vera"),
+        r#"
+@compute @workgroup_size(1)
+fn probe(){var ctx:Ctx;vera_init(&ctx);
+var x=vera_bytes_4_zero();x.len=3u;x.data[0]=1u;x.data[1]=2u;x.data[2]=3u;
+let saved=transition_v_save(&ctx,x);let found=transition_v_lookup(&ctx,x);
+var bad=vera_bytes_17_zero();bad.len=17u;bad.data[0]=99u;
+let failed=transition_v_invalid(&ctx,bad);let lazy=transition_v_lazy(&ctx,bad);let empty=transition_v_empty(&ctx);
+atomicAdd(&output.violations,saved);atomicAdd(&output.committed,found);atomicAdd(&output.reverted,failed);atomicAdd(&output.effects,lazy+empty+ctx.s.col_0_1[0].f_1.data[0]);}
+"#,
+        "probe",
+        [1, 1, 3, 257],
+    );
+}

@@ -3,13 +3,15 @@
 //! Resolution and arithmetic domains are supplied by analysis. This backend
 //! neither reparses source nor asks a second type checker what an expression is.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use num_bigint::{BigInt, Sign};
 
 use crate::diagnostic::{Diagnostic, Span};
 use crate::ir::*;
 use crate::types::{Domain, ExprType, ScalarType, ValueType};
+#[path = "codegen_rust/bytes.rs"]
+mod bytes;
 #[path = "codegen_rust/structured.rs"]
 mod structured;
 use crate::value::Value;
@@ -159,12 +161,14 @@ struct Generator<'a> {
     effect_variants: Vec<String>,
     transition_functions: Vec<String>,
     column_functions: HashMap<ColumnId, String>,
+    source_codec_ids: BTreeMap<ValueType, usize>,
     error_codes: BTreeSet<String>,
     error_variants: HashMap<String, String>,
 }
 
 impl<'a> Generator<'a> {
     fn new(program: &'a CheckedProgram) -> Self {
+        let source_codec_ids = bytes::collect_source_codecs(program);
         let table_names = program
             .tables
             .iter()
@@ -230,6 +234,13 @@ impl<'a> Generator<'a> {
             .map(|((id, _), name)| (*id, name))
             .collect::<HashMap<_, _>>();
         let mut reserved = "main run_batch run_batch_serial restore snapshot mix64 decimal_mul decimal_div checksum replay_file atomic_write wide_product wide_quotient decimal_wide_result decimal_wide_mul decimal_wide_div projection_bound I256 U256".split_whitespace().map(str::to_owned).collect::<HashSet<_>>();
+        for name in ["vera_encode_bytes", "vera_decode_bytes"] {
+            reserved.insert(name.into());
+        }
+        for index in 0..source_codec_ids.len() {
+            reserved.insert(format!("vera_source_encode_{index}"));
+            reserved.insert(format!("vera_source_decode_{index}"));
+        }
         for function in program.functions() {
             reserved.insert(format!("vera_function_{}", function.id.0));
         }
@@ -291,6 +302,9 @@ impl<'a> Generator<'a> {
             "EffectAccess",
             "FunctionPrecondition",
             "VariantAccess",
+            "BytesBounds",
+            "BytesCapacity",
+            "Decode",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -323,6 +337,7 @@ impl<'a> Generator<'a> {
             effect_variants,
             transition_functions,
             column_functions,
+            source_codec_ids,
             error_codes,
             error_variants,
         }
@@ -366,7 +381,9 @@ impl<'a> Generator<'a> {
         self.line("}");
         self.line(include_str!("../templates/wide.rs"));
         self.line(include_str!("../templates/codec.rs"));
+        self.line(include_str!("../templates/bytes.rs"));
         self.named_types();
+        self.source_codecs();
         self.effects();
         for table in &self.program.tables {
             self.emit_table(table);
@@ -594,7 +611,7 @@ impl<'a> Generator<'a> {
         let rt = self.value_rust_type(&column.ty);
         let buckets = (table.capacity * 2).max(16);
         let mask = buckets - 1;
-        let hash = if let ValueType::Named(_) = column.ty {
+        let hash = if matches!(column.ty, ValueType::Named(_) | ValueType::Bytes { .. }) {
             format!("{{let mut out=Vec::new();{}let mut hash=14695981039346656037u64;for byte in out{{hash=(hash^u64::from(byte)).wrapping_mul(1099511628211);}}hash}}",self.value_encode("*value",&column.ty))
         } else if column.ty == ValueType::Scalar(ScalarType::Bytes32) {
             "u64::from_le_bytes(value[..8].try_into().unwrap())".into()
@@ -777,6 +794,9 @@ impl Generator<'_> {
         if let ValueType::Named(id) = ty {
             return format!("vera_project_type_{}({value})", id.0);
         }
+        if matches!(ty, ValueType::Bytes { .. }) {
+            return format!("ProjectionValue::Bytes(({value}).logical().to_vec())");
+        }
         let ty = scalar(ty);
         if ty.is_bool() {
             format!("ProjectionValue::Bool({value})")
@@ -792,6 +812,29 @@ impl Generator<'_> {
 
     fn expression_bindings(&self, id: ExprId, result: &mut HashSet<BindingId>) {
         match &self.expr_info(id).kind {
+            ExprKind::BytesLen { value }
+            | ExprKind::BytesResize { value, .. }
+            | ExprKind::Encode { value, .. }
+            | ExprKind::CanDecode { value, .. }
+            | ExprKind::Decode { value, .. } => self.expression_bindings(*value, result),
+            ExprKind::BytesGet { value, index } => {
+                self.expression_bindings(*value, result);
+                self.expression_bindings(*index, result);
+            }
+            ExprKind::BytesSlice {
+                value,
+                start,
+                count,
+                ..
+            } => {
+                for id in [value, start, count] {
+                    self.expression_bindings(*id, result);
+                }
+            }
+            ExprKind::BytesConcat { left, right, .. } => {
+                self.expression_bindings(*left, result);
+                self.expression_bindings(*right, result);
+            }
             ExprKind::Binding(binding) => {
                 result.insert(*binding);
             }
@@ -1043,7 +1086,7 @@ impl Generator<'_> {
                         ValueType::Scalar(ScalarType::Bytes32) => "[0u8;32]".into(),
                         ValueType::Scalar(ScalarType::Enum(_)) => "0".into(),
                         ValueType::Scalar(ScalarType::U8 | ScalarType::U16) => "1".into(),
-                        ValueType::Named(_) => self.value_zero(&param.ty),
+                        ValueType::Named(_) | ValueType::Bytes { .. } => self.value_zero(&param.ty),
                         _ => "100000000".into(),
                     };
                     format!("{name}:{value}")
@@ -1120,7 +1163,7 @@ impl Generator<'_> {
                 }
             }
             Value::Int(value) => format!("{value}{}", rust_type(&domain.scalar)),
-            Value::Record { .. } | Value::Variant { .. } => {
+            Value::Record { .. } | Value::Variant { .. } | Value::Bytes(_) => {
                 unreachable!("structured constant in scalar literal")
             }
         }
@@ -1188,6 +1231,9 @@ impl Generator<'_> {
                     | ExprKind::Call { .. }
                     | ExprKind::Field { .. }
                     | ExprKind::Payload { .. }
+                    | ExprKind::BytesLen { .. }
+                    | ExprKind::BytesGet { .. }
+                    | ExprKind::Decode { .. }
             );
         let state_name = |snapshot| {
             if snapshot == Snapshot::Pre {
@@ -1197,6 +1243,14 @@ impl Generator<'_> {
             }
         };
         let value = match expression.kind {
+            ExprKind::BytesLen { .. }
+            | ExprKind::BytesGet { .. }
+            | ExprKind::BytesSlice { .. }
+            | ExprKind::BytesConcat { .. }
+            | ExprKind::BytesResize { .. }
+            | ExprKind::Encode { .. }
+            | ExprKind::CanDecode { .. }
+            | ExprKind::Decode { .. } => self.bytes_expression(&expression.kind, env)?,
             ExprKind::Record { ty, fields } => {
                 let TypeDefinitionKind::Record(definitions) =
                     &self.program.type_definition(ty).kind

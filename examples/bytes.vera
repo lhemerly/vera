@@ -1,0 +1,31 @@
+module CanonicalPackets;
+
+record Packet {
+  kind : u8;
+  content : bytes<8>;
+}
+
+function roundtrip(packet : Packet) -> Packet
+  ensure exact : eq(result, packet);
+  body { yield decode<Packet>(encode<Packet>(packet)); }
+
+effect Accepted(packet : Packet);
+transition accept(packet : Packet)
+  reads [] writes []
+  ensure count : eq(effect_count(), 1);
+  ensure kind : effect_is(Accepted, 0);
+  ensure packet : eq(effect_arg(Accepted, 0, packet), packet);
+  body {
+    emit Accepted(roundtrip(packet));
+    commit;
+  }
+
+transition receive(raw : bytes<17>)
+  reads [] writes []
+  require canonical : can_decode<Packet>(raw);
+  ensure bytes : eq(encode<Packet>(effect_arg(Accepted, 0, packet)), raw);
+  body {
+    let %packet : Packet = decode<Packet>(raw);
+    emit Accepted(%packet);
+    commit;
+  }

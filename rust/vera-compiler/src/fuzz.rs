@@ -100,6 +100,11 @@ fn seed_value(
     rng: &mut Xoshiro256,
 ) -> Value {
     match ty {
+        ValueType::Bytes { capacity } => Value::Bytes(if *capacity > 0 && unique {
+            vec![(slot + 1) as u8]
+        } else {
+            Vec::new()
+        }),
         ValueType::Scalar(ScalarType::Bool) => Value::Bool(false),
         ValueType::Scalar(ScalarType::Id64(other)) => {
             Value::Int(BigInt::from(1u64 << program.table(*other).key_bits()))
@@ -159,6 +164,51 @@ fn seed(
     Ok(state)
 }
 
+/// A sampling strategy, never a source/type/execution bound: cover empty,
+/// singleton and common two-byte patterns plus every fitting source literal.
+/// Full-capacity source literals are eligible regardless of their size.
+fn sample_bytes(program: &CheckedProgram, capacity: u64, rng: &mut Xoshiro256) -> Value {
+    if capacity == 0 {
+        return Value::Bytes(Vec::new());
+    }
+    let bytes = match rng.below(4) {
+        0 => Vec::new(),
+        1 => vec![rng.below(256) as u8],
+        2 => {
+            if capacity == 1 {
+                vec![0xff]
+            } else {
+                vec![0, 0xff]
+            }
+        }
+        _ => {
+            let literals = || {
+                program
+                    .expressions()
+                    .iter()
+                    .filter_map(|expression| match &expression.kind {
+                        crate::ir::ExprKind::Constant(Value::Bytes(bytes))
+                            if bytes.len() as u128 <= u128::from(capacity) =>
+                        {
+                            Some(bytes)
+                        }
+                        _ => None,
+                    })
+            };
+            let count = literals().count();
+            if count == 0 {
+                Vec::new()
+            } else {
+                literals()
+                    .nth(rng.below(count as u64) as usize)
+                    .unwrap()
+                    .clone()
+            }
+        }
+    };
+    Value::Bytes(bytes)
+}
+
 fn sample_value(
     program: &CheckedProgram,
     state: &State,
@@ -166,6 +216,7 @@ fn sample_value(
     rng: &mut Xoshiro256,
 ) -> Value {
     let scalar = match ty {
+        ValueType::Bytes { capacity } => return sample_bytes(program, *capacity, rng),
         ValueType::Scalar(scalar) => scalar,
         ValueType::Named(id) => {
             return match &program.type_definition(*id).kind {
