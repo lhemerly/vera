@@ -107,3 +107,19 @@ atomicAdd(violations,first);atomicAdd(committed,second);atomicAdd(reverted,bad);
         "violations=1 committed=1 reverted=3 effects=2",
     );
 }
+
+#[test]
+fn glsl_records_unions_and_typed_function_results_execute() {
+    run(
+        include_str!("fixtures/gpu_structured.vera"),
+        r#"
+void main(){if(gl_GlobalInvocationID.x!=0u){return;}Ctx ctx;vera_init(ctx);
+VeraT0 p=vera_type_0_zero();p.f_0=v_small(7u);p.f_1=v_make(1u,2u,3u,4u,5u,6u,7u,8u);
+VeraT1 w=vera_type_1_zero();w.f_0=v_make(9u,10u,11u,12u,13u,14u,15u,16u);w.f_1=v_make(17u,18u,19u,20u,21u,22u,23u,24u);
+uint saved=transition_v_save(ctx,p,w,v_small(1u));uint found=transition_v_lookup(ctx,p);
+uint bad=transition_v_wrongtag(ctx);uint ordered=transition_v_ordered(ctx);
+atomicAdd(violations,saved);atomicAdd(committed,found);atomicAdd(reverted,bad);atomicAdd(effects,ordered+ctx.s.col_0_2[0].f_1.f_1.w[7]);}
+"#,
+        "violations=1 committed=1 reverted=3 effects=25",
+    );
+}

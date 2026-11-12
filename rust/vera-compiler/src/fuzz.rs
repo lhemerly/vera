@@ -11,7 +11,7 @@ use crate::{
         check_invariants, eval_expression, rebuild_indexes, recompute_aggregates, FailureKind,
         Machine, RuntimeError, State,
     },
-    types::ScalarType,
+    types::{ScalarType, ValueType},
     value::Value,
 };
 
@@ -92,6 +92,48 @@ impl Xoshiro256 {
     }
 }
 
+fn seed_value(
+    program: &CheckedProgram,
+    ty: &ValueType,
+    slot: usize,
+    unique: bool,
+    rng: &mut Xoshiro256,
+) -> Value {
+    match ty {
+        ValueType::Scalar(ScalarType::Bool) => Value::Bool(false),
+        ValueType::Scalar(ScalarType::Id64(other)) => {
+            Value::Int(BigInt::from(1u64 << program.table(*other).key_bits()))
+        }
+        ValueType::Scalar(ScalarType::Dec64 | ScalarType::Dec128) => {
+            Value::Int(BigInt::from(rng.below(900_000_000)))
+        }
+        ValueType::Scalar(_) => Value::Int(BigInt::from(if unique { slot + 1 } else { 0 })),
+        ValueType::Named(id) => match &program.type_definition(*id).kind {
+            crate::ir::TypeDefinitionKind::Record(fields) => Value::Record {
+                ty: *id,
+                fields: fields
+                    .iter()
+                    .map(|f| seed_value(program, &f.ty, slot, unique, rng))
+                    .collect(),
+            },
+            crate::ir::TypeDefinitionKind::Union(variants) => {
+                let variant = &variants[slot % variants.len()];
+                Value::Variant {
+                    ty: *id,
+                    tag: variant.id,
+                    payload: Box::new(seed_value(
+                        program,
+                        &variant.payload,
+                        slot / variants.len(),
+                        unique,
+                        rng,
+                    )),
+                }
+            }
+        },
+    }
+}
+
 fn seed(
     program: &CheckedProgram,
     rng: &mut Xoshiro256,
@@ -107,24 +149,84 @@ fn seed(
             data.occupied[slot] = true;
             data.generations[slot] = 1;
             for column in &table.columns {
-                let number = match &column.ty {
-                    ScalarType::Bool => {
-                        data.columns[column.id.index][slot] = Value::Bool(false);
-                        continue;
-                    }
-                    ScalarType::Id64(other) => {
-                        BigInt::from(1u64 << program.table(*other).key_bits())
-                    }
-                    ScalarType::Dec64 | ScalarType::Dec128 => BigInt::from(rng.below(900_000_000)),
-                    _ => BigInt::from(if column.unique { slot + 1 } else { 0 }),
-                };
-                data.columns[column.id.index][slot] = Value::Int(number);
+                data.columns[column.id.index][slot] =
+                    seed_value(program, &column.ty, slot, column.unique, rng);
             }
         }
     }
     recompute_aggregates(program, &mut state)?;
     rebuild_indexes(program, &mut state)?;
     Ok(state)
+}
+
+fn sample_value(
+    program: &CheckedProgram,
+    state: &State,
+    ty: &ValueType,
+    rng: &mut Xoshiro256,
+) -> Value {
+    let scalar = match ty {
+        ValueType::Scalar(scalar) => scalar,
+        ValueType::Named(id) => {
+            return match &program.type_definition(*id).kind {
+                crate::ir::TypeDefinitionKind::Record(fields) => Value::Record {
+                    ty: *id,
+                    fields: fields
+                        .iter()
+                        .map(|f| sample_value(program, state, &f.ty, rng))
+                        .collect(),
+                },
+                crate::ir::TypeDefinitionKind::Union(variants) => {
+                    let variant = &variants[rng.below(variants.len() as u64) as usize];
+                    Value::Variant {
+                        ty: *id,
+                        tag: variant.id,
+                        payload: Box::new(sample_value(program, state, &variant.payload, rng)),
+                    }
+                }
+            }
+        }
+    };
+    match scalar {
+        ScalarType::Bool => Value::Bool(rng.below(2) == 1),
+        ScalarType::Id64(id) => {
+            let table = program.table(*id);
+            let data = &state.tables[id.0];
+            let live: Vec<_> = (0..data.occupied.len())
+                .filter_map(|slot| data.key_at(table, slot))
+                .collect();
+            Value::Int(BigInt::from(if live.is_empty() {
+                rng.below(table.capacity)
+            } else {
+                live[rng.below(live.len() as u64) as usize]
+            }))
+        }
+        ScalarType::Enum(tags) => Value::Int(BigInt::from(rng.below(tags.len() as u64))),
+        ScalarType::Bytes32 => {
+            let bytes: Vec<_> = (0..32).map(|_| rng.below(256) as u8).collect();
+            Value::Int(BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes))
+        }
+        ty => {
+            let number = match rng.below(16) {
+                0 => ty.min_value(),
+                1 => ty.max_value(),
+                2 => BigInt::from(0),
+                3 => BigInt::from(1),
+                4 if ty.signed() => BigInt::from(-1),
+                _ if ty.is_decimal() => {
+                    let raw = BigInt::from(rng.below(2_000_000_000));
+                    if rng.below(2) == 0 {
+                        -raw
+                    } else {
+                        raw
+                    }
+                }
+                _ if ty.signed() => BigInt::from(rng.next_u64() as i64),
+                _ => BigInt::from(rng.below(ty.max_value().to_u64().unwrap_or(u64::MAX).max(2))),
+            };
+            Value::Int(number)
+        }
+    }
 }
 
 fn sample(
@@ -137,48 +239,7 @@ fn sample(
         .params
         .iter()
         .map(|param| {
-            let value = match &param.ty {
-                ScalarType::Bool => Value::Bool(rng.below(2) == 1),
-                ScalarType::Id64(id) => {
-                    let table = program.table(*id);
-                    let data = &state.tables[id.0];
-                    let live: Vec<_> = (0..data.occupied.len())
-                        .filter_map(|slot| data.key_at(table, slot))
-                        .collect();
-                    Value::Int(BigInt::from(if live.is_empty() {
-                        rng.below(table.capacity)
-                    } else {
-                        live[rng.below(live.len() as u64) as usize]
-                    }))
-                }
-                ScalarType::Enum(tags) => Value::Int(BigInt::from(rng.below(tags.len() as u64))),
-                ScalarType::Bytes32 => {
-                    let bytes: Vec<_> = (0..32).map(|_| rng.below(256) as u8).collect();
-                    Value::Int(BigInt::from_bytes_le(num_bigint::Sign::Plus, &bytes))
-                }
-                ty => {
-                    let number = match rng.below(16) {
-                        0 => ty.min_value(),
-                        1 => ty.max_value(),
-                        2 => BigInt::from(0),
-                        3 => BigInt::from(1),
-                        4 if ty.signed() => BigInt::from(-1),
-                        _ if ty.is_decimal() => {
-                            let raw = BigInt::from(rng.below(2_000_000_000));
-                            if rng.below(2) == 0 {
-                                -raw
-                            } else {
-                                raw
-                            }
-                        }
-                        _ if ty.signed() => BigInt::from(rng.next_u64() as i64),
-                        _ => BigInt::from(
-                            rng.below(ty.max_value().to_u64().unwrap_or(u64::MAX).max(2)),
-                        ),
-                    };
-                    Value::Int(number)
-                }
-            };
+            let value = sample_value(program, state, &param.ty, rng);
             (param.name.clone(), value)
         })
         .collect()
@@ -271,6 +332,9 @@ fn shrink(
                 .find(|p| p.name == name)
                 .expect("known parameter")
                 .ty;
+            let Some(ty) = ty.as_scalar() else {
+                continue;
+            };
             if !matches!(
                 ty,
                 ScalarType::U8

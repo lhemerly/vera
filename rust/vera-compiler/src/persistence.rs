@@ -12,7 +12,7 @@ use crate::{
     ast,
     ir::{CheckedProgram, EffectId, TransitionId},
     runtime::{validate_state, EffectRecord, Machine, RuntimeError, State},
-    types::{Domain, ScalarType},
+    types::{Domain, ScalarType, ValueType},
     value::{self, Value},
 };
 use num_bigint::{BigInt, Sign};
@@ -83,10 +83,13 @@ pub fn program_fingerprint_from_ast(module: &ast::Module) -> [u8; 32] {
     fingerprint::program(module)
 }
 
-fn schema_type(program: &CheckedProgram, ty: &ScalarType) -> String {
+fn schema_type(program: &CheckedProgram, ty: &ValueType) -> String {
     match ty {
-        ScalarType::Id64(table) => format!("id64<{}>", program.table(*table).name),
-        _ => ty.to_string(),
+        ValueType::Scalar(ScalarType::Id64(table)) => {
+            format!("id64<{}>", program.table(*table).name)
+        }
+        ValueType::Scalar(ty) => ty.to_string(),
+        ValueType::Named(id) => format!("named<{}>", program.type_definition(*id).name),
     }
 }
 
@@ -138,7 +141,73 @@ pub fn schema_fingerprint(program: &CheckedProgram) -> [u8; 32] {
             ])
         })
         .collect();
-    C::object([("effects", C::Array(effects)), ("tables", C::Array(tables))]).digest()
+    // Name references plus one reachable definition each avoid expanding a
+    // shared nested type DAG once per field occurrence. Sort by name, not ID.
+    let mut pending = program
+        .tables()
+        .iter()
+        .flat_map(|t| t.columns.iter().map(|c| c.ty.clone()))
+        .chain(
+            program
+                .effects()
+                .iter()
+                .flat_map(|e| e.params.iter().map(|p| p.ty.clone())),
+        )
+        .collect::<Vec<_>>();
+    let mut definitions = BTreeMap::new();
+    while let Some(ty) = pending.pop() {
+        let ValueType::Named(id) = ty else {
+            continue;
+        };
+        let definition = program.type_definition(id);
+        if definitions.contains_key(&definition.name) {
+            continue;
+        }
+        let (kind, fields) = match &definition.kind {
+            crate::ir::TypeDefinitionKind::Record(fields) => (
+                "record",
+                fields
+                    .iter()
+                    .map(|f| (f.name.clone(), f.ty.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+            crate::ir::TypeDefinitionKind::Union(variants) => (
+                "union",
+                variants
+                    .iter()
+                    .map(|v| (v.name.clone(), v.payload.clone()))
+                    .collect::<Vec<_>>(),
+            ),
+        };
+        let descriptor = C::Array(vec![
+            C::String(definition.name.clone()),
+            C::String(kind.into()),
+            C::Array(
+                fields
+                    .iter()
+                    .map(|(name, ty)| {
+                        C::Array(vec![
+                            C::String(name.clone()),
+                            C::String(schema_type(program, ty)),
+                        ])
+                    })
+                    .collect(),
+            ),
+        ]);
+        pending.extend(fields.into_iter().map(|(_, ty)| ty));
+        definitions.insert(definition.name.clone(), descriptor);
+    }
+    if definitions.is_empty() {
+        // Preserve the historical scalar-only snapshot identity byte-for-byte.
+        C::object([("effects", C::Array(effects)), ("tables", C::Array(tables))]).digest()
+    } else {
+        C::object([
+            ("effects", C::Array(effects)),
+            ("tables", C::Array(tables)),
+            ("types", C::Array(definitions.into_values().collect())),
+        ])
+        .digest()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -168,7 +237,7 @@ impl Intent {
                 let value = parameters
                     .get(&param.name)
                     .ok_or_else(|| invalid(format!("missing argument {}", param.name)))?;
-                value::coerce(value, &param.ty).map_err(invalid)
+                value::coerce_value(program, value, &param.ty).map_err(invalid)
             })
             .collect::<Result<_>>()?;
         Ok(Self { transition, args })
@@ -197,7 +266,7 @@ impl Intent {
             ));
         }
         for (arg, param) in self.args.iter().zip(&transition.params) {
-            value::coerce(arg, &param.ty).map_err(invalid)?;
+            value::coerce_value(program, arg, &param.ty).map_err(invalid)?;
         }
         Ok(())
     }
@@ -210,7 +279,7 @@ impl Intent {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&program_fingerprint(program));
         for (arg, param) in self.args.iter().zip(&transition.params) {
-            encode_scalar(&mut bytes, arg, &param.ty)?;
+            encode_typed(program, &mut bytes, arg, &param.ty)?;
         }
         Ok((self.transition.0 as u32, bytes))
     }
@@ -227,7 +296,7 @@ impl Intent {
         let args = transition
             .params
             .iter()
-            .map(|param| reader.scalar(&param.ty))
+            .map(|param| reader.typed(program, &param.ty))
             .collect::<Result<_>>()?;
         reader.done()?;
         Ok(Self {
@@ -237,9 +306,13 @@ impl Intent {
     }
 }
 
-fn encode_scalar(bytes: &mut Vec<u8>, value: &Value, ty: &ScalarType) -> Result<()> {
-    value::coerce(value, ty).map_err(invalid)?;
-    bytes.extend(value::to_le_bytes(value, ty.byte_width(), ty.signed()).map_err(invalid)?);
+fn encode_typed(
+    program: &CheckedProgram,
+    bytes: &mut Vec<u8>,
+    value: &Value,
+    ty: &ValueType,
+) -> Result<()> {
+    bytes.extend(value::encode_value(program, value, ty).map_err(invalid)?);
     Ok(())
 }
 
@@ -282,13 +355,20 @@ pub fn encode_state(program: &CheckedProgram, state: &State) -> Result<Vec<u8>> 
         }
         for (index, column) in table.columns.iter().enumerate() {
             for value in &data.columns[index] {
-                encode_scalar(&mut bytes, value, &column.ty)?;
+                encode_typed(program, &mut bytes, value, &column.ty)?;
             }
             if column.tracked_sum {
                 let aggregate = data.aggregates[index]
                     .as_ref()
                     .ok_or_else(|| invalid("missing tracked aggregate"))?;
-                encode_aggregate(&mut bytes, aggregate, &column.ty)?;
+                encode_aggregate(
+                    &mut bytes,
+                    aggregate,
+                    column
+                        .ty
+                        .as_scalar()
+                        .ok_or_else(|| invalid("non-scalar aggregate"))?,
+                )?;
             }
             if column.unique {
                 let index = data.indexes[index]
@@ -312,7 +392,7 @@ pub fn encode_state(program: &CheckedProgram, state: &State) -> Result<Vec<u8>> 
         let tag = u32::try_from(record.effect.0).map_err(|_| invalid("effect tag exceeds u32"))?;
         bytes.extend_from_slice(&tag.to_le_bytes());
         for (value, param) in record.args.iter().zip(&effect.params) {
-            encode_scalar(&mut bytes, value, &param.ty)?;
+            encode_typed(program, &mut bytes, value, &param.ty)?;
         }
     }
     bytes.extend_from_slice(&checksum(&bytes).to_le_bytes());
@@ -333,9 +413,25 @@ fn minimum_snapshot_size(program: &CheckedProgram) -> Result<usize> {
         add(&mut size, table.capacity.div_ceil(64), 8)?;
         add(&mut size, table.capacity, 4)?;
         for (index, column) in table.columns.iter().enumerate() {
-            add(&mut size, table.capacity, column.ty.byte_width() as u64)?;
+            add(
+                &mut size,
+                table.capacity,
+                u64::try_from(program.value_wire_width(&column.ty).map_err(invalid)?)
+                    .map_err(|_| invalid("type width exceeds u64"))?,
+            )?;
             if column.tracked_sum {
-                add(&mut size, 1, u64::from(column.ty.aggregate_width() / 8))?;
+                add(
+                    &mut size,
+                    1,
+                    u64::from(
+                        column
+                            .ty
+                            .as_scalar()
+                            .ok_or_else(|| invalid("non-scalar aggregate"))?
+                            .aggregate_width()
+                            / 8,
+                    ),
+                )?;
             }
             if column.unique {
                 let buckets = table.layout.unique_buckets[index]
@@ -370,10 +466,17 @@ pub fn decode_state(program: &CheckedProgram, bytes: &[u8]) -> Result<State> {
         }
         for (index, column) in table.columns.iter().enumerate() {
             for value in &mut data.columns[index] {
-                *value = reader.scalar(&column.ty)?;
+                *value = reader.typed(program, &column.ty)?;
             }
             if column.tracked_sum {
-                data.aggregates[index] = Some(reader.aggregate(&column.ty)?);
+                data.aggregates[index] = Some(
+                    reader.aggregate(
+                        column
+                            .ty
+                            .as_scalar()
+                            .ok_or_else(|| invalid("non-scalar aggregate"))?,
+                    )?,
+                );
             }
             if column.unique {
                 let index = data.indexes[index]
@@ -406,7 +509,7 @@ pub fn decode_state(program: &CheckedProgram, bytes: &[u8]) -> Result<State> {
         let args = effect
             .params
             .iter()
-            .map(|param| reader.scalar(&param.ty))
+            .map(|param| reader.typed(program, &param.ty))
             .collect::<Result<_>>()?;
         state.outbox.push(EffectRecord {
             effect: EffectId(tag),
@@ -547,8 +650,9 @@ impl<'a> Reader<'a> {
         ))
     }
 
-    fn scalar(&mut self, ty: &ScalarType) -> Result<Value> {
-        value::from_le_bytes(self.take(ty.byte_width())?, ty).map_err(invalid)
+    fn typed(&mut self, program: &CheckedProgram, ty: &ValueType) -> Result<Value> {
+        let width = program.value_wire_width(ty).map_err(invalid)?;
+        value::decode_value(program, self.take(width)?, ty).map_err(invalid)
     }
 
     fn aggregate(&mut self, ty: &ScalarType) -> Result<BigInt> {

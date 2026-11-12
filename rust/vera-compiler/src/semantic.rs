@@ -10,7 +10,7 @@ use num_bigint::BigInt;
 use crate::ast::{self as a, LiteralValue};
 use crate::diagnostic::{Diagnostic, Span};
 use crate::ir::{self as i, *};
-use crate::types::{compute_layout, Domain, ScalarType};
+use crate::types::{compute_value_layout, Domain, ExprType, ScalarType, ValueType};
 use crate::value::{literal_in_domain, symbol_id, Value};
 
 type Result<T> = std::result::Result<T, Diagnostic>;
@@ -172,11 +172,11 @@ impl Analyzer {
                 }
                 if matches!(
                     function.name.as_str(),
-                    "effect_count" | "effect_is" | "effect_arg"
+                    "effect_count" | "effect_is" | "effect_arg" | "field"
                 ) {
                     return Err(diagnostic(
                         "D_FUNCTION_NAME",
-                        "function name conflicts with an effect observation",
+                        "function name conflicts with a built-in expression",
                         function.span,
                     ));
                 }
@@ -271,7 +271,7 @@ impl Analyzer {
                 let lowered = self.expression(
                     expression,
                     &scope,
-                    Some(Domain::scalar(ScalarType::Bool)),
+                    Some(ExprType::scalar(ScalarType::Bool)),
                     Context::specification(Snapshot::Current),
                 )?;
                 cost = add_cost(cost, lowered.cost, function.span)?;
@@ -283,7 +283,7 @@ impl Analyzer {
             let body = self.expression(
                 &function.body,
                 &scope,
-                Some(Domain::scalar(result_type.clone())),
+                Some(ExprType::scalar(result_type.clone())),
                 Context::specification(Snapshot::Current),
             )?;
             cost = add_cost(cost, body.cost, function.span)?;
@@ -308,7 +308,7 @@ impl Analyzer {
                 let lowered = self.expression(
                     expression,
                     &result_scope,
-                    Some(Domain::scalar(ScalarType::Bool)),
+                    Some(ExprType::scalar(ScalarType::Bool)),
                     Context::specification(Snapshot::Current),
                 )?;
                 ensures.push(NamedExpr {
@@ -337,6 +337,189 @@ impl Analyzer {
                 span: function.span,
             });
             self.function_names.insert(name, id);
+        }
+        Ok(())
+    }
+
+    fn named_type(&self, name: &str, span: Span) -> Result<TypeId> {
+        self.program.type_id(name).ok_or_else(|| {
+            diagnostic(
+                "D_UNKNOWN_TYPE",
+                format!("unknown named type {name:?}"),
+                span,
+            )
+        })
+    }
+    fn record_fields(&self, id: TypeId, span: Span) -> Result<&[FieldDefinition]> {
+        match &self.program.type_definition(id).kind {
+            TypeDefinitionKind::Record(fields) => Ok(fields),
+            _ => Err(diagnostic(
+                "D_TYPE_MISMATCH",
+                "expected a record type",
+                span,
+            )),
+        }
+    }
+    fn union_variant(&self, id: TypeId, name: &str, span: Span) -> Result<&VariantDefinition> {
+        match &self.program.type_definition(id).kind {
+            TypeDefinitionKind::Union(variants) => {
+                variants.iter().find(|v| v.name == name).ok_or_else(|| {
+                    diagnostic(
+                        "D_UNKNOWN_VARIANT",
+                        format!("unknown variant {name:?}"),
+                        span,
+                    )
+                })
+            }
+            _ => Err(diagnostic("D_TYPE_MISMATCH", "expected a union type", span)),
+        }
+    }
+    fn collect_types(&mut self, declarations: &[a::Decl]) -> Result<()> {
+        for declaration in declarations {
+            let (name, span) = match declaration {
+                a::Decl::Record(d) => (&d.name, d.span),
+                a::Decl::Union(d) => (&d.name, d.span),
+                _ => continue,
+            };
+            if self.program.type_id(name).is_some() {
+                return Err(diagnostic(
+                    "D_DUPLICATE",
+                    format!("type {name:?} declared twice"),
+                    span,
+                ));
+            }
+            let id = TypeId(self.program.types.len());
+            self.program.types.push(TypeDefinition {
+                id,
+                name: name.clone(),
+                kind: TypeDefinitionKind::Record(Vec::new()),
+                span,
+            });
+        }
+        for declaration in declarations {
+            let (name, fields, union, span) = match declaration {
+                a::Decl::Record(d) => (&d.name, &d.fields, false, d.span),
+                a::Decl::Union(d) => (&d.name, &d.variants, true, d.span),
+                _ => continue,
+            };
+            let id = self.program.type_id(name).unwrap();
+            let mut names = BTreeSet::new();
+            if union && fields.is_empty() {
+                return Err(diagnostic(
+                    "D_EMPTY_UNION",
+                    "union requires at least one inhabited variant",
+                    span,
+                ));
+            }
+            if union && fields.len().saturating_sub(1) > u32::MAX as usize {
+                return Err(diagnostic(
+                    "D_TYPE_REPRESENTATION",
+                    "union tag cannot be represented by its u32 wire tag",
+                    span,
+                ));
+            }
+            let mut resolved = Vec::new();
+            for field in fields {
+                if !names.insert(&field.name) {
+                    return Err(diagnostic(
+                        "D_DUPLICATE",
+                        format!("member {:?} declared twice", field.name),
+                        field.span,
+                    ));
+                }
+                resolved.push((field, self.resolve_type(&field.ty)?));
+            }
+            self.program.types[id.0].kind = if union {
+                TypeDefinitionKind::Union(
+                    resolved
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (f, payload))| VariantDefinition {
+                            id: VariantId(i),
+                            name: f.name.clone(),
+                            payload,
+                            span: f.span,
+                        })
+                        .collect(),
+                )
+            } else {
+                TypeDefinitionKind::Record(
+                    resolved
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, (f, ty))| FieldDefinition {
+                            id: FieldId(i),
+                            name: f.name.clone(),
+                            ty,
+                            span: f.span,
+                        })
+                        .collect(),
+                )
+            };
+        }
+        let mut pending = vec![0usize; self.program.types.len()];
+        let mut users: BTreeMap<TypeId, Vec<TypeId>> = BTreeMap::new();
+        for definition in self.program.types() {
+            let deps = match &definition.kind {
+                TypeDefinitionKind::Record(fs) => fs.iter().map(|f| &f.ty).collect::<Vec<_>>(),
+                TypeDefinitionKind::Union(vs) => vs.iter().map(|v| &v.payload).collect(),
+            }
+            .into_iter()
+            .filter_map(|t| {
+                if let ValueType::Named(id) = t {
+                    Some(*id)
+                } else {
+                    None
+                }
+            })
+            .collect::<BTreeSet<_>>();
+            pending[definition.id.0] = deps.len();
+            for dep in deps {
+                users.entry(dep).or_default().push(definition.id);
+            }
+        }
+        let mut ready = pending
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n == 0)
+            .map(|(i, _)| TypeId(i))
+            .collect::<BTreeSet<_>>();
+        let mut count = 0;
+        while let Some(id) = ready.pop_first() {
+            count += 1;
+            let ty = ValueType::Named(id);
+            let span = self.program.type_definition(id).span;
+            let width = self
+                .program
+                .value_wire_width(&ty)
+                .map_err(|m| diagnostic("D_TYPE_REPRESENTATION", m, span))?;
+            let storage = self
+                .program
+                .value_storage_width(&ty)
+                .map_err(|m| diagnostic("D_TYPE_REPRESENTATION", m, span))?;
+            let alignment = self
+                .program
+                .value_alignment(&ty)
+                .map_err(|m| diagnostic("D_TYPE_REPRESENTATION", m, span))?;
+            self.program
+                .type_layouts
+                .insert(id, (width, storage, alignment));
+            if let Some(callers) = users.get(&id) {
+                for caller in callers {
+                    pending[caller.0] -= 1;
+                    if pending[caller.0] == 0 {
+                        ready.insert(*caller);
+                    }
+                }
+            }
+        }
+        if count != self.program.types.len() {
+            let id = pending.iter().position(|n| *n > 0).unwrap();
+            return Err(diagnostic(
+                "D_TYPE_CYCLE",
+                "recursive by-value types do not have finite storage",
+                self.program.types[id].span,
+            ));
         }
         Ok(())
     }
@@ -388,6 +571,7 @@ impl Analyzer {
                 span: table.span,
             });
         }
+        self.collect_types(declarations)?;
         // All table identities exist before resolving forward/self references.
         for declaration in declarations {
             let a::Decl::Table(table) = declaration else {
@@ -435,16 +619,23 @@ impl Analyzer {
                     )
                 })
                 .collect::<Vec<_>>();
-            let layout = compute_layout(self.program.table(id).capacity, &layout_columns)
-                .map_err(|message| diagnostic("D_CAPACITY", message, table.span))?;
+            let layout = compute_value_layout(
+                &self.program,
+                self.program.table(id).capacity,
+                &layout_columns,
+            )
+            .map_err(|message| diagnostic("D_CAPACITY", message, table.span))?;
             self.program.tables[id.0].columns = columns;
             self.program.tables[id.0].layout = layout;
         }
         Ok(())
     }
 
-    fn resolve_type(&self, reference: &a::TypeRef) -> Result<ScalarType> {
-        Ok(match reference.name.as_str() {
+    fn resolve_type(&self, reference: &a::TypeRef) -> Result<ValueType> {
+        if let Some(id) = self.program.type_id(&reference.name) {
+            return Ok(ValueType::Named(id));
+        }
+        Ok(ValueType::Scalar(match reference.name.as_str() {
             "bool" => ScalarType::Bool,
             "u8" => ScalarType::U8,
             "u16" => ScalarType::U16,
@@ -490,7 +681,7 @@ impl Analyzer {
                     reference.span,
                 ))
             }
-        })
+        }))
     }
 
     fn table_id(&self, name: &str, span: Span) -> Result<TableId> {
@@ -515,11 +706,12 @@ impl Analyzer {
         &mut self,
         scope: &mut Scope,
         name: &str,
-        ty: ScalarType,
+        ty: impl Into<ValueType>,
         origin: BindingOrigin,
         state_dependent: bool,
         span: Span,
     ) -> Result<BindingId> {
+        let ty = ty.into();
         if scope.contains_key(name) {
             return Err(diagnostic(
                 "D_DUPLICATE",
@@ -610,7 +802,7 @@ impl Analyzer {
         let expression = self.expression(
             &invariant.expr,
             &scope,
-            Some(Domain::scalar(ScalarType::Bool)),
+            Some(ExprType::scalar(ScalarType::Bool)),
             Context::specification(Snapshot::Current),
         )?;
         self.program.invariants.push(Invariant {
@@ -629,13 +821,13 @@ impl Analyzer {
             self.expression(
                 expression,
                 &scope,
-                Some(Domain::scalar(ScalarType::Bool)),
+                Some(ExprType::scalar(ScalarType::Bool)),
                 context,
             )?
             .id
         } else {
             self.push(
-                Domain::scalar(ScalarType::Bool),
+                ExprType::scalar(ScalarType::Bool),
                 ExprKind::Constant(Value::Bool(true)),
                 false,
                 projection.span,
@@ -669,7 +861,7 @@ impl Analyzer {
                 .expression(
                     &guard.condition,
                     &scope,
-                    Some(Domain::scalar(ScalarType::Bool)),
+                    Some(ExprType::scalar(ScalarType::Bool)),
                     context,
                 )?
                 .id;
@@ -717,7 +909,7 @@ impl Analyzer {
             let lowered = self.expression(
                 expression,
                 &scope,
-                Some(Domain::scalar(ScalarType::Bool)),
+                Some(ExprType::scalar(ScalarType::Bool)),
                 Context::specification(Snapshot::Current),
             )?;
             requires.push(NamedExpr {
@@ -730,7 +922,7 @@ impl Analyzer {
             let lowered = self.expression(
                 expression,
                 &scope,
-                Some(Domain::scalar(ScalarType::Bool)),
+                Some(ExprType::scalar(ScalarType::Bool)),
                 Context {
                     outbox: true,
                     ..Context::specification(Snapshot::Current)
@@ -846,7 +1038,7 @@ impl Analyzer {
 
     fn push(
         &mut self,
-        domain: Domain,
+        domain: ExprType,
         kind: ExprKind,
         state_dependent: bool,
         span: Span,
@@ -869,7 +1061,7 @@ impl Analyzer {
         context: Context,
     ) -> Result<Lowered> {
         let lowered = self.expression(expression, scope, None, context)?;
-        if self.program.expr(lowered.id).domain.scalar != ScalarType::Id64(table) {
+        if self.program.expr(lowered.id).domain.value_type() != ScalarType::Id64(table) {
             return Err(diagnostic(
                 "D_TYPE_MISMATCH",
                 format!("row key requires id64<{}>", self.program.table(table).name),
@@ -883,16 +1075,20 @@ impl Analyzer {
         &mut self,
         expression: &a::Expr,
         scope: &Scope,
-        expected: Option<Domain>,
+        expected: Option<ExprType>,
         context: Context,
     ) -> Result<Lowered> {
         let lowered = self.expression_inner(expression, scope, expected.clone(), context)?;
         if let Some(expected) = expected {
-            let actual = &self.program.expr(lowered.id).domain.scalar;
-            if actual != &expected.scalar {
+            let actual = self.program.expr(lowered.id).domain.value_type();
+            if actual != expected.value_type() {
                 return Err(diagnostic(
                     "D_TYPE_MISMATCH",
-                    format!("expected {}, got {actual}", expected.scalar),
+                    format!(
+                        "expected {}, got {}",
+                        self.program.value_type_name(&expected.value_type()),
+                        self.program.value_type_name(&actual)
+                    ),
                     expression.span(),
                 ));
             }
@@ -904,15 +1100,143 @@ impl Analyzer {
         &mut self,
         expression: &a::Expr,
         scope: &Scope,
-        expected: Option<Domain>,
+        expected: Option<ExprType>,
         context: Context,
     ) -> Result<Lowered> {
         let span = expression.span();
         let (domain, kind, dependent, cost) = match expression {
+            a::Expr::Record(record) => {
+                let ty = self.named_type(&record.ty, span)?;
+                let definitions = self.record_fields(ty, span)?.to_vec();
+                let mut seen = BTreeSet::new();
+                let mut fields = Vec::new();
+                let mut cost = 0;
+                let mut dependent = false;
+                for (name, expression) in &record.fields {
+                    let field = definitions
+                        .iter()
+                        .find(|f| f.name == *name)
+                        .ok_or_else(|| {
+                            diagnostic(
+                                "D_UNKNOWN_FIELD",
+                                format!("unknown field {name:?}"),
+                                expression.span(),
+                            )
+                        })?;
+                    if !seen.insert(field.id) {
+                        return Err(diagnostic(
+                            "D_DUPLICATE",
+                            format!("field {name:?} initialized twice"),
+                            expression.span(),
+                        ));
+                    }
+                    let lowered = self.expression(
+                        expression,
+                        scope,
+                        Some(ExprType::scalar(field.ty.clone())),
+                        context,
+                    )?;
+                    cost = add_cost(cost, lowered.cost, span)?;
+                    dependent |= self.program.expr(lowered.id).state_dependent;
+                    fields.push((field.id, lowered.id));
+                }
+                if seen.len() != definitions.len() {
+                    return Err(diagnostic(
+                        "D_RECORD_FIELDS",
+                        "record constructor must initialize every field exactly once",
+                        span,
+                    ));
+                }
+                (
+                    ExprType::Named(ty),
+                    ExprKind::Record { ty, fields },
+                    dependent,
+                    cost,
+                )
+            }
+            a::Expr::Field(field) => {
+                let record = self.expression(&field.record, scope, None, context)?;
+                let ExprType::Named(ty) = self.program.expr(record.id).domain else {
+                    return Err(diagnostic(
+                        "D_TYPE_MISMATCH",
+                        "field projection requires a record",
+                        span,
+                    ));
+                };
+                let definition = self
+                    .record_fields(ty, span)?
+                    .iter()
+                    .find(|f| f.name == field.field)
+                    .ok_or_else(|| {
+                        diagnostic(
+                            "D_UNKNOWN_FIELD",
+                            format!("unknown field {:?}", field.field),
+                            span,
+                        )
+                    })?;
+                (
+                    Self::promote(ExprType::scalar(definition.ty.clone()), expected.as_ref()),
+                    ExprKind::Field {
+                        record: record.id,
+                        field: definition.id,
+                    },
+                    self.program.expr(record.id).state_dependent,
+                    record.cost,
+                )
+            }
+            a::Expr::Variant(variant) => {
+                let ty = self.named_type(&variant.ty, span)?;
+                let definition = self.union_variant(ty, &variant.variant, span)?.clone();
+                let payload = self.expression(
+                    &variant.payload,
+                    scope,
+                    Some(ExprType::scalar(definition.payload)),
+                    context,
+                )?;
+                (
+                    ExprType::Named(ty),
+                    ExprKind::Variant {
+                        ty,
+                        variant: definition.id,
+                        payload: payload.id,
+                    },
+                    self.program.expr(payload.id).state_dependent,
+                    payload.cost,
+                )
+            }
+            a::Expr::IsVariant(access) | a::Expr::Payload(access) => {
+                let ty = self.named_type(&access.ty, span)?;
+                let definition = self.union_variant(ty, &access.variant, span)?.clone();
+                let value =
+                    self.expression(&access.value, scope, Some(ExprType::Named(ty)), context)?;
+                let (domain, kind) = if matches!(expression, a::Expr::IsVariant(_)) {
+                    (
+                        ExprType::scalar(ScalarType::Bool),
+                        ExprKind::IsVariant {
+                            value: value.id,
+                            variant: definition.id,
+                        },
+                    )
+                } else {
+                    (
+                        Self::promote(ExprType::scalar(definition.payload), expected.as_ref()),
+                        ExprKind::Payload {
+                            value: value.id,
+                            variant: definition.id,
+                        },
+                    )
+                };
+                (
+                    domain,
+                    kind,
+                    self.program.expr(value.id).state_dependent,
+                    value.cost,
+                )
+            }
             a::Expr::Literal(literal) => {
                 let domain = self.literal_domain(&literal.value, expected, span)?;
                 if let LiteralValue::String(text) = &literal.value {
-                    if domain.scalar == ScalarType::Sym32 {
+                    if domain.value_type() == ScalarType::Sym32 {
                         let code = symbol_id(text);
                         if self
                             .program
@@ -929,19 +1253,23 @@ impl Analyzer {
                         self.program.symbols.insert(code, text.clone());
                     }
                 }
-                let value = literal_in_domain(&literal.value, &domain)
-                    .map_err(|message| diagnostic("D_LITERAL_RANGE", message, span))?;
+                let value = literal_in_domain(
+                    &literal.value,
+                    domain.scalar_domain().expect("literal scalar domain"),
+                )
+                .map_err(|message| diagnostic("D_LITERAL_RANGE", message, span))?;
                 (domain, ExprKind::Constant(value), false, 0)
             }
             a::Expr::Var(variable) => {
                 if let Some(binding) = scope.get(&variable.name).copied() {
                     let info = self.program.binding(binding);
-                    let domain = Self::promote(Domain::scalar(info.ty.clone()), expected.as_ref());
+                    let domain =
+                        Self::promote(ExprType::scalar(info.ty.clone()), expected.as_ref());
                     (domain, ExprKind::Binding(binding), info.state_dependent, 0)
-                } else if let Some(Domain {
+                } else if let Some(ExprType::Scalar(Domain {
                     scalar: ScalarType::Enum(tags),
                     ..
-                }) = &expected
+                })) = &expected
                 {
                     let index = tags
                         .iter()
@@ -969,13 +1297,13 @@ impl Analyzer {
             }
             a::Expr::Unary(unary) => {
                 let (op, hint) = match unary.op.as_str() {
-                    "not" => (UnaryOp::Not, Some(Domain::scalar(ScalarType::Bool))),
+                    "not" => (UnaryOp::Not, Some(ExprType::scalar(ScalarType::Bool))),
                     "neg" => (UnaryOp::Neg, expected.clone()),
                     _ => return Err(diagnostic("D_BAD_OPERAND", "unknown unary operation", span)),
                 };
                 let operand = self.expression(&unary.operand, scope, hint, context)?;
                 let domain = self.program.expr(operand.id).domain.clone();
-                if op == UnaryOp::Neg && !domain.signed() {
+                if op == UnaryOp::Neg && !domain.scalar_domain().is_some_and(Domain::signed) {
                     return Err(diagnostic(
                         "D_BAD_OPERAND",
                         "neg requires a signed numeric operand",
@@ -997,7 +1325,7 @@ impl Analyzer {
                 let condition = self.expression(
                     &select.cond,
                     scope,
-                    Some(Domain::scalar(ScalarType::Bool)),
+                    Some(ExprType::scalar(ScalarType::Bool)),
                     context,
                 )?;
                 let mut target = expected
@@ -1007,8 +1335,8 @@ impl Analyzer {
                 if let Some(domain) = &mut target {
                     for branch in [&select.a, &select.b] {
                         if let Some(other) = self.concrete(branch, scope)? {
-                            if domain.scalar == other.scalar {
-                                domain.width = domain.width.max(other.width);
+                            if domain.value_type() == other.value_type() {
+                                *domain = domain.clone().merge(&other);
                             }
                         }
                     }
@@ -1017,10 +1345,7 @@ impl Analyzer {
                 let yes_domain = self.program.expr(yes.id).domain.clone();
                 let no = self.expression(&select.b, scope, Some(yes_domain.clone()), context)?;
                 let no_domain = &self.program.expr(no.id).domain;
-                let domain = Domain {
-                    scalar: yes_domain.scalar,
-                    width: yes_domain.width.max(no_domain.width),
-                };
+                let domain = yes_domain.merge(no_domain);
                 let dependent = [condition.id, yes.id, no.id]
                     .iter()
                     .any(|id| self.program.expr(*id).state_dependent);
@@ -1040,7 +1365,7 @@ impl Analyzer {
                 let column = self.column_id(&get.table, &get.column, span)?;
                 let key = self.key(&get.key, column.table, scope, context)?;
                 let domain = Self::promote(
-                    Domain::scalar(self.program.column(column).ty.clone()),
+                    ExprType::scalar(self.program.column(column).ty.clone()),
                     expected.as_ref(),
                 );
                 (
@@ -1065,7 +1390,7 @@ impl Analyzer {
                 })?;
                 let key = self.key(expression, column.table, scope, context)?;
                 let domain = Self::promote(
-                    Domain::scalar(self.program.column(column).ty.clone()),
+                    ExprType::scalar(self.program.column(column).ty.clone()),
                     expected.as_ref(),
                 );
                 (
@@ -1097,7 +1422,7 @@ impl Analyzer {
                 };
                 let key = self.key(expression, column.table, scope, old_context)?;
                 let domain = Self::promote(
-                    Domain::scalar(self.program.column(column).ty.clone()),
+                    ExprType::scalar(self.program.column(column).ty.clone()),
                     expected.as_ref(),
                 );
                 (
@@ -1115,7 +1440,7 @@ impl Analyzer {
                 let table = self.table_id(&exists.table, span)?;
                 let key = self.key(&exists.key, table, scope, context)?;
                 (
-                    Domain::scalar(ScalarType::Bool),
+                    ExprType::scalar(ScalarType::Bool),
                     ExprKind::TableExists {
                         table,
                         key: key.id,
@@ -1159,7 +1484,14 @@ impl Analyzer {
                     ));
                 }
                 (
-                    Domain::aggregate(self.program.column(column).ty.clone()),
+                    ExprType::aggregate(
+                        self.program
+                            .column(column)
+                            .ty
+                            .as_scalar()
+                            .expect("tracked scalar")
+                            .clone(),
+                    ),
                     ExprKind::Sum {
                         column,
                         state: if sum.old {
@@ -1175,9 +1507,9 @@ impl Analyzer {
             a::Expr::KeyOf(key) => {
                 let table = self.table_id(&key.table, span)?;
                 let unsigned_literal = matches!(&*key.expr, a::Expr::Literal(literal) if matches!(&literal.value, LiteralValue::Integer(number) if !number.as_decimal().starts_with('-')));
-                let hint = unsigned_literal.then(|| Domain::scalar(ScalarType::U64));
+                let hint = unsigned_literal.then(|| ExprType::scalar(ScalarType::U64));
                 let value = self.expression(&key.expr, scope, hint, context)?;
-                if !self.program.expr(value.id).domain.scalar.is_integer() {
+                if !self.program.expr(value.id).domain.value_type().is_integer() {
                     return Err(diagnostic(
                         "D_TYPE_MISMATCH",
                         "id64 constructor requires an integer",
@@ -1185,7 +1517,7 @@ impl Analyzer {
                     ));
                 }
                 (
-                    Domain::scalar(ScalarType::Id64(table)),
+                    ExprType::scalar(ScalarType::Id64(table)),
                     ExprKind::KeyOf {
                         table,
                         value: value.id,
@@ -1221,7 +1553,7 @@ impl Analyzer {
                     let value = self.expression(
                         argument,
                         scope,
-                        Some(Domain::scalar(parameter.ty.clone())),
+                        Some(ExprType::scalar(parameter.ty.clone())),
                         context,
                     )?;
                     cost = add_cost(cost, value.cost, span)?;
@@ -1244,7 +1576,7 @@ impl Analyzer {
                     .depth
                     .max(context.fold_depth.saturating_add(info.fold_depth));
                 (
-                    Self::promote(Domain::scalar(info.result_type), expected.as_ref()),
+                    Self::promote(ExprType::scalar(info.result_type), expected.as_ref()),
                     ExprKind::Call { function, args },
                     dependent,
                     cost,
@@ -1259,7 +1591,7 @@ impl Analyzer {
                     ));
                 }
                 (
-                    Domain::scalar(ScalarType::U64),
+                    ExprType::scalar(ScalarType::U64),
                     ExprKind::EffectCount,
                     true,
                     0,
@@ -1269,7 +1601,7 @@ impl Analyzer {
                 let (effect, index) =
                     self.effect_index(&query.effect, &query.index, scope, context, span)?;
                 (
-                    Domain::scalar(ScalarType::Bool),
+                    ExprType::scalar(ScalarType::Bool),
                     ExprKind::EffectIs {
                         effect,
                         index: index.id,
@@ -1294,7 +1626,7 @@ impl Analyzer {
                         )
                     })?;
                 let domain = Self::promote(
-                    Domain::scalar(info.params[parameter].ty.clone()),
+                    ExprType::scalar(info.params[parameter].ty.clone()),
                     expected.as_ref(),
                 );
                 (
@@ -1334,28 +1666,37 @@ impl Analyzer {
         let effect = self.effect_names.get(name).copied().ok_or_else(|| {
             diagnostic("D_UNKNOWN_EFFECT", format!("unknown effect {name:?}"), span)
         })?;
-        let index =
-            self.expression(index, scope, Some(Domain::scalar(ScalarType::U64)), context)?;
+        let index = self.expression(
+            index,
+            scope,
+            Some(ExprType::scalar(ScalarType::U64)),
+            context,
+        )?;
         Ok((effect, index))
     }
 
-    fn promote(mut domain: Domain, expected: Option<&Domain>) -> Domain {
-        if let Some(expected) = expected {
-            if expected.scalar == domain.scalar {
-                domain.width = domain.width.max(expected.width);
-            }
+    fn promote(domain: ExprType, expected: Option<&ExprType>) -> ExprType {
+        match expected {
+            Some(expected) => domain.merge(expected),
+            None => domain,
         }
-        domain
     }
-
     fn literal_domain(
         &self,
         literal: &LiteralValue,
-        expected: Option<Domain>,
+        expected: Option<ExprType>,
         span: Span,
-    ) -> Result<Domain> {
-        match literal {
-            LiteralValue::Bool(_) => Ok(Domain::scalar(ScalarType::Bool)),
+    ) -> Result<ExprType> {
+        if matches!(expected, Some(ExprType::Named(_))) {
+            return Err(diagnostic(
+                "D_TYPE_MISMATCH",
+                "structured values require a constructor",
+                span,
+            ));
+        }
+        let expected = expected.and_then(|d| d.scalar_domain().cloned());
+        let domain = match literal {
+            LiteralValue::Bool(_) => Domain::scalar(ScalarType::Bool),
             LiteralValue::Integer(_) => {
                 let domain = expected.unwrap_or_else(|| Domain::scalar(ScalarType::I64));
                 if domain.scalar.is_bool() {
@@ -1365,7 +1706,7 @@ impl Analyzer {
                         span,
                     ));
                 }
-                Ok(domain)
+                domain
             }
             LiteralValue::Decimal(_) => {
                 let domain = expected.unwrap_or_else(|| Domain::scalar(ScalarType::Dec64));
@@ -1376,7 +1717,7 @@ impl Analyzer {
                         span,
                     ));
                 }
-                Ok(domain)
+                domain
             }
             LiteralValue::String(value) => match expected {
                 Some(
@@ -1384,7 +1725,7 @@ impl Analyzer {
                         scalar: ScalarType::Sym32,
                         ..
                     },
-                ) => Ok(domain),
+                ) => domain,
                 Some(
                     domain @ Domain {
                         scalar: ScalarType::Enum(_),
@@ -1400,56 +1741,100 @@ impl Analyzer {
                             ));
                         }
                     }
-                    Ok(domain)
+                    domain
                 }
-                _ => Err(diagnostic(
-                    "D_TYPE_MISMATCH",
-                    "string literal requires sym32 or enum context",
-                    span,
-                )),
+                _ => {
+                    return Err(diagnostic(
+                        "D_TYPE_MISMATCH",
+                        "string literal requires sym32 or enum context",
+                        span,
+                    ))
+                }
             },
-        }
+        };
+        Ok(ExprType::Scalar(domain))
     }
 
-    fn concrete(&self, expression: &a::Expr, scope: &Scope) -> Result<Option<Domain>> {
+    fn concrete(&self, expression: &a::Expr, scope: &Scope) -> Result<Option<ExprType>> {
         Ok(match expression {
+            a::Expr::Record(record) => {
+                Some(ExprType::Named(self.named_type(&record.ty, record.span)?))
+            }
+            a::Expr::Variant(variant) => {
+                Some(ExprType::Named(self.named_type(&variant.ty, variant.span)?))
+            }
+            a::Expr::IsVariant(_) => Some(ExprType::scalar(ScalarType::Bool)),
+            a::Expr::Payload(access) => {
+                let id = self.named_type(&access.ty, access.span)?;
+                Some(ExprType::scalar(
+                    self.union_variant(id, &access.variant, access.span)?
+                        .payload
+                        .clone(),
+                ))
+            }
+            a::Expr::Field(field) => match self.concrete(&field.record, scope)? {
+                Some(ExprType::Named(id)) => Some(ExprType::scalar(
+                    self.record_fields(id, field.span)?
+                        .iter()
+                        .find(|f| f.name == field.field)
+                        .ok_or_else(|| {
+                            diagnostic(
+                                "D_UNKNOWN_FIELD",
+                                format!("unknown field {:?}", field.field),
+                                field.span,
+                            )
+                        })?
+                        .ty
+                        .clone(),
+                )),
+                _ => None,
+            },
+
             a::Expr::Literal(literal) => matches!(literal.value, LiteralValue::Bool(_))
-                .then(|| Domain::scalar(ScalarType::Bool)),
+                .then(|| ExprType::scalar(ScalarType::Bool)),
             a::Expr::Var(variable) => scope
                 .get(&variable.name)
-                .map(|id| Domain::scalar(self.program.binding(*id).ty.clone())),
-            a::Expr::TableGet(get) => Some(Domain::scalar(
+                .map(|id| ExprType::scalar(self.program.binding(*id).ty.clone())),
+            a::Expr::TableGet(get) => Some(ExprType::scalar(
                 self.program
                     .column(self.column_id(&get.table, &get.column, get.span)?)
                     .ty
                     .clone(),
             )),
-            a::Expr::TableAccess(get) => Some(Domain::scalar(
+            a::Expr::TableAccess(get) => Some(ExprType::scalar(
                 self.program
                     .column(self.column_id(&get.table, &get.column, get.span)?)
                     .ty
                     .clone(),
             )),
-            a::Expr::Old(old) => Some(Domain::scalar(
+            a::Expr::Old(old) => Some(ExprType::scalar(
                 self.program
                     .column(self.column_id(&old.access.table, &old.access.column, old.span)?)
                     .ty
                     .clone(),
             )),
-            a::Expr::SumAgg(sum) => Some(Domain::aggregate(
+            a::Expr::SumAgg(sum) => Some(ExprType::aggregate(
                 self.program
                     .column(self.column_id(&sum.table, &sum.column, sum.span)?)
                     .ty
+                    .as_scalar()
+                    .ok_or_else(|| {
+                        diagnostic(
+                            "D_BAD_OPERAND",
+                            "aggregate requires scalar column",
+                            sum.span,
+                        )
+                    })?
                     .clone(),
             )),
-            a::Expr::KeyOf(key) => Some(Domain::scalar(ScalarType::Id64(
+            a::Expr::KeyOf(key) => Some(ExprType::scalar(ScalarType::Id64(
                 self.table_id(&key.table, key.span)?,
             ))),
-            a::Expr::TableLookup(lookup) => Some(Domain::scalar(ScalarType::Id64(
+            a::Expr::TableLookup(lookup) => Some(ExprType::scalar(ScalarType::Id64(
                 self.table_id(&lookup.table, lookup.span)?,
             ))),
             a::Expr::TableExists(_) | a::Expr::TableExistsUnique(_) => {
-                Some(Domain::scalar(ScalarType::Bool))
+                Some(ExprType::scalar(ScalarType::Bool))
             }
             a::Expr::Call(call) => {
                 let function = self
@@ -1463,12 +1848,12 @@ impl Analyzer {
                             call.span,
                         )
                     })?;
-                Some(Domain::scalar(
+                Some(ExprType::scalar(
                     self.program.function(function).result_type.clone(),
                 ))
             }
-            a::Expr::EffectCount(_) => Some(Domain::scalar(ScalarType::U64)),
-            a::Expr::EffectIs(_) => Some(Domain::scalar(ScalarType::Bool)),
+            a::Expr::EffectCount(_) => Some(ExprType::scalar(ScalarType::U64)),
+            a::Expr::EffectIs(_) => Some(ExprType::scalar(ScalarType::Bool)),
             a::Expr::EffectArg(query) => {
                 let effect = self
                     .effect_names
@@ -1494,12 +1879,12 @@ impl Analyzer {
                             query.span,
                         )
                     })?;
-                Some(Domain::scalar(parameter.ty.clone()))
+                Some(ExprType::scalar(parameter.ty.clone()))
             }
-            a::Expr::Fold(fold) => Some(Domain::scalar(self.resolve_type(&fold.acc_type)?)),
+            a::Expr::Fold(fold) => Some(ExprType::scalar(self.resolve_type(&fold.acc_type)?)),
             a::Expr::Unary(unary) => {
                 if unary.op == "not" {
-                    Some(Domain::scalar(ScalarType::Bool))
+                    Some(ExprType::scalar(ScalarType::Bool))
                 } else {
                     self.concrete(&unary.operand, scope)?
                 }
@@ -1513,7 +1898,7 @@ impl Analyzer {
                     binary.op.as_str(),
                     "eq" | "ne" | "lt" | "le" | "gt" | "ge" | "and" | "or" | "xor"
                 ) {
-                    Some(Domain::scalar(ScalarType::Bool))
+                    Some(ExprType::scalar(ScalarType::Bool))
                 } else {
                     self.merge_concrete(
                         self.concrete(&binary.left, scope)?,
@@ -1524,11 +1909,10 @@ impl Analyzer {
         })
     }
 
-    fn merge_concrete(&self, left: Option<Domain>, right: Option<Domain>) -> Option<Domain> {
+    fn merge_concrete(&self, left: Option<ExprType>, right: Option<ExprType>) -> Option<ExprType> {
         match (left, right) {
-            (Some(mut left), Some(right)) if left.scalar == right.scalar => {
-                left.width = left.width.max(right.width);
-                Some(left)
+            (Some(left), Some(right)) if left.value_type() == right.value_type() => {
+                Some(left.merge(&right))
             }
             (left @ Some(_), _) => left,
             (None, right) => right,
@@ -1539,7 +1923,7 @@ impl Analyzer {
         &mut self,
         binary: &a::Binary,
         scope: &Scope,
-        expected: Option<Domain>,
+        expected: Option<ExprType>,
         context: Context,
     ) -> Result<Lowered> {
         let op = binary_op(&binary.op)
@@ -1547,7 +1931,7 @@ impl Analyzer {
         let left_concrete = self.concrete(&binary.left, scope)?;
         let right_concrete = self.concrete(&binary.right, scope)?;
         let mut target = if op.boolean() {
-            Some(Domain::scalar(ScalarType::Bool))
+            Some(ExprType::scalar(ScalarType::Bool))
         } else if !op.comparison() {
             expected.or_else(|| self.merge_concrete(left_concrete.clone(), right_concrete.clone()))
         } else {
@@ -1555,8 +1939,8 @@ impl Analyzer {
         };
         if let Some(domain) = &mut target {
             for other in [left_concrete, right_concrete].into_iter().flatten() {
-                if domain.scalar == other.scalar {
-                    domain.width = domain.width.max(other.width);
+                if domain.value_type() == other.value_type() {
+                    *domain = domain.clone().merge(&other);
                 }
             }
         }
@@ -1569,14 +1953,14 @@ impl Analyzer {
             context,
         )?;
         let right_domain = self.program.expr(right.id).domain.clone();
-        if left_domain.scalar != right_domain.scalar {
+        if left_domain.value_type() != right_domain.value_type() {
             return Err(diagnostic(
                 "D_TYPE_MISMATCH",
                 "binary operands require the same scalar type",
                 binary.span,
             ));
         }
-        if op.boolean() && left_domain.scalar != ScalarType::Bool {
+        if op.boolean() && left_domain.value_type() != ScalarType::Bool {
             return Err(diagnostic(
                 "D_TYPE_MISMATCH",
                 "boolean operation requires bool operands",
@@ -1586,7 +1970,7 @@ impl Analyzer {
         if matches!(
             op,
             BinaryOp::Lt | BinaryOp::Le | BinaryOp::Gt | BinaryOp::Ge
-        ) && !left_domain.scalar.is_ordered()
+        ) && !left_domain.value_type().is_ordered()
         {
             return Err(diagnostic(
                 "D_BAD_OPERAND",
@@ -1594,7 +1978,7 @@ impl Analyzer {
                 binary.span,
             ));
         }
-        if !op.comparison() && !op.boolean() && !left_domain.scalar.is_numeric() {
+        if !op.comparison() && !op.boolean() && !left_domain.value_type().is_numeric() {
             return Err(diagnostic(
                 "D_BAD_OPERAND",
                 "arithmetic requires numeric operands",
@@ -1602,12 +1986,9 @@ impl Analyzer {
             ));
         }
         let domain = if op.comparison() || op.boolean() {
-            Domain::scalar(ScalarType::Bool)
+            ExprType::scalar(ScalarType::Bool)
         } else {
-            Domain {
-                scalar: left_domain.scalar,
-                width: left_domain.width.max(right_domain.width),
-            }
+            left_domain.merge(&right_domain)
         };
         let dependent = self.program.expr(left.id).state_dependent
             || self.program.expr(right.id).state_dependent;
@@ -1635,7 +2016,7 @@ impl Analyzer {
         expression: &a::Expr,
         exists_only: bool,
         scope: &Scope,
-        expected: Option<Domain>,
+        expected: Option<ExprType>,
         context: Context,
         span: Span,
     ) -> Result<Lowered> {
@@ -1651,7 +2032,7 @@ impl Analyzer {
         let value = self.expression(
             expression,
             scope,
-            Some(Domain::scalar(info.ty.clone())),
+            Some(ExprType::scalar(info.ty.clone())),
             context,
         )?;
         let scalar = if exists_only {
@@ -1659,7 +2040,7 @@ impl Analyzer {
         } else {
             ScalarType::Id64(column.table)
         };
-        let domain = Self::promote(Domain::scalar(scalar), expected.as_ref());
+        let domain = Self::promote(ExprType::scalar(scalar), expected.as_ref());
         Ok(Lowered {
             id: self.push(
                 domain,
@@ -1680,7 +2061,7 @@ impl Analyzer {
         &mut self,
         fold: &a::Fold,
         scope: &Scope,
-        expected: Option<Domain>,
+        expected: Option<ExprType>,
         context: Context,
     ) -> Result<Lowered> {
         let limit = fold
@@ -1716,14 +2097,14 @@ impl Analyzer {
         let init = self.expression(
             &fold.init,
             scope,
-            Some(Domain::scalar(accumulator_type.clone())),
+            Some(ExprType::scalar(accumulator_type.clone())),
             inner_context,
         )?;
         let range_type = self
             .concrete(&fold.lo, scope)?
             .or(self.concrete(&fold.hi, scope)?);
         let lo = self.expression(&fold.lo, scope, range_type, inner_context)?;
-        let index_type = self.program.expr(lo.id).domain.scalar.clone();
+        let index_type = self.program.expr(lo.id).domain.value_type().clone();
         if !index_type.is_integer() {
             return Err(diagnostic(
                 "D_BAD_OPERAND",
@@ -1734,7 +2115,7 @@ impl Analyzer {
         let hi = self.expression(
             &fold.hi,
             scope,
-            Some(Domain::scalar(index_type.clone())),
+            Some(ExprType::scalar(index_type.clone())),
             inner_context,
         )?;
         if fold.acc_name == fold.index_name
@@ -1789,7 +2170,7 @@ impl Analyzer {
         let yield_value = self.expression(
             &fold.yield_expr,
             &inner_scope,
-            Some(Domain::scalar(accumulator_type.clone())),
+            Some(ExprType::scalar(accumulator_type.clone())),
             inner_context,
         )?;
         body_cost = add_cost(body_cost, yield_value.cost, fold.span)?;
@@ -1812,7 +2193,7 @@ impl Analyzer {
             body,
             yield_value: yield_value.id,
         }));
-        let domain = Self::promote(Domain::scalar(accumulator_type), expected.as_ref());
+        let domain = Self::promote(ExprType::scalar(accumulator_type), expected.as_ref());
         Ok(Lowered {
             id: self.push(domain, kind, state_dependent, fold.span),
             cost,
@@ -1849,7 +2230,7 @@ impl Analyzer {
                 let value = self.expression(
                     &binding.value,
                     scope,
-                    Some(Domain::scalar(ty.clone())),
+                    Some(ExprType::scalar(ty.clone())),
                     context,
                 )?;
                 let binding_id = self.bind(
@@ -1877,7 +2258,7 @@ impl Analyzer {
                 let condition = self.expression(
                     &guard.cond,
                     scope,
-                    Some(Domain::scalar(ScalarType::Bool)),
+                    Some(ExprType::scalar(ScalarType::Bool)),
                     context,
                 )?;
                 (
@@ -1901,7 +2282,7 @@ impl Analyzer {
                 let value = self.expression(
                     &set.value,
                     scope,
-                    Some(Domain::scalar(self.program.column(column).ty.clone())),
+                    Some(ExprType::scalar(self.program.column(column).ty.clone())),
                     context,
                 )?;
                 let cost = add_cost(1, add_cost(key.cost, value.cost, span)?, span)?;
@@ -1938,7 +2319,7 @@ impl Analyzer {
                     let value = self.expression(
                         expression,
                         scope,
-                        Some(Domain::scalar(self.program.column(column).ty.clone())),
+                        Some(ExprType::scalar(self.program.column(column).ty.clone())),
                         context,
                     )?;
                     cost = add_cost(cost, value.cost, span)?;
@@ -1994,7 +2375,7 @@ impl Analyzer {
                     let value = self.expression(
                         expression,
                         scope,
-                        Some(Domain::scalar(parameter.ty)),
+                        Some(ExprType::scalar(parameter.ty)),
                         context,
                     )?;
                     cost = add_cost(cost, value.cost, span)?;
@@ -2025,6 +2406,16 @@ impl Analyzer {
 
     fn source_state_dependent(&self, expression: &a::Expr, scope: &Scope) -> bool {
         match expression {
+            a::Expr::Record(v) => v
+                .fields
+                .iter()
+                .any(|(_, e)| self.source_state_dependent(e, scope)),
+            a::Expr::Field(v) => self.source_state_dependent(&v.record, scope),
+            a::Expr::Variant(v) => self.source_state_dependent(&v.payload, scope),
+            a::Expr::IsVariant(v) | a::Expr::Payload(v) => {
+                self.source_state_dependent(&v.value, scope)
+            }
+
             a::Expr::Var(variable) => scope
                 .get(&variable.name)
                 .is_some_and(|id| self.program.binding(*id).state_dependent),
@@ -2088,6 +2479,15 @@ impl Analyzer {
     fn collect_reads(&self, id: ExprId, reads: &mut Vec<Access>, tier_two: &mut bool) {
         let expression = self.program.expr(id);
         match &expression.kind {
+            ExprKind::Record { fields, .. } => {
+                for (_, child) in fields {
+                    self.collect_reads(*child, reads, tier_two);
+                }
+            }
+            ExprKind::Field { record: child, .. }
+            | ExprKind::Variant { payload: child, .. }
+            | ExprKind::IsVariant { value: child, .. }
+            | ExprKind::Payload { value: child, .. } => self.collect_reads(*child, reads, tier_two),
             ExprKind::Constant(_) | ExprKind::Binding(_) | ExprKind::EffectCount => {}
             ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
                 self.collect_reads(*index, reads, tier_two)
@@ -2133,6 +2533,17 @@ impl Analyzer {
 
     fn collect_expression_writes(&self, id: ExprId, writes: &mut Vec<Access>, tier_two: &mut bool) {
         match &self.program.expr(id).kind {
+            ExprKind::Record { fields, .. } => {
+                for (_, child) in fields {
+                    self.collect_expression_writes(*child, writes, tier_two);
+                }
+            }
+            ExprKind::Field { record: child, .. }
+            | ExprKind::Variant { payload: child, .. }
+            | ExprKind::IsVariant { value: child, .. }
+            | ExprKind::Payload { value: child, .. } => {
+                self.collect_expression_writes(*child, writes, tier_two)
+            }
             ExprKind::Constant(_)
             | ExprKind::Binding(_)
             | ExprKind::Sum { .. }
@@ -2236,6 +2647,54 @@ impl Analyzer {
         }
         let eq = |left, right| self.same_expression(left, right, bindings);
         match (&left.kind, &right.kind) {
+            (ExprKind::Record { ty: a, fields: x }, ExprKind::Record { ty: b, fields: y }) => {
+                a == b
+                    && x.len() == y.len()
+                    && x.iter().zip(y).all(|((f, x), (g, y))| f == g && eq(*x, *y))
+            }
+            (
+                ExprKind::Field {
+                    record: a,
+                    field: x,
+                },
+                ExprKind::Field {
+                    record: b,
+                    field: y,
+                },
+            ) => x == y && eq(*a, *b),
+            (
+                ExprKind::Variant {
+                    ty: a,
+                    variant: x,
+                    payload: p,
+                },
+                ExprKind::Variant {
+                    ty: b,
+                    variant: y,
+                    payload: q,
+                },
+            ) => a == b && x == y && eq(*p, *q),
+            (
+                ExprKind::IsVariant {
+                    value: a,
+                    variant: x,
+                },
+                ExprKind::IsVariant {
+                    value: b,
+                    variant: y,
+                },
+            )
+            | (
+                ExprKind::Payload {
+                    value: a,
+                    variant: x,
+                },
+                ExprKind::Payload {
+                    value: b,
+                    variant: y,
+                },
+            ) => x == y && eq(*a, *b),
+
             (
                 ExprKind::Call {
                     function: a,
@@ -2451,6 +2910,16 @@ fn function_expression_dependencies(
 ) -> Result<()> {
     let mut child = |e: &a::Expr| function_expression_dependencies(e, calls, deps);
     match expression {
+        a::Expr::Record(v) => {
+            for (_, e) in &v.fields {
+                child(e)?;
+            }
+            Ok(())
+        }
+        a::Expr::Field(v) => child(&v.record),
+        a::Expr::Variant(v) => child(&v.payload),
+        a::Expr::IsVariant(v) | a::Expr::Payload(v) => child(&v.value),
+
         a::Expr::Literal(_) | a::Expr::Var(_) => Ok(()),
         a::Expr::Unary(v) => child(&v.operand),
         a::Expr::Binary(v) => {

@@ -56,6 +56,8 @@ node_enum!(Decl {
     Effect(EffectDecl),
     Transition(TransitionDecl),
     Function(FunctionDecl),
+    Record(RecordDecl),
+    Union(UnionDecl),
 });
 
 #[derive(Clone, Debug)]
@@ -180,6 +182,11 @@ node_enum!(Expr {
     KeyOf(KeyOf),
     Fold(Box<Fold>),
     Call(Call),
+    Record(RecordExpr),
+    Field(FieldExpr),
+    Variant(VariantExpr),
+    IsVariant(VariantAccess),
+    Payload(VariantAccess),
     EffectCount(EffectCount),
     EffectIs(EffectIs),
     EffectArg(EffectArg),
@@ -203,6 +210,10 @@ impl Expr {
             Self::KeyOf(v) => v.span,
             Self::Fold(v) => v.span,
             Self::Call(v) => v.span,
+            Self::Record(v) => v.span,
+            Self::Field(v) => v.span,
+            Self::Variant(v) => v.span,
+            Self::IsVariant(v) | Self::Payload(v) => v.span,
             Self::EffectCount(v) => v.span,
             Self::EffectIs(v) => v.span,
             Self::EffectArg(v) => v.span,
@@ -450,3 +461,48 @@ pub struct Call {
     pub span: Span,
 }
 serialize_node!(Call, "Call", function => "function", args => "args");
+
+#[derive(Clone, Debug)]
+pub struct RecordDecl {
+    pub name: String,
+    pub fields: Vec<Param>,
+    pub span: Span,
+}
+serialize_node!(RecordDecl,"RecordDecl",name=>"name",fields=>"fields");
+#[derive(Clone, Debug)]
+pub struct UnionDecl {
+    pub name: String,
+    pub variants: Vec<Param>,
+    pub span: Span,
+}
+serialize_node!(UnionDecl,"UnionDecl",name=>"name",variants=>"variants");
+#[derive(Clone, Debug)]
+pub struct RecordExpr {
+    pub ty: String,
+    pub fields: Vec<(String, Expr)>,
+    pub span: Span,
+}
+serialize_node!(RecordExpr,"RecordExpr",ty=>"type",fields=>"fields");
+#[derive(Clone, Debug)]
+pub struct FieldExpr {
+    pub record: Box<Expr>,
+    pub field: String,
+    pub span: Span,
+}
+serialize_node!(FieldExpr,"FieldExpr",record=>"record",field=>"field");
+#[derive(Clone, Debug)]
+pub struct VariantExpr {
+    pub ty: String,
+    pub variant: String,
+    pub payload: Box<Expr>,
+    pub span: Span,
+}
+serialize_node!(VariantExpr,"VariantExpr",ty=>"type",variant=>"variant",payload=>"payload");
+#[derive(Clone, Debug)]
+pub struct VariantAccess {
+    pub ty: String,
+    pub variant: String,
+    pub value: Box<Expr>,
+    pub span: Span,
+}
+serialize_node!(VariantAccess,"VariantAccess",ty=>"type",variant=>"variant",value=>"value");

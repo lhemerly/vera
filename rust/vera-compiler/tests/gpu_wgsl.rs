@@ -10,13 +10,17 @@ use naga::{
 use vera_compiler::{codegen_gpu::generate_wgsl, parse_source, semantic::analyze};
 
 fn run(source: &str, probe: &str, entry: &str) -> Option<[u32; 4]> {
+    let started = std::time::Instant::now();
+    let timed = std::env::var_os("VERA_GPU_TIMINGS").is_some();
     let program = analyze(parse_source(source).unwrap()).unwrap();
     let code = generate_wgsl(&program, 2).unwrap() + probe;
+    let generated = started.elapsed();
     let module = naga::front::wgsl::parse_str(&code)
         .unwrap_or_else(|error| panic!("invalid generated WGSL: {}", error.emit_to_string(&code)));
     let info = Validator::new(ValidationFlags::all(), Capabilities::empty())
         .validate(&module)
         .unwrap_or_else(|error| panic!("WGSL validation failed: {error:?}"));
+    let validated = started.elapsed();
     // The actual host allocates exactly one 16-byte storage buffer, as did the
     // WebGPU harness. Check that ABI before dispatch instead of relying on a
     // graphics API to infer a compatible bind group.
@@ -78,7 +82,18 @@ fn run(source: &str, probe: &str, entry: &str) -> Option<[u32; 4]> {
         .expect("validated WGSL must lower to GLSL")
         .write()
         .expect("WGSL compute shader must emit complete GLSL");
-    gpu_host::dispatch(&glsl)
+    let translated = started.elapsed();
+    if timed {
+        eprintln!("GPU stages: generate={generated:?} parse_validate={:?} translate={:?} WGSL_bytes={} GLSL_bytes={} types={} functions={} expressions={}", validated-generated, translated-validated, code.len(), glsl.len(), module.types.len(), module.functions.len(), module.functions.iter().map(|(_,f)|f.expressions.len()).sum::<usize>());
+    }
+    let result = gpu_host::dispatch(&glsl);
+    if timed {
+        eprintln!(
+            "GPU driver host/dispatch={:?}",
+            started.elapsed() - translated
+        );
+    }
+    result
 }
 fn expect(source: &str, probe: &str, entry: &str, expected: [u32; 4]) {
     if let Some(result) = run(source, probe, entry) {
@@ -238,5 +253,22 @@ let first=transition_v_run(&ctx,v_small(3u),payload);let second=transition_v_laz
 atomicAdd(&output.violations,first);atomicAdd(&output.committed,second);atomicAdd(&output.reverted,bad);atomicAdd(&output.effects,ctx.s.effect_count);}"#,
         "probe",
         [1, 1, 3, 2],
+    );
+}
+
+#[test]
+fn wgsl_records_unions_and_typed_function_results_execute() {
+    expect(
+        include_str!("fixtures/gpu_structured.vera"),
+        r#"
+@compute @workgroup_size(1) fn probe(){var ctx:Ctx;vera_init(&ctx);
+var p=vera_type_0_zero();p.f_0=v_small(7u);p.f_1=v_make(1u,2u,3u,4u,5u,6u,7u,8u);
+var w=vera_type_1_zero();w.f_0=v_make(9u,10u,11u,12u,13u,14u,15u,16u);w.f_1=v_make(17u,18u,19u,20u,21u,22u,23u,24u);
+let saved=transition_v_save(&ctx,p,w,v_small(1u));let found=transition_v_lookup(&ctx,p);
+let bad=transition_v_wrongtag(&ctx);let ordered=transition_v_ordered(&ctx);
+atomicAdd(&output.violations,saved);atomicAdd(&output.committed,found);atomicAdd(&output.reverted,bad);atomicAdd(&output.effects,ordered+ctx.s.col_0_2[0].f_1.f_1.w[7]);}
+"#,
+        "probe",
+        [1, 1, 3, 25],
     );
 }

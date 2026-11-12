@@ -834,3 +834,116 @@ let intent=Params::Promoted{};intent.execute(&mut state).unwrap();intent.check_p
 }"#,
     );
 }
+
+#[test]
+fn native_structured_values_match_interpreter_codecs_state_and_effect_contracts() {
+    use num_bigint::BigInt;
+    use std::collections::BTreeMap;
+    use vera_compiler::{
+        ir::TypeId,
+        persistence::{encode_state, Intent},
+        runtime::Machine,
+        types::ValueType,
+        value::Value,
+    };
+    let source=format!("{}\nprojection View(k:id64<Store>){{allow_if:table_exists(Store,k);expose:[Store[k].envelope];enable_intents:[];}}",include_str!("fixtures/gpu_structured.vera"));
+    let program = analyze(parse_source(&source).unwrap()).unwrap();
+    let bytes = |v: u8| Value::Int(BigInt::from_bytes_le(num_bigint::Sign::Plus, &[v; 32]));
+    let pair = Value::Record {
+        ty: program.type_id("Pair").unwrap(),
+        fields: vec![Value::Int(7.into()), bytes(3)],
+    };
+    let wide = Value::Record {
+        ty: program.type_id("Wide").unwrap(),
+        fields: vec![bytes(4), bytes(5)],
+    };
+    let params = BTreeMap::from([
+        ("p".into(), pair.clone()),
+        ("w".into(), wide),
+        ("accept".into(), Value::Bool(true)),
+    ]);
+    let intent = Intent::from_parameters(&program, "save", &params).unwrap();
+    let expected_intent = intent.encode(&program).unwrap().1;
+    let mut machine = Machine::new(&program).unwrap();
+    machine.call("save", &params).unwrap();
+    machine
+        .call("lookup", &BTreeMap::from([("p".into(), pair)]))
+        .unwrap();
+    let expected_state = encode_state(&program, &machine.state).unwrap();
+    let expected_sizes = program
+        .types()
+        .iter()
+        .map(|definition| {
+            (
+                definition.name.clone(),
+                program
+                    .value_storage_width(&ValueType::Named(TypeId(definition.id.0)))
+                    .unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let sizes = expected_sizes
+        .iter()
+        .map(|(name, width)| {
+            format!("assert_eq!(std::mem::size_of::<VeraValue_{name}>(),{width});")
+        })
+        .collect::<String>();
+    let main = format!(
+        r#"fn main(){{
+{sizes}
+let p=VeraValue_Pair{{left:7,right:[3u8;32]}};let w=VeraValue_Wide{{a:[4u8;32],b:[5u8;32]}};
+let intent=Params::Save{{p,w,accept:true}};let (tag,bytes)=intent.encode();assert_eq!(bytes,vec!{expected_intent:?});assert_eq!(Params::decode(tag,&bytes).unwrap(),intent);
+let pre=State::default();let mut state=pre.clone();intent.execute(&mut state).unwrap();intent.check_postconditions(&pre,&state).unwrap();
+lookup(&mut state,p).unwrap();assert_eq!(state.encode(),vec!{expected_state:?});assert_eq!(State::decode(state.encode()).unwrap(),state);
+let saved=state.clone();assert_eq!(save(&mut state,p,w,true),Err(ErrorCode::DuplicateKey));assert_eq!(state,saved);
+assert_eq!(wrongtag(&mut state),Err(ErrorCode::VariantAccess));assert_eq!(state,saved);
+let view=project_View(&state,4).unwrap();assert!(view.allowed);assert!(matches!(view.cells[0].value,Some(ProjectionValue::Record{{ty:"Envelope",..}})));
+lazy(&mut state).unwrap();let before=state.clone();let order=Params::Ordered{{}};order.execute(&mut state).unwrap();order.check_postconditions(&before,&state).unwrap();
+let inspect=Params::Inspect{{m:VeraValue_Message::Code(7)}};let (tag,bytes)=inspect.encode();assert_eq!(Params::decode(tag,&bytes).unwrap(),inspect);
+let mut padded=bytes.clone();*padded.last_mut().unwrap()=1;assert_eq!(Params::decode(tag,padded),Err(ErrorCode::InvalidEncoding));
+let mut badtag=bytes;badtag[32..36].copy_from_slice(&999u32.to_le_bytes());assert_eq!(Params::decode(tag,badtag),Err(ErrorCode::InvalidEncoding));
+}}"#
+    );
+    run_case(&source, &main);
+}
+
+#[test]
+fn native_unit_variants_validate_nested_enums_and_handle_name_collisions() {
+    run_case(
+        r#"record Empty{} record Check{code:enum {A,B};}
+union Choice{None:Empty;Some:Check;}
+effect Chosen(value:Choice);
+function identity(v:Choice)->Choice ensure exact:eq(result,v);body {yield v;}
+transition go(v:Choice) reads [] writes [] ensure same:eq(effect_arg(Chosen,0,value),v);body {emit Chosen(identity(v));commit;}
+transition vera_decode_type_0() reads [] writes [] body {let %e:Empty=record<Empty>();commit;}"#,
+        r#"fn main(){
+assert_eq!(std::mem::size_of::<VeraValue_Empty>(),0);
+let intent=Params::Go{v:VeraValue_Choice::None(VeraValue_Empty{})};let start=State::default();let mut state=start.clone();intent.execute(&mut state).unwrap();intent.check_postconditions(&start,&state).unwrap();
+let (tag,bytes)=intent.encode();assert_eq!(Params::decode(tag,bytes).unwrap(),intent);
+assert_eq!(go(&mut state,VeraValue_Choice::Some(VeraValue_Check{code:2})),Err(ErrorCode::InvalidEncoding));
+Params::VeraDecodeType0{}.execute(&mut state).unwrap();
+}"#,
+    );
+}
+
+#[test]
+fn native_structured_scalar_leaves_promote_and_constructor_inputs_narrow() {
+    run_case(
+        r#"record R{value:u64;} union U{Number:u64;}
+table T capacity 2 {key id:id64<T>;col v:u64 [tracked_sum];}
+transition init() reads [] writes [T[*].v] body {let %a:id64<T>=table_alloc(T,{v:18446744073709551615});let %b:id64<T>=table_alloc(T,{v:1});commit;}
+transition promoted(r:R,u:U) reads [] writes []
+ensure fields:eq(add(field(r,value),sum(T.v)),add(sum(T.v),1));
+ensure payloads:eq(add(payload<U,Number>(u),sum(T.v)),add(sum(T.v),1));
+body {commit;}
+transition record_overflow() reads [T[*].v] writes [] body {let %r:R=record<R>(value:sum(T.v));commit;}
+transition union_overflow() reads [T[*].v] writes [] body {let %u:U=variant<U,Number>(sum(T.v));commit;}"#,
+        r#"fn main(){
+let mut state=State::default();init(&mut state).unwrap();let before=state.clone();
+let intent=Params::Promoted{r:VeraValue_R{value:1},u:VeraValue_U::Number(1)};
+intent.execute(&mut state).unwrap();intent.check_postconditions(&before,&state).unwrap();
+assert_eq!(record_overflow(&mut state),Err(ErrorCode::ArithOverflow));assert_eq!(state,before);
+assert_eq!(union_overflow(&mut state),Err(ErrorCode::ArithOverflow));assert_eq!(state,before);
+}"#,
+    );
+}

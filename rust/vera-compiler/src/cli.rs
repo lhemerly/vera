@@ -17,7 +17,7 @@ use vera_compiler::{
     projection::build_affordance_frame,
     runtime::{rebuild_indexes, recompute_aggregates, Machine, State},
     semantic::analyze,
-    types::ScalarType,
+    types::{ScalarType, ValueType},
     value::{self, Value},
     verifier::{verify_all, verify_function, verify_transition, VerifierConfig},
 };
@@ -306,7 +306,11 @@ fn parameter(text: &str, ty: &ScalarType) -> std::result::Result<Value, String> 
         _ => integer(text, ty),
     }
 }
-fn parameters(specs: &[OsString], params: &[Param]) -> Result<BTreeMap<String, Value>> {
+fn parameters(
+    program: &CheckedProgram,
+    specs: &[OsString],
+    params: &[Param],
+) -> Result<BTreeMap<String, Value>> {
     let mut out = BTreeMap::new();
     for spec in specs {
         let text = spec
@@ -319,7 +323,13 @@ fn parameters(specs: &[OsString], params: &[Param]) -> Result<BTreeMap<String, V
             .iter()
             .find(|p| p.name == name)
             .ok_or_else(|| input(format!("unknown parameter {name:?}")))?;
-        let value = parameter(text, &param.ty).map_err(|e| input(format!("{name}: {e}")))?;
+        let value = match &param.ty {
+            ValueType::Scalar(ty) => parameter(text, ty),
+            ValueType::Named(_) => serde_json::from_str::<Json>(text)
+                .map_err(|e| e.to_string())
+                .and_then(|json| value::value_from_json(program, &json, &param.ty)),
+        }
+        .map_err(|e| input(format!("{name}: {e}")))?;
         if out.insert(name.into(), value).is_some() {
             return Err(input(format!("parameter {name:?} supplied twice")));
         }
@@ -405,7 +415,7 @@ fn initial_state(program: &CheckedProgram, opts: &Options) -> Result<State> {
                     }
                     if let Some(v) = columns.get(&column.name) {
                         target.columns[column.id.index][slot] =
-                            value::from_json(&column.ty, v).map_err(input)?;
+                            value::value_from_json(program, v, &column.ty).map_err(input)?;
                     }
                 }
             }
@@ -431,7 +441,11 @@ fn state_json(program: &CheckedProgram, state: &State) -> Json {
                         for c in &info.columns {
                             columns.insert(
                                 c.name.clone(),
-                                data.columns[c.id.index][slot].to_json(&c.ty),
+                                value::value_to_json(
+                                    program,
+                                    &data.columns[c.id.index][slot],
+                                    &c.ty,
+                                ),
                             );
                         }
                         if info.column_id("id").is_some() {
@@ -455,7 +469,7 @@ fn state_json(program: &CheckedProgram, state: &State) -> Json {
                 .params
                 .iter()
                 .zip(&record.args)
-                .map(|(p, v)| (p.name.clone(), v.to_json(&p.ty)))
+                .map(|(p, v)| (p.name.clone(), value::value_to_json(program, v, &p.ty)))
                 .collect();
             json!({"effect":effect.name,"args":args})
         })
@@ -566,9 +580,9 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
         .collect();
     match opts.command.as_str() {
         "check" => {
-            let tables:Vec<_>=program.tables().iter().map(|t|json!({"name":t.name,"capacity":t.capacity,"bytes":t.layout.size,"columns":t.columns.iter().map(|c|json!({"name":c.name,"type":c.ty.to_string(),"tracked_sum":c.tracked_sum,"unique":c.unique})).collect::<Vec<_>>()})).collect();
+            let tables:Vec<_>=program.tables().iter().map(|t|json!({"name":t.name,"capacity":t.capacity,"bytes":t.layout.size,"columns":t.columns.iter().map(|c|json!({"name":c.name,"type":program.value_type_name(&c.ty),"tracked_sum":c.tracked_sum,"unique":c.unique})).collect::<Vec<_>>()})).collect();
             let transitions:Vec<_>=program.transitions().iter().map(|t|json!({"name":t.name,"tier":t.tier,"wcet_bound":t.wcet_bound,"reads":t.reads.len(),"writes":t.writes.len(),"fold_depth":t.fold_depth,"max_fold_product":t.max_fold_product})).collect();
-            let functions:Vec<_>=program.functions().iter().map(|f|json!({"name":f.name,"result_type":f.result_type.to_string(),"wcet_bound":f.wcet_bound,"dependencies":f.dependencies.iter().map(|id|program.function(*id).name.clone()).collect::<Vec<_>>()})).collect();
+            let functions:Vec<_>=program.functions().iter().map(|f|json!({"name":f.name,"result_type":program.value_type_name(&f.result_type),"wcet_bound":f.wcet_bound,"dependencies":f.dependencies.iter().map(|id|program.function(*id).name.clone()).collect::<Vec<_>>()})).collect();
             if opts.flag("--json") {
                 let mut report = json!({"ok":true,"tables":tables,"transitions":transitions,"invariants":program.invariants().len(),"projections":program.projections().len()});
                 if !functions.is_empty() {
@@ -672,7 +686,7 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             } else {
                 &[]
             };
-            let args = parameters(&opts.params, params)?;
+            let args = parameters(&program, &opts.params, params)?;
             if opts.command != "project" {
                 proof_gate(
                     &program,

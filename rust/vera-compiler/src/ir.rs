@@ -2,7 +2,7 @@
 use crate::{
     ast,
     diagnostic::Span,
-    types::{Domain, ScalarType, TableLayout},
+    types::{ExprType, TableLayout, ValueType},
     value::Value,
 };
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,10 @@ id!(
     TransitionId,
     EffectId,
     ProjectionId,
-    FunctionId
+    FunctionId,
+    TypeId,
+    FieldId,
+    VariantId
 );
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
@@ -40,7 +43,7 @@ pub enum Snapshot {
 pub struct Column {
     pub id: ColumnId,
     pub name: String,
-    pub ty: ScalarType,
+    pub ty: ValueType,
     pub tracked_sum: bool,
     pub unique: bool,
     pub span: Span,
@@ -81,7 +84,7 @@ pub enum BindingOrigin {
 pub struct Binding {
     pub id: BindingId,
     pub name: String,
-    pub ty: ScalarType,
+    pub ty: ValueType,
     pub origin: BindingOrigin,
     pub state_dependent: bool,
     pub span: Span,
@@ -90,7 +93,7 @@ pub struct Binding {
 pub struct Param {
     pub name: String,
     pub binding: BindingId,
-    pub ty: ScalarType,
+    pub ty: ValueType,
     pub span: Span,
 }
 
@@ -152,13 +155,34 @@ impl BinaryOp {
 
 #[derive(Clone, Debug)]
 pub struct TypedExpr {
-    pub domain: Domain,
+    pub domain: ExprType,
     pub kind: ExprKind,
     pub state_dependent: bool,
     pub span: Span,
 }
 #[derive(Clone, Debug)]
 pub enum ExprKind {
+    Record {
+        ty: TypeId,
+        fields: Vec<(FieldId, ExprId)>,
+    },
+    Field {
+        record: ExprId,
+        field: FieldId,
+    },
+    Variant {
+        ty: TypeId,
+        variant: VariantId,
+        payload: ExprId,
+    },
+    IsVariant {
+        value: ExprId,
+        variant: VariantId,
+    },
+    Payload {
+        value: ExprId,
+        variant: VariantId,
+    },
     Constant(Value),
     Binding(BindingId),
     Unary {
@@ -332,6 +356,8 @@ pub struct Projection {
 pub struct CheckedProgram {
     pub(crate) syntax: ast::Module,
     pub(crate) tables: Vec<Table>,
+    pub(crate) types: Vec<TypeDefinition>,
+    pub(crate) type_layouts: BTreeMap<TypeId, (usize, usize, u64)>,
     pub(crate) bindings: Vec<Binding>,
     pub(crate) expressions: Vec<TypedExpr>,
     pub(crate) transitions: Vec<Transition>,
@@ -346,6 +372,8 @@ impl CheckedProgram {
         Self {
             syntax,
             tables: Vec::new(),
+            types: Vec::new(),
+            type_layouts: BTreeMap::new(),
             bindings: Vec::new(),
             expressions: Vec::new(),
             transitions: Vec::new(),
@@ -437,7 +465,7 @@ pub struct Function {
     pub name: String,
     pub params: Vec<Param>,
     pub result: BindingId,
-    pub result_type: ScalarType,
+    pub result_type: ValueType,
     pub requires: Vec<NamedExpr>,
     pub ensures: Vec<NamedExpr>,
     pub body: ExprId,
@@ -446,4 +474,141 @@ pub struct Function {
     pub fold_depth: u32,
     pub max_fold_product: u32,
     pub span: Span,
+}
+
+#[derive(Clone, Debug)]
+pub struct TypeDefinition {
+    pub id: TypeId,
+    pub name: String,
+    pub kind: TypeDefinitionKind,
+    pub span: Span,
+}
+#[derive(Clone, Debug)]
+pub enum TypeDefinitionKind {
+    Record(Vec<FieldDefinition>),
+    Union(Vec<VariantDefinition>),
+}
+#[derive(Clone, Debug)]
+pub struct FieldDefinition {
+    pub id: FieldId,
+    pub name: String,
+    pub ty: ValueType,
+    pub span: Span,
+}
+#[derive(Clone, Debug)]
+pub struct VariantDefinition {
+    pub id: VariantId,
+    pub name: String,
+    pub payload: ValueType,
+    pub span: Span,
+}
+impl CheckedProgram {
+    pub fn types(&self) -> &[TypeDefinition] {
+        &self.types
+    }
+    pub fn type_definition(&self, id: TypeId) -> &TypeDefinition {
+        &self.types[id.0]
+    }
+    pub fn type_id(&self, name: &str) -> Option<TypeId> {
+        self.types.iter().find(|t| t.name == name).map(|t| t.id)
+    }
+    pub fn value_type_name(&self, ty: &ValueType) -> String {
+        match ty {
+            ValueType::Scalar(t) => t.to_string(),
+            ValueType::Named(id) => self.type_definition(*id).name.clone(),
+        }
+    }
+    pub fn value_wire_width(&self, ty: &ValueType) -> Result<usize, String> {
+        if let ValueType::Named(id) = ty {
+            if let Some(layout) = self.type_layouts.get(id) {
+                return Ok(layout.0);
+            }
+        }
+        match ty {
+            ValueType::Scalar(t) => Ok(t.byte_width()),
+            ValueType::Named(id) => match &self.type_definition(*id).kind {
+                TypeDefinitionKind::Record(fields) => fields.iter().try_fold(0usize, |n, f| {
+                    n.checked_add(self.value_wire_width(&f.ty)?)
+                        .ok_or_else(|| "record wire width exceeds usize".into())
+                }),
+                TypeDefinitionKind::Union(variants) => variants
+                    .iter()
+                    .map(|v| self.value_wire_width(&v.payload))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(4)
+                    .ok_or_else(|| "union wire width exceeds usize".into()),
+            },
+        }
+    }
+    pub fn value_alignment(&self, ty: &ValueType) -> Result<u64, String> {
+        if let ValueType::Named(id) = ty {
+            if let Some(layout) = self.type_layouts.get(id) {
+                return Ok(layout.2);
+            }
+        }
+        match ty {
+            ValueType::Scalar(crate::types::ScalarType::Bytes32) => Ok(1),
+            ValueType::Scalar(t) => Ok(t.align()),
+            ValueType::Named(id) => match &self.type_definition(*id).kind {
+                TypeDefinitionKind::Record(fields) => Ok(fields
+                    .iter()
+                    .map(|f| self.value_alignment(&f.ty))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .max()
+                    .unwrap_or(1)),
+                TypeDefinitionKind::Union(variants) => Ok(variants
+                    .iter()
+                    .map(|v| self.value_alignment(&v.payload))
+                    .collect::<Result<Vec<_>, _>>()?
+                    .into_iter()
+                    .max()
+                    .unwrap_or(1)
+                    .max(4)),
+            },
+        }
+    }
+    pub fn value_storage_width(&self, ty: &ValueType) -> Result<usize, String> {
+        if let ValueType::Named(id) = ty {
+            if let Some(layout) = self.type_layouts.get(id) {
+                return Ok(layout.1);
+            }
+        }
+        fn align(n: usize, a: usize) -> Result<usize, String> {
+            n.checked_add(a - 1)
+                .map(|n| n / a * a)
+                .ok_or_else(|| "type layout exceeds usize".into())
+        }
+        match ty {
+            ValueType::Scalar(t) => Ok(t.byte_width()),
+            ValueType::Named(id) => {
+                let alignment = usize::try_from(self.value_alignment(ty)?)
+                    .map_err(|_| "alignment exceeds usize")?;
+                let width = match &self.type_definition(*id).kind {
+                    TypeDefinitionKind::Record(fields) => {
+                        fields.iter().try_fold(0usize, |n, f| {
+                            align(n, self.value_alignment(&f.ty)? as usize)?
+                                .checked_add(self.value_storage_width(&f.ty)?)
+                                .ok_or_else(|| "record layout exceeds usize".to_string())
+                        })?
+                    }
+                    TypeDefinitionKind::Union(variants) => align(4, alignment)?
+                        .checked_add(
+                            variants
+                                .iter()
+                                .map(|v| self.value_storage_width(&v.payload))
+                                .collect::<Result<Vec<_>, _>>()?
+                                .into_iter()
+                                .max()
+                                .unwrap_or(0),
+                        )
+                        .ok_or("union layout exceeds usize")?,
+                };
+                align(width, alignment)
+            }
+        }
+    }
 }

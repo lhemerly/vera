@@ -1,5 +1,5 @@
 //! Scalar identity, evaluation domains and canonical physical table layouts.
-use crate::ir::TableId;
+use crate::ir::{CheckedProgram, TableId, TypeId};
 use num_bigint::BigInt;
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -261,4 +261,192 @@ pub fn mix64(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D049BB133111EB);
     z ^ (z >> 31)
+}
+
+/// A scalar leaf or a reference to a shared nominal finite product/sum type.
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum ValueType {
+    Scalar(ScalarType),
+    Named(TypeId),
+}
+impl From<ScalarType> for ValueType {
+    fn from(t: ScalarType) -> Self {
+        Self::Scalar(t)
+    }
+}
+impl ValueType {
+    pub fn as_scalar(&self) -> Option<&ScalarType> {
+        match self {
+            Self::Scalar(t) => Some(t),
+            Self::Named(_) => None,
+        }
+    }
+    pub fn is_numeric(&self) -> bool {
+        self.as_scalar().is_some_and(ScalarType::is_numeric)
+    }
+    pub fn is_integer(&self) -> bool {
+        self.as_scalar().is_some_and(ScalarType::is_integer)
+    }
+    pub fn is_ordered(&self) -> bool {
+        self.as_scalar().is_some_and(ScalarType::is_ordered)
+    }
+    pub fn is_bool(&self) -> bool {
+        self.as_scalar().is_some_and(ScalarType::is_bool)
+    }
+    pub fn is_decimal(&self) -> bool {
+        self.as_scalar().is_some_and(ScalarType::is_decimal)
+    }
+}
+impl fmt::Display for ValueType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Scalar(t) => t.fmt(f),
+            Self::Named(id) => write!(f, "type#{}", id.0),
+        }
+    }
+}
+impl PartialEq<ScalarType> for ValueType {
+    fn eq(&self, other: &ScalarType) -> bool {
+        self.as_scalar() == Some(other)
+    }
+}
+impl PartialEq<ValueType> for ScalarType {
+    fn eq(&self, other: &ValueType) -> bool {
+        other == self
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum ExprType {
+    Scalar(Domain),
+    Named(TypeId),
+}
+impl ExprType {
+    pub fn value_type(&self) -> ValueType {
+        match self {
+            Self::Scalar(d) => ValueType::Scalar(d.scalar.clone()),
+            Self::Named(id) => ValueType::Named(*id),
+        }
+    }
+    pub fn scalar_domain(&self) -> Option<&Domain> {
+        match self {
+            Self::Scalar(d) => Some(d),
+            Self::Named(_) => None,
+        }
+    }
+    pub fn as_scalar(&self) -> Option<&ScalarType> {
+        self.scalar_domain().map(|d| &d.scalar)
+    }
+    pub fn is_aggregate(&self) -> bool {
+        self.scalar_domain().is_some_and(Domain::is_aggregate)
+    }
+    pub fn scalar(ty: impl Into<ValueType>) -> Self {
+        match ty.into() {
+            ValueType::Scalar(t) => Self::Scalar(Domain::scalar(t)),
+            ValueType::Named(id) => Self::Named(id),
+        }
+    }
+    pub fn aggregate(ty: ScalarType) -> Self {
+        Self::Scalar(Domain::aggregate(ty))
+    }
+    pub fn merge(self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::Scalar(mut a), Self::Scalar(b)) if a.scalar == b.scalar => {
+                a.width = a.width.max(b.width);
+                Self::Scalar(a)
+            }
+            (a, _) => a,
+        }
+    }
+}
+impl From<Domain> for ExprType {
+    fn from(d: Domain) -> Self {
+        Self::Scalar(d)
+    }
+}
+
+pub fn compute_value_layout(
+    program: &CheckedProgram,
+    capacity: u64,
+    columns: &[(String, ValueType, bool, bool)],
+) -> Result<TableLayout, String> {
+    if capacity == 0 || capacity > (1u64 << 32) || !capacity.is_power_of_two() {
+        return Err("capacity must be a power of two between 1 and 2^32".into());
+    }
+    let scalar_columns = columns
+        .iter()
+        .map(|(n, t, a, u)| t.as_scalar().map(|s| (n.clone(), s.clone(), *a, *u)))
+        .collect::<Option<Vec<_>>>();
+    if let Some(columns) = scalar_columns {
+        return compute_layout(capacity, &columns);
+    }
+    let mut layout = TableLayout {
+        column_offsets: vec![0; columns.len()],
+        aggregate_offsets: vec![None; columns.len()],
+        hash_key_offsets: vec![None; columns.len()],
+        hash_used_offsets: vec![None; columns.len()],
+        unique_buckets: vec![None; columns.len()],
+        ..Default::default()
+    };
+    let mut end = 0u64;
+    let mut add =
+        |layout: &mut TableLayout, name: String, size: u64, align: u64| -> Result<u64, String> {
+            let offset = end.checked_add(63).ok_or("layout exceeds u64")? / 64 * 64;
+            layout.fields.push(LayoutField {
+                name,
+                offset,
+                size,
+                align,
+                pad_before: offset - end,
+            });
+            end = offset.checked_add(size).ok_or("layout exceeds u64")?;
+            Ok(offset)
+        };
+    add(
+        &mut layout,
+        "occupied_bitmap".into(),
+        capacity.div_ceil(64).max(1) * 8,
+        8,
+    )?;
+    add(&mut layout, "generation".into(), capacity * 4, 4)?;
+    for (i, (name, ty, _, _)) in columns.iter().enumerate() {
+        let size = (program.value_storage_width(ty)? as u64)
+            .checked_mul(capacity)
+            .ok_or("column layout exceeds u64")?;
+        layout.column_offsets[i] = add(
+            &mut layout,
+            format!("col_{name}"),
+            size,
+            program.value_alignment(ty)?,
+        )?;
+    }
+    for (i, (name, ty, tracked, unique)) in columns.iter().enumerate() {
+        if *tracked {
+            let size = u64::from(
+                ty.as_scalar()
+                    .ok_or("aggregate requires scalar")?
+                    .aggregate_width()
+                    / 8,
+            );
+            layout.aggregate_offsets[i] =
+                Some(add(&mut layout, format!("agg_sum_{name}"), size, size)?);
+        }
+        if *unique {
+            let buckets = (capacity * 2).max(16).next_power_of_two();
+            layout.unique_buckets[i] = Some(buckets);
+            layout.hash_key_offsets[i] = Some(add(
+                &mut layout,
+                format!("hash_{name}_key"),
+                buckets * 8,
+                8,
+            )?);
+            layout.hash_used_offsets[i] = Some(add(
+                &mut layout,
+                format!("hash_{name}_used"),
+                buckets.div_ceil(64) * 8,
+                8,
+            )?);
+        }
+    }
+    layout.size = end.checked_add(63).ok_or("layout exceeds u64")? / 64 * 64;
+    Ok(layout)
 }

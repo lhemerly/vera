@@ -1,0 +1,49 @@
+record Pair {left:u64;right:bytes32;}
+record Wide {a:bytes32;b:bytes32;}
+union Message {Data:Pair;Code:u8;}
+record Envelope {message:Message;wide:Wide;}
+function wrap(p:Pair,w:Wide)->Envelope
+  ensure message:eq(field(result,message),variant<Message,Data>(p));
+  ensure wide:eq(field(result,wide),w);
+  body {yield record<Envelope>(wide:w,message:variant<Message,Data>(p));}
+function unwrap(m:Message)->Pair
+  require data:is_variant<Message,Data>(m);
+  ensure data:eq(result,payload<Message,Data>(m));
+  body {yield payload<Message,Data>(m);}
+function roundtrip(p:Pair,w:Wide)->Pair
+  ensure data:eq(result,p);
+  body {yield unwrap(field(wrap(p,w),message));}
+function widefold(w:Wide)->Wide
+  ensure data:eq(result,w);
+  body {yield fold_bounded<2>(acc:Wide=w,i in [0..1]){yield acc;};}
+table Store capacity 4 {key id:id64<Store>;col identity:Pair [unique];col message:Message;col envelope:Envelope;}
+effect Sent(row:id64<Store>,payload:Envelope);
+effect Number(value:u64);
+effect PairValue(value:Pair);
+transition save(p:Pair,w:Wide,accept:bool) reads [] writes [Store[*].identity,Store[*].message,Store[*].envelope]
+  ensure emitted:eq(effect_arg(Sent,0,payload),wrap(p,w));
+  ensure stored:eq(Store[effect_arg(Sent,0,row)].envelope,wrap(p,w));
+  body {
+    let %e:Envelope=wrap(roundtrip(p,w),widefold(w));
+    let %k:id64<Store>=table_alloc(Store,{identity:p,message:field(%e,message),envelope:%e});
+    emit Sent(%k,%e);guard(accept,ERR_REJECT);commit;
+  }
+transition lookup(p:Pair) reads [Store[*].identity,Store[*].message] writes []
+  body {guard(table_exists_unique(Store,identity,p),ERR_MISSING);let %k:id64<Store>=table_lookup(Store,identity,p);let %m:Message=table_get(Store,%k,message);emit PairValue(unwrap(%m));commit;}
+transition wrongtag() reads [] writes []
+  body {let %p:Pair=payload<Message,Data>(variant<Message,Code>(7));commit;}
+transition lazy() reads [] writes []
+  body {let %p:Pair=select(false,payload<Message,Data>(variant<Message,Code>(7)),record<Pair>(left:9,right:0));emit PairValue(%p);commit;}
+transition ordered() reads [] writes []
+  ensure first:eq(effect_arg(Number,0,value),2);
+  ensure second:eq(effect_arg(Number,1,value),1);
+  ensure fields:eq(effect_arg(PairValue,2,value),record<Pair>(left:11,right:22));
+  body {
+    let %p:Pair=record<Pair>(
+      right:fold_bounded<1>(acc:bytes32=0,i in [0..0]){emit Number(2);yield 22;},
+      left:fold_bounded<1>(acc:u64=0,i in [0..0]){emit Number(1);yield 11;}
+    );
+    emit PairValue(%p);commit;
+  }
+transition inspect(m:Message) reads [] writes []
+  body {let %p:Pair=unwrap(m);emit PairValue(%p);commit;}

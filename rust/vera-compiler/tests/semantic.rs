@@ -277,13 +277,22 @@ fn aggregate_domains_and_scalar_narrowing_are_resolved_before_backends() {
     let program = analyze(parse_source("table T capacity 2 {key id:id64<T>;col v:u8 [tracked_sum];}transition go() reads [T[*].v] writes [] ensure total:le(add(sum(T.v),1),1000);body {let %narrow:u8=sum(T.v);let %again:u8=%narrow;commit;}").unwrap()).unwrap();
     let transition = &program.transitions()[0];
     let condition = program.expr(transition.ensures[0].value);
-    assert_eq!(condition.domain.scalar, ScalarType::Bool);
-    assert_eq!(condition.domain.width, 8);
+    assert_eq!(
+        condition.domain.scalar_domain().unwrap().scalar,
+        ScalarType::Bool
+    );
+    assert_eq!(condition.domain.scalar_domain().unwrap().width, 8);
     let ExprKind::Binary { left, right, .. } = condition.kind else {
         panic!("comparison missing")
     };
-    assert_eq!(program.expr(left).domain.width, 128);
-    assert_eq!(program.expr(right).domain.width, 128);
+    assert_eq!(
+        program.expr(left).domain.scalar_domain().unwrap().width,
+        128
+    );
+    assert_eq!(
+        program.expr(right).domain.scalar_domain().unwrap().width,
+        128
+    );
     let ExprKind::Constant(ref value) = program.expr(right).kind else {
         panic!("contextual literal missing")
     };
@@ -292,11 +301,14 @@ fn aggregate_domains_and_scalar_narrowing_are_resolved_before_backends() {
         panic!("scalar boundary missing")
     };
     assert_eq!(program.binding(binding).ty, ScalarType::U8);
-    assert_eq!(program.expr(value).domain.width, 128);
+    assert_eq!(
+        program.expr(value).domain.scalar_domain().unwrap().width,
+        128
+    );
     let StmtKind::Let { value, .. } = transition.body[1].kind else {
         panic!("later binding missing")
     };
-    assert_eq!(program.expr(value).domain.width, 8);
+    assert_eq!(program.expr(value).domain.scalar_domain().unwrap().width, 8);
 }
 
 #[test]

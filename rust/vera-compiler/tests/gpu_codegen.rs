@@ -609,3 +609,212 @@ assert(transition_v_round(&ctx)==3u);assert(transition_v_promoted(&ctx)==1u);
 "#,
     );
 }
+
+#[test]
+fn native_gpu_records_unions_functions_and_structured_tables_execute() {
+    let source = include_str!("fixtures/gpu_structured.vera");
+    run_cpp(
+        source,
+        r#"
+Ctx ctx{};vera_init(&ctx);
+VeraT0 p=vera_type_0_zero();p.f_0=v_small(7u);p.f_1=v_make(1u,2u,3u,4u,5u,6u,7u,8u);
+VeraT1 w=vera_type_1_zero();w.f_0=v_make(9u,10u,11u,12u,13u,14u,15u,16u);w.f_1=v_make(17u,18u,19u,20u,21u,22u,23u,24u);
+assert(transition_v_save(&ctx,p,w,v_zero())==0u);assert(ctx.s.effect_count==0u);
+assert(transition_v_save(&ctx,p,w,v_small(1u))==1u);assert(ctx.s.effect_count==1u);
+assert(transition_v_lookup(&ctx,p)==1u);assert(ctx.s.effect_count==2u);
+assert(transition_v_save(&ctx,p,w,v_small(1u))==0u);assert(ctx.s.effect_count==2u);
+assert(transition_v_wrongtag(&ctx)==3u);assert(ctx.s.effect_count==2u);
+assert(transition_v_lazy(&ctx)==1u);assert(transition_v_ordered(&ctx)==1u);
+assert(vera_type_1_eq(ctx.s.col_0_2[0].f_1,w));
+assert(ctx.s.col_0_2[0].f_1.f_1.w[7]==24u);
+VeraT0 invalid=p;invalid.f_0.w[2]=1u;assert(transition_v_save(&ctx,invalid,w,v_small(1u))==0u);
+"#,
+    );
+    let program = checked(source);
+    let code = generate_wgsl(&program, 2).unwrap();
+    let module = naga::front::wgsl::parse_str(&code)
+        .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&code)));
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+#[test]
+fn gpu_structured_hash_matches_canonical_bytes_including_union_padding() {
+    use vera_compiler::{
+        ir::VariantId,
+        types::{mix64, ValueType},
+        value::{encode_value, Value},
+    };
+    let source="record R {flag:bool;amount:i64;blob:bytes32;} union U {Large:R;Small:u8;} transition go() reads [] writes [] body {commit;}";
+    let program = checked(source);
+    let record_id = program.type_id("R").unwrap();
+    let union_id = program.type_id("U").unwrap();
+    let record = Value::Record {
+        ty: record_id,
+        fields: vec![
+            Value::Bool(true),
+            Value::Int((-3).into()),
+            Value::Int((BigInt::from(1u8) << 248usize) + 7u8),
+        ],
+    };
+    let values = [
+        record.clone(),
+        Value::Variant {
+            ty: union_id,
+            tag: VariantId(0),
+            payload: Box::new(record),
+        },
+        Value::Variant {
+            ty: union_id,
+            tag: VariantId(1),
+            payload: Box::new(Value::Int(9.into())),
+        },
+    ];
+    let types = [
+        ValueType::Named(record_id),
+        ValueType::Named(union_id),
+        ValueType::Named(union_id),
+    ];
+    let hashes = values
+        .iter()
+        .zip(&types)
+        .map(|(v, t)| {
+            let bytes = encode_value(&program, v, t).unwrap();
+            mix64(bytes.iter().fold(14695981039346656037u64, |h, b| {
+                (h ^ u64::from(*b)).wrapping_mul(1099511628211)
+            }))
+        })
+        .collect::<Vec<_>>();
+    let main = format!(
+        r#"
+VeraT0 r=vera_type_0_zero();r.f_0=v_small(1u);r.f_1=v_neg(v_small(3u));r.f_2=v_make(7u,0u,0u,0u,0u,0u,0u,16777216u);
+V h=vera_type_0_hash(r);assert(h.w[0]=={}u&&h.w[1]=={}u);
+VeraT1 u=vera_type_1_zero();u.p0=r;h=vera_type_1_hash(u);assert(h.w[0]=={}u&&h.w[1]=={}u);
+u.tag=1u;u.p1=v_small(9u);h=vera_type_1_hash(u);assert(h.w[0]=={}u&&h.w[1]=={}u);
+"#,
+        hashes[0] as u32,
+        hashes[0] >> 32,
+        hashes[1] as u32,
+        hashes[1] >> 32,
+        hashes[2] as u32,
+        hashes[2] >> 32
+    );
+    run_cpp(source, &main);
+}
+
+#[test]
+fn gpu_empty_records_and_unit_union_payloads_are_real_values() {
+    let source = r#"record Unit {} union Option {None:Unit;Some:bytes32;}
+function none()->Option body {yield variant<Option,None>(record<Unit>());}
+function take(x:Option)->Unit require empty:is_variant<Option,None>(x);body {yield payload<Option,None>(x);}
+effect Saved(value:Unit,option:Option);
+transition go() reads [] writes []
+ensure unit:eq(effect_arg(Saved,0,value),record<Unit>());
+ensure variant:is_variant<Option,None>(effect_arg(Saved,0,option));
+body {let %x:Unit=take(none());emit Saved(%x,none());commit;}"#;
+    run_cpp(
+        source,
+        "Ctx ctx{};vera_init(&ctx);assert(transition_v_go(&ctx)==1u);",
+    );
+    let code = generate_wgsl(&checked(source), 2).unwrap();
+    let module = naga::front::wgsl::parse_str(&code)
+        .unwrap_or_else(|error| panic!("{}", error.emit_to_string(&code)));
+    naga::valid::Validator::new(
+        naga::valid::ValidationFlags::all(),
+        naga::valid::Capabilities::empty(),
+    )
+    .validate(&module)
+    .unwrap();
+}
+
+#[test]
+fn gpu_structured_scalar_projections_promote_and_constructors_narrow() {
+    run_cpp(
+        r#"record R {v:u64;} union U {Value:u64;}
+table T capacity 2 {key id:id64<T>;col v:u64 [tracked_sum];}
+transition fill() reads [] writes [T[*].v] body {let %k:id64<T>=table_alloc(T,{v:18446744073709551615});commit;}
+transition project() reads [T[*].v] writes [] body {
+ let %r:R=record<R>(v:18446744073709551615);
+ let %u:U=variant<U,Value>(18446744073709551615);
+ guard(eq(add(field(%r,v),field(%r,v)),sum(T.v)),ERR_BAD);
+ guard(eq(add(payload<U,Value>(%u),payload<U,Value>(%u)),sum(T.v)),ERR_BAD);
+ commit;
+}
+transition narrow_record() reads [T[*].v] writes [] body {let %r:R=record<R>(v:sum(T.v));commit;}
+transition narrow_union() reads [T[*].v] writes [] body {let %u:U=variant<U,Value>(sum(T.v));commit;}"#,
+        "Ctx ctx{};vera_init(&ctx);assert(transition_v_fill(&ctx)==1u);assert(transition_v_fill(&ctx)==1u);assert(transition_v_project(&ctx)==1u);assert(transition_v_narrow_record(&ctx)==3u);assert(transition_v_narrow_union(&ctx)==3u);",
+    );
+}
+
+#[test]
+fn gpu_nominal_type_and_call_interfaces_grow_linearly() {
+    let mut previous = None;
+    for size in [8, 16, 32] {
+        let mut source = String::from("record R {");
+        for n in 0..size {
+            source.push_str(&format!("field_{n}:u64;"));
+        }
+        source.push_str("} union U {");
+        for n in 0..size {
+            source.push_str(&format!("V{n}:R;"));
+        }
+        source.push('}');
+        source.push_str("function f0(x:R)->R body {yield x;}");
+        for n in 1..size {
+            source.push_str(&format!(
+                "function f{n}(x:R)->R body {{yield f{}(x);}}",
+                n - 1
+            ));
+        }
+        source.push_str(&format!("effect E(x:R); transition go(x:U) reads [] writes [] body {{let %r:R=f{}(payload<U,V0>(x));emit E(%r);commit;}}",size-1));
+        let start = std::time::Instant::now();
+        let code = generate_wgsl(&checked(&source), 2).unwrap();
+        let module = naga::front::wgsl::parse_str(&code).unwrap();
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::empty(),
+        )
+        .validate(&module)
+        .unwrap();
+        let expressions = module
+            .functions
+            .iter()
+            .map(|(_, f)| f.expressions.len())
+            .sum::<usize>();
+        eprintln!("structured interfaces size={size} bytes={} functions={} expressions={expressions} generation_parse_validation={:?}",code.len(),module.functions.len(),start.elapsed());
+        if let Some((bytes, functions, exprs)) = previous {
+            // Doubling fields, alternatives, and helper-chain length must not
+            // duplicate callee bodies or enumerate products of union variants.
+            assert!(code.len() < 2 * bytes);
+            assert!(module.functions.len() < 2 * functions);
+            assert!(expressions < 2 * exprs);
+        }
+        previous = Some((code.len(), module.functions.len(), expressions));
+    }
+}
+
+#[test]
+fn low64_multiplication_and_mix_match_native_reference_vectors() {
+    run_cpp(
+        "transition go() reads [] writes [] body {commit;}",
+        r#"
+const uint64_t edge[]={0,1,65535,65536,4294967295ULL,4294967296ULL,9223372036854775808ULL,18446744073709551615ULL};
+auto check=[](uint64_t a,uint64_t b){
+V av=v_make(uint32_t(a),uint32_t(a>>32),7u,9u,11u,13u,15u,17u);
+V bv=v_make(uint32_t(b),uint32_t(b>>32),19u,21u,23u,25u,27u,29u);
+V got=v_mul64(av,bv);uint64_t expected=a*b;
+assert(got.w[0]==uint32_t(expected)&&got.w[1]==uint32_t(expected>>32));
+for(unsigned i=2;i<8;++i)assert(got.w[i]==0);
+uint64_t mixed=a;mixed=(mixed^(mixed>>30))*0xbf58476d1ce4e5b9ULL;mixed=(mixed^(mixed>>27))*0x94d049bb133111ebULL;mixed^=mixed>>31;
+V h=vera_mix(av);assert(h.w[0]==uint32_t(mixed)&&h.w[1]==uint32_t(mixed>>32));for(unsigned i=2;i<8;++i)assert(h.w[i]==0);
+};
+for(uint64_t a:edge)for(uint64_t b:edge)check(a,b);
+uint64_t rng=0x3456789abcdef123ULL;
+for(unsigned i=0;i<10000;++i){rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;uint64_t a=rng;rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;check(a,rng);}
+"#,
+    );
+}

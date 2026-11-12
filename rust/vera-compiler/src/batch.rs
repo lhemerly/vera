@@ -343,6 +343,10 @@ fn value_bytes(value: &Value) -> u64 {
     size_of::<Value>() as u64
         + match value {
             Value::Bool(_) => 0,
+            Value::Record { fields, .. } => fields.iter().fold(0_u64, |total, value| {
+                total.saturating_add(value_bytes(value))
+            }),
+            Value::Variant { payload, .. } => value_bytes(payload),
             // Include allocator slack and a complete last integer limb.
             Value::Int(value) => value.bits().div_ceil(8).saturating_add(32),
         }

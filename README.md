@@ -110,7 +110,7 @@ rustc --edition 2021 --crate-type lib counter.rs
 | Feature | What it provides |
 |---|---|
 | Tables | Fixed capacity, typed generation-checked handles, unique secondary keys |
-| Values | Booleans, fixed-width integers, exact fixed-point decimals, symbols, bytes32, enums |
+| Values | Booleans, fixed-width integers, exact decimals, symbols, bytes32, enums, nominal records and tagged unions |
 | Specifications | Row/global invariants, preconditions, postconditions, old-state values |
 | Transactions | Checked reads and writes, allocation, guards, atomic commit, typed effects |
 | Folds | Inclusive declared-bounded iteration with scoped accumulator and index bindings |
@@ -139,6 +139,8 @@ variant and payload; try [the effect counter](examples/effect_counter.vera).
 opt-in controls without shrinking declared state. No proof timeout or resource
 ceiling is imposed by default. [Pure functions](docs/COMPOSITIONAL_FUNCTIONS.md)
 reuse verified summaries rather than inlining callee bodies into caller proofs.
+[Structured values](docs/STRUCTURED_VALUES.md) share canonical type definitions
+across functions, effects, storage and codecs without variant-product expansion.
 
 ## Explore a program
 

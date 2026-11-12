@@ -261,7 +261,7 @@ projection View(k:id64<T>) {
 fn malformed_or_truncated_input_returns_a_located_diagnostic() {
     for source in [
         "module", "table T capacity 1 {", "table T capacity -1 {key id:id64<T>;}",
-        "table T capacity 1 {key id:u64;}", "effect E(x:mystery);", "effect E(x:enum{});",
+        "table T capacity 1 {key id:u64;}", "effect E(x:enum{});",
         "transition go() reads [] writes [] body {}", "transition go() reads [] writes [] body {commit;commit;}",
         "transition go() reads [] writes [] body {let value:i64=1;commit;}",
         "transition go() reads [] writes [] body {let %value:i64=fold_bounded<2>(acc:i64=0,i in [0..1]) {};commit;}",

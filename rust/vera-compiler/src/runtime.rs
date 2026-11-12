@@ -17,8 +17,8 @@ use crate::ir::{
     BindingId, CheckedProgram, ColumnId, EffectId, ExprId, ExprKind, Fold, Param, Snapshot, Stmt,
     StmtKind, Table, TableId, Transition,
 };
-use crate::types::{mix64, Domain, ScalarType, MAX_PROBES};
-use crate::value::{checked_binary, checked_unary, coerce, low_u64, Value};
+use crate::types::{mix64, ExprType, ValueType, MAX_PROBES};
+use crate::value::{checked_binary, checked_unary, coerce_value, low_u64, zero_value, Value};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum FailureKind {
@@ -202,7 +202,7 @@ impl State {
             let mut aggregates = reserved(table.columns.len())?;
             let mut indexes = reserved(table.columns.len())?;
             for column in &table.columns {
-                columns.push(filled(capacity, Value::zero(&column.ty))?);
+                columns.push(filled(capacity, zero_value(program, &column.ty))?);
                 aggregates.push(column.tracked_sum.then(BigInt::zero));
                 indexes.push(match table.layout.unique_buckets[column.id.index] {
                     Some(buckets) => {
@@ -300,7 +300,7 @@ impl<'p> Machine<'p> {
             .transition_id(name)
             .map(|id| self.program.transition(id))
             .ok_or_else(|| RuntimeError::new("ERR_UNKNOWN_TRANSITION", FailureKind::Input))?;
-        let bindings = bind_params(&transition.params, args)?;
+        let bindings = bind_params(self.program, &transition.params, args)?;
         let mut staged = self.state.clone();
         let (result, bindings, mut trace) = {
             let mut evaluator = Evaluator {
@@ -333,6 +333,7 @@ impl<'p> Machine<'p> {
 }
 
 pub fn bind_params(
+    program: &CheckedProgram,
     params: &[Param],
     args: &BTreeMap<String, Value>,
 ) -> Result<BTreeMap<BindingId, Value>, RuntimeError> {
@@ -343,7 +344,8 @@ pub fn bind_params(
     params
         .iter()
         .map(|param| {
-            let value = coerce(&args[&param.name], &param.ty).map_err(|_| invalid())?;
+            let value =
+                coerce_value(program, &args[&param.name], &param.ty).map_err(|_| invalid())?;
             Ok((param.binding, value))
         })
         .collect()
@@ -351,6 +353,26 @@ pub fn bind_params(
 
 pub fn bucket_of(value: &Value, buckets: usize) -> usize {
     (mix64(low_u64(value)) & (buckets as u64 - 1)) as usize
+}
+
+fn typed_bucket(
+    program: &CheckedProgram,
+    column: ColumnId,
+    value: &Value,
+    buckets: usize,
+) -> Result<usize, RuntimeError> {
+    let ty = &program.column(column).ty;
+    if matches!(ty, ValueType::Scalar(_)) {
+        // Widened aggregate queries may legitimately lie outside the column's
+        // scalar range; they compare unequal rather than becoming state errors.
+        return Ok(bucket_of(value, buckets));
+    }
+    let value = coerce_value(program, value, ty).map_err(|_| invalid_state())?;
+    let bytes = crate::value::encode_value(program, &value, ty).map_err(|_| invalid_state())?;
+    let hash = bytes.iter().fold(14695981039346656037_u64, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(1099511628211)
+    });
+    Ok((mix64(hash) & (buckets as u64 - 1)) as usize)
 }
 
 fn table_state(state: &State, table: TableId) -> Result<&TableState, RuntimeError> {
@@ -384,7 +406,7 @@ pub fn unique_lookup(
     if index.keys.len() != buckets || index.used.len() != buckets {
         return Err(invalid_state());
     }
-    let mut position = bucket_of(value, buckets);
+    let mut position = typed_bucket(program, column, value, buckets)?;
     for distance in 0..MAX_PROBES {
         if !index.used[position] {
             return Ok(None);
@@ -398,7 +420,7 @@ pub fn unique_lookup(
         if resident == value {
             return Ok((table.occupied.get(slot) == Some(&true)).then_some(slot));
         }
-        let home = bucket_of(resident, buckets);
+        let home = typed_bucket(program, column, resident, buckets)?;
         if (position.wrapping_sub(home) & (buckets - 1)) < distance {
             return Ok(None);
         }
@@ -431,7 +453,7 @@ fn unique_insert(
     if buckets == 0 || !buckets.is_power_of_two() || index.used.len() != buckets {
         return Err(invalid_state());
     }
-    let mut position = bucket_of(&value, buckets);
+    let mut position = typed_bucket(program, column, &value, buckets)?;
     let mut distance = 0usize;
     let mut incoming = slot;
     for _ in 0..MAX_PROBES {
@@ -441,7 +463,12 @@ fn unique_insert(
             return Ok(());
         }
         let resident = index.keys[position];
-        let home = bucket_of(values.get(resident).ok_or_else(invalid_state)?, buckets);
+        let home = typed_bucket(
+            program,
+            column,
+            values.get(resident).ok_or_else(invalid_state)?,
+            buckets,
+        )?;
         let resident_distance = position.wrapping_sub(home) & (buckets - 1);
         if resident_distance < distance {
             index.keys[position] = incoming;
@@ -473,8 +500,8 @@ fn validate_rows(program: &CheckedProgram, state: &State) -> Result<(), RuntimeE
                 return Err(invalid_state());
             }
             for (slot, value) in values.iter().enumerate() {
-                coerce(value, &column.ty).map_err(|_| invalid_state())?;
-                if !table.occupied[slot] && value != &Value::zero(&column.ty) {
+                coerce_value(program, value, &column.ty).map_err(|_| invalid_state())?;
+                if !table.occupied[slot] && value != &zero_value(program, &column.ty) {
                     return Err(invalid_state());
                 }
             }
@@ -609,7 +636,7 @@ pub fn validate_state(program: &CheckedProgram, state: &State) -> Result<(), Run
             return Err(invalid_state());
         }
         for (param, value) in effect.params.iter().zip(&record.args) {
-            coerce(value, &param.ty).map_err(|_| invalid_state())?;
+            coerce_value(program, value, &param.ty).map_err(|_| invalid_state())?;
         }
     }
     check_invariants(program, state, state)
@@ -760,7 +787,8 @@ impl Evaluator<'_, '_> {
         for (param, arg) in info.params.iter().zip(args) {
             bindings.insert(
                 param.binding,
-                coerce(arg, &param.ty).map_err(|_| arithmetic().at(info.span))?,
+                coerce_value(self.program, arg, &param.ty)
+                    .map_err(|_| arithmetic().at(info.span))?,
             );
         }
         if self.record_trace {
@@ -794,7 +822,7 @@ impl Evaluator<'_, '_> {
                 }
             }
             let value = self.value(info.body, Snapshot::Current)?;
-            coerce(&value, &info.result_type)
+            coerce_value(self.program, &value, &info.result_type)
                 .map_err(|_| arithmetic().at(self.program.expr(info.body).span))
         })();
         if self.record_trace {
@@ -818,7 +846,7 @@ impl Evaluator<'_, '_> {
     fn value_inner(
         &mut self,
         kind: ExprKind,
-        domain: &Domain,
+        domain: &ExprType,
         context: Snapshot,
     ) -> Result<Value, RuntimeError> {
         match kind {
@@ -829,6 +857,63 @@ impl Evaluator<'_, '_> {
                     .collect::<Result<Vec<_>, _>>()?;
                 self.call_function(function, &values)
             }
+            ExprKind::Record { ty, fields } => {
+                let crate::ir::TypeDefinitionKind::Record(definitions) =
+                    &self.program.type_definition(ty).kind
+                else {
+                    return Err(arithmetic());
+                };
+                let mut values = definitions
+                    .iter()
+                    .map(|field| zero_value(self.program, &field.ty))
+                    .collect::<Vec<_>>();
+                for (field, expression) in fields {
+                    let value = self.value(expression, context)?;
+                    values[field.0] = coerce_value(self.program, &value, &definitions[field.0].ty)
+                        .map_err(|_| arithmetic())?;
+                }
+                Ok(Value::Record { ty, fields: values })
+            }
+            ExprKind::Field { record, field } => {
+                let Value::Record { fields, .. } = self.value(record, context)? else {
+                    return Err(arithmetic());
+                };
+                fields.get(field.0).cloned().ok_or_else(arithmetic)
+            }
+            ExprKind::Variant {
+                ty,
+                variant,
+                payload,
+            } => {
+                let value = self.value(payload, context)?;
+                let crate::ir::TypeDefinitionKind::Union(variants) =
+                    &self.program.type_definition(ty).kind
+                else {
+                    return Err(arithmetic());
+                };
+                let payload = coerce_value(self.program, &value, &variants[variant.0].payload)
+                    .map_err(|_| arithmetic())?;
+                Ok(Value::Variant {
+                    ty,
+                    tag: variant,
+                    payload: Box::new(payload),
+                })
+            }
+            ExprKind::IsVariant { value, variant } => {
+                let Value::Variant { tag, .. } = self.value(value, context)? else {
+                    return Err(arithmetic());
+                };
+                Ok(Value::Bool(tag == variant))
+            }
+            ExprKind::Payload { value, variant } => {
+                let Value::Variant { tag, payload, .. } = self.value(value, context)? else {
+                    return Err(arithmetic());
+                };
+                if tag != variant {
+                    return Err(RuntimeError::new("ERR_VARIANT_ACCESS", FailureKind::Trap));
+                }
+                Ok(*payload)
+            }
             ExprKind::Constant(value) => Ok(value),
             ExprKind::Binding(binding) => self
                 .bindings
@@ -837,12 +922,21 @@ impl Evaluator<'_, '_> {
                 .ok_or_else(|| RuntimeError::new("ERR_UNINITIALIZED", FailureKind::Trap)),
             ExprKind::Unary { op, operand } => {
                 let value = self.value(operand, context)?;
-                checked_unary(op, &value, domain).map_err(|_| arithmetic())
+                checked_unary(op, &value, domain.scalar_domain().ok_or_else(arithmetic)?)
+                    .map_err(|_| arithmetic())
             }
             ExprKind::Binary { op, left, right } => {
                 let a = self.value(left, context)?;
                 let b = self.value(right, context)?;
-                checked_binary(op, &a, &b, domain).map_err(|_| arithmetic())
+                if matches!(op, crate::ir::BinaryOp::Eq | crate::ir::BinaryOp::Ne) {
+                    return Ok(Value::Bool(if op == crate::ir::BinaryOp::Eq {
+                        a == b
+                    } else {
+                        a != b
+                    }));
+                }
+                checked_binary(op, &a, &b, domain.scalar_domain().ok_or_else(arithmetic)?)
+                    .map_err(|_| arithmetic())
             }
             ExprKind::Select { condition, yes, no } => {
                 let condition = self
@@ -945,11 +1039,12 @@ impl Evaluator<'_, '_> {
         let accumulator_type = self.program.binding(fold.accumulator).ty.clone();
         let index_type = self.program.binding(fold.index).ty.clone();
         let initial = self.value(fold.init, context)?;
-        let mut accumulator = coerce(&initial, &accumulator_type).map_err(|_| arithmetic())?;
+        let mut accumulator =
+            coerce_value(self.program, &initial, &accumulator_type).map_err(|_| arithmetic())?;
         let low = self.value(fold.lo, context)?;
-        let low = coerce(&low, &index_type).map_err(|_| arithmetic())?;
+        let low = coerce_value(self.program, &low, &index_type).map_err(|_| arithmetic())?;
         let high = self.value(fold.hi, context)?;
-        let high = coerce(&high, &index_type).map_err(|_| arithmetic())?;
+        let high = coerce_value(self.program, &high, &index_type).map_err(|_| arithmetic())?;
         let mut index = low.int().map_err(|_| arithmetic())?.clone();
         let high = high.int().map_err(|_| arithmetic())?.clone();
         let saved = self.bindings.clone();
@@ -965,8 +1060,9 @@ impl Evaluator<'_, '_> {
                     self.statement(statement, context)?;
                 }
                 let value = self.value(fold.yield_value, context)?;
-                accumulator = coerce(&value, &accumulator_type).map_err(|_| arithmetic())?;
-                if index >= index_type.max_value() {
+                accumulator = coerce_value(self.program, &value, &accumulator_type)
+                    .map_err(|_| arithmetic())?;
+                if index >= index_type.as_scalar().ok_or_else(arithmetic)?.max_value() {
                     break;
                 }
                 index += BigInt::one();
@@ -1011,8 +1107,8 @@ impl Evaluator<'_, '_> {
         match statement {
             StmtKind::Let { binding, value } => {
                 let value = self.value(*value, context)?;
-                let value =
-                    coerce(&value, &self.program.binding(*binding).ty).map_err(|_| arithmetic())?;
+                let value = coerce_value(self.program, &value, &self.program.binding(*binding).ty)
+                    .map_err(|_| arithmetic())?;
                 self.bindings.insert(*binding, value.clone());
                 self.log(
                     span,
@@ -1043,8 +1139,8 @@ impl Evaluator<'_, '_> {
                 if !table_state(self.state, column.table)?.valid(table, key) {
                     return Err(missing_row());
                 }
-                let value =
-                    coerce(&value, &self.program.column(*column).ty).map_err(|_| arithmetic())?;
+                let value = coerce_value(self.program, &value, &self.program.column(*column).ty)
+                    .map_err(|_| arithmetic())?;
                 let slot = (key & (table.capacity - 1)) as usize;
                 let old = row_value(self.state, *column, slot)?;
                 let rows = &mut self.state.tables[column.table.0];
@@ -1082,8 +1178,9 @@ impl Evaluator<'_, '_> {
                 // before table-full or generation-exhaustion handled reverts.
                 for (column, expression) in fields {
                     let value = self.value(*expression, context)?;
-                    let value = coerce(&value, &self.program.column(*column).ty)
-                        .map_err(|_| arithmetic())?;
+                    let value =
+                        coerce_value(self.program, &value, &self.program.column(*column).ty)
+                            .map_err(|_| arithmetic())?;
                     values[column.index] = Some(value);
                 }
                 let slot = table_state(self.state, *table)?
@@ -1136,7 +1233,10 @@ impl Evaluator<'_, '_> {
                 let mut values = Vec::new();
                 for (parameter, expression) in info.params.iter().zip(args) {
                     let value = self.value(*expression, context)?;
-                    values.push(coerce(&value, &parameter.ty).map_err(|_| arithmetic())?);
+                    values.push(
+                        coerce_value(self.program, &value, &parameter.ty)
+                            .map_err(|_| arithmetic())?,
+                    );
                 }
                 self.log(
                     span,
@@ -1158,7 +1258,8 @@ impl Evaluator<'_, '_> {
     }
 }
 
-fn check_aggregate(value: &BigInt, ty: &ScalarType, capacity: u64) -> Result<(), RuntimeError> {
+fn check_aggregate(value: &BigInt, ty: &ValueType, capacity: u64) -> Result<(), RuntimeError> {
+    let ty = ty.as_scalar().ok_or_else(arithmetic)?;
     if value < &(ty.min_value() * capacity) || value > &(ty.max_value() * capacity) {
         Err(arithmetic())
     } else {

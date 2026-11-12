@@ -9,7 +9,9 @@ use num_bigint::{BigInt, Sign};
 
 use crate::diagnostic::{Diagnostic, Span};
 use crate::ir::*;
-use crate::types::{Domain, ScalarType};
+use crate::types::{Domain, ExprType, ScalarType, ValueType};
+#[path = "codegen_rust/structured.rs"]
+mod structured;
 use crate::value::Value;
 
 #[derive(Clone, Copy, Debug)]
@@ -88,6 +90,10 @@ fn names_map(names: &[String], bases: Vec<String>, prefix: &str) -> Vec<String> 
 
 fn quote(value: &str) -> String {
     format!("{value:?}")
+}
+
+fn scalar(ty: &ValueType) -> &ScalarType {
+    ty.as_scalar().expect("checked scalar-only operation")
 }
 
 fn rust_type(ty: &ScalarType) -> &'static str {
@@ -227,6 +233,16 @@ impl<'a> Generator<'a> {
         for function in program.functions() {
             reserved.insert(format!("vera_function_{}", function.id.0));
         }
+        for ty in program.types() {
+            for stem in [
+                "vera_valid_type",
+                "vera_encode_type",
+                "vera_decode_type",
+                "vera_project_type",
+            ] {
+                reserved.insert(format!("{stem}_{}", ty.id.0));
+            }
+        }
         for transition in &program.transitions {
             reserved.insert(format!("transition_{}", transition.name));
         }
@@ -274,6 +290,7 @@ impl<'a> Generator<'a> {
             "InvalidEncoding",
             "EffectAccess",
             "FunctionPrecondition",
+            "VariantAccess",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -349,6 +366,7 @@ impl<'a> Generator<'a> {
         self.line("}");
         self.line(include_str!("../templates/wide.rs"));
         self.line(include_str!("../templates/codec.rs"));
+        self.named_types();
         self.effects();
         for table in &self.program.tables {
             self.emit_table(table);
@@ -393,7 +411,7 @@ impl<'a> Generator<'a> {
                 .params
                 .iter()
                 .zip(parameter_fields(&effect.params))
-                .map(|(p, name)| format!("{name}:{}", rust_type(&p.ty)))
+                .map(|(p, name)| format!("{name}:{}", self.value_rust_type(&p.ty)))
                 .collect::<Vec<_>>()
                 .join(",");
             self.line(format!("{}{{{fields}}},", self.effect_variants[index]));
@@ -420,18 +438,25 @@ impl<'a> Generator<'a> {
         for column in &table.columns {
             specifications.push((
                 format!("col_{}", column.name),
-                format!("[{};{cap}]", rust_type(&column.ty)),
-                format!("[{};{cap}]", zero(&column.ty)),
-                cap * u64::from(column.ty.bits() / 8),
+                format!("[{};{cap}]", self.value_rust_type(&column.ty)),
+                format!("[{};{cap}]", self.value_zero(&column.ty)),
+                cap * self
+                    .program
+                    .value_storage_width(&column.ty)
+                    .expect("checked value layout") as u64,
             ));
         }
         for column in &table.columns {
             if column.tracked_sum {
                 specifications.push((
                     format!("agg_sum_{}", column.name),
-                    aggregate_type(&column.ty).into(),
-                    aggregate_zero(&column.ty).into(),
-                    if column.ty.bits() > 64 { 32 } else { 16 },
+                    aggregate_type(scalar(&column.ty)).into(),
+                    aggregate_zero(scalar(&column.ty)).into(),
+                    if scalar(&column.ty).bits() > 64 {
+                        32
+                    } else {
+                        16
+                    },
                 ));
             }
         }
@@ -524,11 +549,11 @@ impl<'a> Generator<'a> {
             for column in &table.columns {
                 let cn = &column.name;
                 let suffix = self.column_functions[&column.id].clone();
-                let rt = rust_type(&column.ty);
+                let rt = self.value_rust_type(&column.ty);
                 self.line(format!("fn table_get_{suffix}(t:&Table_{tn},key:u64)->Result<{rt},ErrorCode>{{if !table_exists_{tn}(t,key){{return Err(ErrorCode::MissingRow);}}Ok(t.col_{cn}[(key&{}) as usize])}}",cap-1));
                 self.line(format!("fn table_set_{suffix}(t:&mut Table_{tn},key:u64,value:{rt})->Result<(),ErrorCode>{{if !table_exists_{tn}(t,key){{return Err(ErrorCode::MissingRow);}}let slot=(key&{}) as usize;let old=t.col_{cn}[slot];",cap-1));
                 if column.tracked_sum {
-                    self.line(format!("t.agg_sum_{cn}=t.agg_sum_{cn}.checked_sub({}).and_then(|n|n.checked_add({})).ok_or(ErrorCode::ArithOverflow)?;",aggregate_cast("old",&column.ty),aggregate_cast("value",&column.ty)));
+                    self.line(format!("t.agg_sum_{cn}=t.agg_sum_{cn}.checked_sub({}).and_then(|n|n.checked_add({})).ok_or(ErrorCode::ArithOverflow)?;",aggregate_cast("old",scalar(&column.ty)),aggregate_cast("value",scalar(&column.ty))));
                 }
                 self.line(format!("t.col_{cn}[slot]=value;Ok(())}}"));
                 if column.unique {
@@ -538,14 +563,14 @@ impl<'a> Generator<'a> {
             let params = table
                 .columns
                 .iter()
-                .map(|c| format!("field_{}:{}", c.name, rust_type(&c.ty)))
+                .map(|c| format!("field_{}:{}", c.name, self.value_rust_type(&c.ty)))
                 .collect::<Vec<_>>()
                 .join(",");
             self.line(format!("fn table_alloc_{tn}(t:&mut Table_{tn}{})->Result<u64,ErrorCode>{{let slot=(0..{cap}).find(|&i|(t.occupied_bitmap[i/64]>>(i%64))&1==0).ok_or(ErrorCode::TableFull)?;let gen=t.generation[slot];if gen==u32::MAX{{return Err(ErrorCode::GenerationExhausted);}}",if params.is_empty(){String::new()}else{format!(",{params}")}));
             for column in &table.columns {
                 let cn = &column.name;
                 if column.tracked_sum {
-                    self.line(format!("t.agg_sum_{cn}=t.agg_sum_{cn}.checked_add({}).ok_or(ErrorCode::ArithOverflow)?;",aggregate_cast(&format!("field_{cn}"),&column.ty)));
+                    self.line(format!("t.agg_sum_{cn}=t.agg_sum_{cn}.checked_add({}).ok_or(ErrorCode::ArithOverflow)?;",aggregate_cast(&format!("field_{cn}"),scalar(&column.ty))));
                 }
                 self.line(format!("t.col_{cn}[slot]=field_{cn};"));
             }
@@ -566,13 +591,15 @@ impl<'a> Generator<'a> {
         let tn = &table.name;
         let cn = &column.name;
         let suffix = self.column_functions[&column.id].clone();
-        let rt = rust_type(&column.ty);
+        let rt = self.value_rust_type(&column.ty);
         let buckets = (table.capacity * 2).max(16);
         let mask = buckets - 1;
-        let hash = if column.ty == ScalarType::Bytes32 {
-            "u64::from_le_bytes(value[..8].try_into().unwrap())"
+        let hash = if let ValueType::Named(_) = column.ty {
+            format!("{{let mut out=Vec::new();{}let mut hash=14695981039346656037u64;for byte in out{{hash=(hash^u64::from(byte)).wrapping_mul(1099511628211);}}hash}}",self.value_encode("*value",&column.ty))
+        } else if column.ty == ValueType::Scalar(ScalarType::Bytes32) {
+            "u64::from_le_bytes(value[..8].try_into().unwrap())".into()
         } else {
-            "*value as u64"
+            "*value as u64".into()
         };
         self.line(format!(
             "fn hash_bucket_{suffix}(value:&{rt})->usize{{(mix64({hash})&{mask}) as usize}}"
@@ -603,7 +630,7 @@ impl Generator<'_> {
                 self.line(format!(
                     "for value in &{object}.col_{}{{{}}}",
                     column.name,
-                    encode_scalar("*value", &column.ty)
+                    self.value_encode("*value", &column.ty)
                 ));
                 if column.tracked_sum {
                     self.line(format!(
@@ -626,7 +653,7 @@ impl Generator<'_> {
                 effect.id.0
             ));
             for (param, name) in effect.params.iter().zip(names) {
-                self.line(encode_scalar(&format!("*{name}"), &param.ty));
+                self.line(self.value_encode(&format!("*{name}"), &param.ty));
             }
             self.line("},");
         }
@@ -642,10 +669,10 @@ impl Generator<'_> {
                 self.line(format!(
                     "for value in &mut {object}.col_{}{{*value={};}}",
                     column.name,
-                    decode_scalar(&column.ty)
+                    self.value_decode(&column.ty)
                 ));
                 if column.tracked_sum {
-                    let rt = aggregate_type(&column.ty);
+                    let rt = aggregate_type(scalar(&column.ty));
                     self.line(format!(
                         "{object}.agg_sum_{}={rt}::from_le_bytes(r.take::<{}>()?);",
                         column.name,
@@ -664,7 +691,7 @@ impl Generator<'_> {
                 effect.id.0, self.effect_variants[effect.id.0]
             ));
             for (param, name) in effect.params.iter().zip(parameter_fields(&effect.params)) {
-                self.line(format!("{name}:{},", decode_scalar(&param.ty)));
+                self.line(format!("{name}:{},", self.value_decode(&param.ty)));
             }
             self.line("},");
         }
@@ -678,14 +705,13 @@ impl Generator<'_> {
             }
             for column in &table.columns {
                 let name = &column.name;
-                self.line(format!("for i in 0..{capacity}{{if ({object}.occupied_bitmap[i/64]>>(i%64))&1==0&&{object}.col_{name}[i]!={}{{return Err(ErrorCode::InvalidEncoding);}}}}",zero(&column.ty)));
-                if let ScalarType::Enum(tags) = &column.ty {
-                    if tags.len() < 256 {
-                        self.line(format!("if {object}.col_{name}.iter().any(|&value|(value as usize)>={}){{return Err(ErrorCode::InvalidEncoding);}}",tags.len()));
-                    }
+                self.line(format!("for i in 0..{capacity}{{if ({object}.occupied_bitmap[i/64]>>(i%64))&1==0&&{object}.col_{name}[i]!={}{{return Err(ErrorCode::InvalidEncoding);}}}}",self.value_zero(&column.ty)));
+                let valid = self.value_validate("*value", &column.ty);
+                if valid != "true" {
+                    self.line(format!("if {object}.col_{name}.iter().any(|value|!({valid})){{return Err(ErrorCode::InvalidEncoding);}}"));
                 }
                 if column.tracked_sum {
-                    self.line(format!("let mut total:{}={};for i in 0..{capacity}{{if ({object}.occupied_bitmap[i/64]>>(i%64))&1==1{{total=total.checked_add({}).ok_or(ErrorCode::InvalidEncoding)?;}}}}if total!={object}.agg_sum_{name}{{return Err(ErrorCode::InvalidEncoding);}}",aggregate_type(&column.ty),aggregate_zero(&column.ty),aggregate_cast(&format!("{object}.col_{name}[i]"),&column.ty)));
+                    self.line(format!("let mut total:{}={};for i in 0..{capacity}{{if ({object}.occupied_bitmap[i/64]>>(i%64))&1==1{{total=total.checked_add({}).ok_or(ErrorCode::InvalidEncoding)?;}}}}if total!={object}.agg_sum_{name}{{return Err(ErrorCode::InvalidEncoding);}}",aggregate_type(scalar(&column.ty)),aggregate_zero(scalar(&column.ty)),aggregate_cast(&format!("{object}.col_{name}[i]"),scalar(&column.ty))));
                 }
                 if column.unique {
                     let buckets = table.layout.unique_buckets[column.id.index]
@@ -724,10 +750,10 @@ impl Generator<'_> {
                 names.join(",")
             ));
             for (param, name) in effect.params.iter().zip(names) {
-                if let ScalarType::Enum(tags) = &param.ty {
+                let valid = self.value_validate(&format!("*{name}"), &param.ty);
+                if valid != "true" {
                     self.line(format!(
-                        "if (*{name} as usize)>={}{{return Err(ErrorCode::InvalidEncoding);}}",
-                        tags.len()
+                        "if !({valid}){{return Err(ErrorCode::InvalidEncoding);}}"
                     ));
                 }
             }
@@ -744,10 +770,14 @@ impl Generator<'_> {
     fn projection_value(&mut self, id: ExprId, env: &Environment) -> Result<String, Diagnostic> {
         let domain = self.expr_info(id).domain.clone();
         let value = self.expr(id, env)?;
-        Ok(self.wrap_projection_value(&value, &domain.scalar, domain.is_aggregate()))
+        Ok(self.wrap_projection_value(&value, &domain.value_type(), domain.is_aggregate()))
     }
 
-    fn wrap_projection_value(&self, value: &str, ty: &ScalarType, aggregate: bool) -> String {
+    fn wrap_projection_value(&self, value: &str, ty: &ValueType, aggregate: bool) -> String {
+        if let ValueType::Named(id) = ty {
+            return format!("vera_project_type_{}({value})", id.0);
+        }
+        let ty = scalar(ty);
         if ty.is_bool() {
             format!("ProjectionValue::Bool({value})")
         } else if *ty == ScalarType::Bytes32 {
@@ -764,6 +794,16 @@ impl Generator<'_> {
         match &self.expr_info(id).kind {
             ExprKind::Binding(binding) => {
                 result.insert(*binding);
+            }
+            ExprKind::Record { fields, .. } => {
+                for (_, id) in fields {
+                    self.expression_bindings(*id, result);
+                }
+            }
+            ExprKind::Field { record, .. } => self.expression_bindings(*record, result),
+            ExprKind::Variant { payload, .. } => self.expression_bindings(*payload, result),
+            ExprKind::IsVariant { value, .. } | ExprKind::Payload { value, .. } => {
+                self.expression_bindings(*value, result)
             }
             ExprKind::Call { args, .. } => {
                 for id in args {
@@ -883,11 +923,18 @@ impl Generator<'_> {
 
     fn projections(&mut self) -> Result<(), Diagnostic> {
         self.line(include_str!("../templates/projections.rs"));
+        self.named_projection_helpers();
         for projection in self.program.projections.clone() {
             let params = projection
                 .params
                 .iter()
-                .map(|p| format!(",{}:{}", self.binding(p.binding), rust_type(&p.ty)))
+                .map(|p| {
+                    format!(
+                        ",{}:{}",
+                        self.binding(p.binding),
+                        self.value_rust_type(&p.ty)
+                    )
+                })
                 .collect::<String>();
             let env = projection
                 .params
@@ -896,11 +943,10 @@ impl Generator<'_> {
                 .collect::<Environment>();
             self.line(format!("pub fn project_{}(state:&State{params})->Result<ProjectionFrame,ErrorCode>{{let pre=state;let mut frame=ProjectionFrame{{projection:{},allowed:false,reason:\"\",cells:Vec::new(),affordances:Vec::new()}};",projection.name,quote(&projection.name)));
             for param in &projection.params {
-                if let ScalarType::Enum(tags) = &param.ty {
+                let valid = self.value_validate(&self.binding(param.binding), &param.ty);
+                if valid != "true" {
                     self.line(format!(
-                        "if ({} as usize)>={}{{return Err(ErrorCode::InvalidEncoding);}}",
-                        self.binding(param.binding),
-                        tags.len()
+                        "if !({valid}){{return Err(ErrorCode::InvalidEncoding);}}"
                     ));
                 }
             }
@@ -967,11 +1013,12 @@ impl Generator<'_> {
             if seeded || table.capacity < 2 {
                 continue;
             }
-            let Some(column) = table
-                .columns
-                .iter()
-                .find(|c| matches!(c.ty, ScalarType::I64 | ScalarType::Dec64 | ScalarType::U64))
-            else {
+            let Some(column) = table.columns.iter().find(|c| {
+                matches!(
+                    c.ty,
+                    ValueType::Scalar(ScalarType::I64 | ScalarType::Dec64 | ScalarType::U64)
+                )
+            }) else {
                 continue;
             };
             seeded = true;
@@ -989,13 +1036,14 @@ impl Generator<'_> {
                 .zip(parameter_fields(&transition.params))
                 .map(|(param, name)| {
                     let value = match &param.ty {
-                        ScalarType::Id64(table) => {
+                        ValueType::Scalar(ScalarType::Id64(table)) => {
                             format!("1u64<<KEY_BITS_{}", self.table_constants[table.0])
                         }
-                        ScalarType::Bool => "false".into(),
-                        ScalarType::Bytes32 => "[0u8;32]".into(),
-                        ScalarType::Enum(_) => "0".into(),
-                        ScalarType::U8 | ScalarType::U16 => "1".into(),
+                        ValueType::Scalar(ScalarType::Bool) => "false".into(),
+                        ValueType::Scalar(ScalarType::Bytes32) => "[0u8;32]".into(),
+                        ValueType::Scalar(ScalarType::Enum(_)) => "0".into(),
+                        ValueType::Scalar(ScalarType::U8 | ScalarType::U16) => "1".into(),
+                        ValueType::Named(_) => self.value_zero(&param.ty),
                         _ => "100000000".into(),
                     };
                     format!("{name}:{value}")
@@ -1072,6 +1120,9 @@ impl Generator<'_> {
                 }
             }
             Value::Int(value) => format!("{value}{}", rust_type(&domain.scalar)),
+            Value::Record { .. } | Value::Variant { .. } => {
+                unreachable!("structured constant in scalar literal")
+            }
         }
     }
 
@@ -1079,12 +1130,12 @@ impl Generator<'_> {
         &mut self,
         id: ExprId,
         env: &Environment,
-        ty: &ScalarType,
+        ty: &ValueType,
     ) -> Result<String, Diagnostic> {
         let value = self.expr(id, env)?;
         if self.expr_info(id).domain.is_aggregate() {
-            let native = if ty.signed() { "i128" } else { "u128" };
-            Ok(format!("{}::try_from(({value}).to_{native}().ok_or(ErrorCode::ArithOverflow)?).map_err(|_|ErrorCode::ArithOverflow)?", rust_type(ty)))
+            let native = if scalar(ty).signed() { "i128" } else { "u128" };
+            Ok(format!("{}::try_from(({value}).to_{native}().ok_or(ErrorCode::ArithOverflow)?).map_err(|_|ErrorCode::ArithOverflow)?", self.value_rust_type(ty)))
         } else {
             Ok(value)
         }
@@ -1096,12 +1147,23 @@ impl Generator<'_> {
         if domain.is_aggregate() {
             Ok(value)
         } else {
-            let native = if domain.signed() { "i128" } else { "u128" };
+            let native = if domain
+                .scalar_domain()
+                .expect("checked scalar expression")
+                .signed()
+            {
+                "i128"
+            } else {
+                "u128"
+            };
             Ok(format!("I256::from_{native}(({value}) as {native})"))
         }
     }
 
-    fn carrier(&self, value: String, domain: &Domain) -> String {
+    fn carrier(&self, value: String, expression_type: &ExprType) -> String {
+        let Some(domain) = expression_type.scalar_domain() else {
+            return value;
+        };
         if domain.is_aggregate() && domain.width == 128 {
             let native = if domain.signed() { "i128" } else { "u128" };
             format!("{{let v={value};I256::from_{native}(v.to_{native}().ok_or(ErrorCode::ArithOverflow)?)}}")
@@ -1124,6 +1186,8 @@ impl Generator<'_> {
                     | ExprKind::EffectArg { .. }
                     | ExprKind::EffectCount
                     | ExprKind::Call { .. }
+                    | ExprKind::Field { .. }
+                    | ExprKind::Payload { .. }
             );
         let state_name = |snapshot| {
             if snapshot == Snapshot::Pre {
@@ -1133,6 +1197,66 @@ impl Generator<'_> {
             }
         };
         let value = match expression.kind {
+            ExprKind::Record { ty, fields } => {
+                let TypeDefinitionKind::Record(definitions) =
+                    &self.program.type_definition(ty).kind
+                else {
+                    unreachable!("checked record")
+                };
+                let names = self.record_field_names(ty);
+                let mut prefix = String::from("{");
+                let mut values = Vec::new();
+                for (field, id) in fields {
+                    let value = self.narrowed(id, env, &definitions[field.0].ty)?;
+                    let local = self.fresh("field");
+                    prefix.push_str(&format!("let {local}={value};"));
+                    values.push(format!("{}:{local}", names[field.0]));
+                }
+                format!(
+                    "{prefix}{}{{{}}}}}",
+                    self.value_rust_type(&ValueType::Named(ty)),
+                    values.join(",")
+                )
+            }
+            ExprKind::Field { record, field } => {
+                let ValueType::Named(ty) = self.expr_info(record).domain.value_type() else {
+                    unreachable!("checked record")
+                };
+                let value = self.expr(record, env)?;
+                format!("({value}).{}", self.record_field_names(ty)[field.0])
+            }
+            ExprKind::Variant {
+                ty,
+                variant,
+                payload,
+            } => {
+                let TypeDefinitionKind::Union(variants) = &self.program.type_definition(ty).kind
+                else {
+                    unreachable!("checked union")
+                };
+                let value = self.narrowed(payload, env, &variants[variant.0].payload)?;
+                format!(
+                    "{}::{}({value})",
+                    self.value_rust_type(&ValueType::Named(ty)),
+                    self.union_variant_names(ty)[variant.0]
+                )
+            }
+            ExprKind::IsVariant { value, variant } | ExprKind::Payload { value, variant } => {
+                let ValueType::Named(ty) = self.expr_info(value).domain.value_type() else {
+                    unreachable!("checked union")
+                };
+                let value = self.expr(value, env)?;
+                let pattern = format!(
+                    "{}::{}",
+                    self.value_rust_type(&ValueType::Named(ty)),
+                    self.union_variant_names(ty)[variant.0]
+                );
+                if matches!(expression.kind, ExprKind::IsVariant { .. }) {
+                    format!("matches!({value},{pattern}(_))")
+                } else {
+                    format!("{{match {value}{{{pattern}(payload)=>payload,_=>return Err(ErrorCode::VariantAccess)}}}}")
+                }
+            }
             ExprKind::Call { function, args } => {
                 let callee = self.program.function(function);
                 let mut source = String::from("{");
@@ -1142,7 +1266,7 @@ impl Generator<'_> {
                     let local = self.fresh("argument");
                     source.push_str(&format!(
                         "let {local}:{}={value};",
-                        rust_type(&parameter.ty)
+                        self.value_rust_type(&parameter.ty)
                     ));
                     values.push(local);
                 }
@@ -1153,7 +1277,7 @@ impl Generator<'_> {
                 ));
                 source
             }
-            ExprKind::Constant(value) => self.scalar_literal(&value, &domain),
+            ExprKind::Constant(value) => self.value_literal(&value, &domain),
             ExprKind::Binding(binding) => env
                 .get(&binding)
                 .cloned()
@@ -1179,14 +1303,17 @@ impl Generator<'_> {
                 let at = self.fresh("a");
                 let bt = self.fresh("b");
                 let rt = if wide {
-                    "I256"
+                    "I256".to_string()
                 } else {
-                    rust_type(&self.expr_info(left).domain.scalar)
+                    self.value_rust_type(&self.expr_info(left).domain.value_type())
                 };
                 let mut prefix = format!("{{let {at}:{rt}={a};let {bt}:{rt}={b};");
                 if wide
-                    && domain.width == 128
-                    && domain.signed()
+                    && domain.scalar_domain().is_some_and(|d| d.width == 128)
+                    && domain
+                        .scalar_domain()
+                        .expect("checked scalar expression")
+                        .signed()
                     && matches!(op, BinaryOp::Div | BinaryOp::Rem)
                 {
                     prefix.push_str(&format!("if {at}==I256::from_i128(i128::MIN)&&{bt}==I256::from_i128(-1){{return Err(ErrorCode::ArithOverflow);}}"));
@@ -1207,9 +1334,15 @@ impl Generator<'_> {
                     format!("{prefix}{at}{symbol}{bt}}}")
                 } else if matches!(op, BinaryOp::Min | BinaryOp::Max) {
                     format!("{prefix}std::cmp::{}({at},{bt})}}", op.name())
-                } else if domain.scalar.is_decimal() && matches!(op, BinaryOp::Mul | BinaryOp::Div)
+                } else if domain.as_scalar().is_some_and(ScalarType::is_decimal)
+                    && matches!(op, BinaryOp::Mul | BinaryOp::Div)
                 {
-                    let scale = 10u128.pow(domain.scale());
+                    let scale = 10u128.pow(
+                        domain
+                            .scalar_domain()
+                            .expect("checked numeric expression")
+                            .scale(),
+                    );
                     if wide {
                         format!(
                             "{prefix}decimal_wide_{}({at},{bt},{scale}u128)?}}",
@@ -1284,10 +1417,10 @@ impl Generator<'_> {
                 if exists_only {
                     format!(
                         "{{let {temp}:{}={value};{lookup}.is_some()}}",
-                        rust_type(&ty)
+                        self.value_rust_type(&ty)
                     )
                 } else {
-                    format!("{{let {temp}:{}={value};let slot={lookup}.ok_or(ErrorCode::MissingRow)?;(({state}.{field}.generation[slot] as u64)<<{})|slot as u64}}", rust_type(&ty), table.key_bits())
+                    format!("{{let {temp}:{}={value};let slot={lookup}.ok_or(ErrorCode::MissingRow)?;(({state}.{field}.generation[slot] as u64)<<{})|slot as u64}}", self.value_rust_type(&ty), table.key_bits())
                 }
             }
             ExprKind::Sum { column, state } => {
@@ -1298,12 +1431,12 @@ impl Generator<'_> {
                     self.field(column.table),
                     column_info.name
                 );
-                if column_info.ty.bits() > 64 {
+                if scalar(&column_info.ty).bits() > 64 {
                     value
                 } else {
                     format!(
                         "I256::from_{}({value})",
-                        if column_info.ty.signed() {
+                        if scalar(&column_info.ty).signed() {
                             "i128"
                         } else {
                             "u128"
@@ -1344,7 +1477,15 @@ impl Generator<'_> {
             ExprKind::Fold(fold) => self.fold(&fold, env)?,
         };
         Ok(if promote {
-            let native = if domain.signed() { "i128" } else { "u128" };
+            let native = if domain
+                .scalar_domain()
+                .expect("checked scalar expression")
+                .signed()
+            {
+                "i128"
+            } else {
+                "u128"
+            };
             format!("I256::from_{native}(({value}) as {native})")
         } else {
             value
@@ -1363,13 +1504,16 @@ impl Generator<'_> {
             let index_type = self.program.binding(fold.index).ty.clone();
             self.line("{");
             let init = self.narrowed(fold.init, env, &acc_type)?;
-            self.line(format!("let mut {acc}:{}={init};", rust_type(&acc_type)));
+            self.line(format!(
+                "let mut {acc}:{}={init};",
+                self.value_rust_type(&acc_type)
+            ));
             let lo = self.narrowed(fold.lo, env, &index_type)?;
             let hi_value = self.narrowed(fold.hi, env, &index_type)?;
             self.line(format!(
                 "let mut {idx}:{}={lo};let {hi}:{}={hi_value};",
-                rust_type(&index_type),
-                rust_type(&index_type)
+                self.value_rust_type(&index_type),
+                self.value_rust_type(&index_type)
             ));
             let mut inner = env.clone();
             inner.insert(fold.accumulator, acc.clone());
@@ -1400,7 +1544,7 @@ impl Generator<'_> {
                 let ty = self.program.binding(*binding).ty.clone();
                 let value = self.narrowed(*value, env, &ty)?;
                 let name = self.binding(*binding);
-                self.line(format!("let {name}:{}={value};", rust_type(&ty)));
+                self.line(format!("let {name}:{}={value};", self.value_rust_type(&ty)));
                 env.insert(*binding, name);
             }
             StmtKind::Guard { condition, code } => {
@@ -1432,7 +1576,7 @@ impl Generator<'_> {
                     let ty = self.column(*column).ty.clone();
                     let value = self.narrowed(*id, env, &ty)?;
                     let temp = self.fresh("field");
-                    self.line(format!("let {temp}:{}={value};", rust_type(&ty)));
+                    self.line(format!("let {temp}:{}={value};", self.value_rust_type(&ty)));
                     values.insert(*column, temp);
                 }
                 let arguments = self
@@ -1456,7 +1600,10 @@ impl Generator<'_> {
                 for ((id, param), field) in args.iter().zip(&effect_info.params).zip(fields) {
                     let value = self.narrowed(*id, env, &param.ty)?;
                     let temp = self.fresh("effect");
-                    self.line(format!("let {temp}:{}={value};", rust_type(&param.ty)));
+                    self.line(format!(
+                        "let {temp}:{}={value};",
+                        self.value_rust_type(&param.ty)
+                    ));
                     assignments.push(format!("{field}:{temp}"));
                 }
                 self.line(format!(
@@ -1478,13 +1625,19 @@ impl Generator<'_> {
         let params = function
             .params
             .iter()
-            .map(|p| format!("{}:{}", self.binding(p.binding), rust_type(&p.ty)))
+            .map(|p| {
+                format!(
+                    "{}:{}",
+                    self.binding(p.binding),
+                    self.value_rust_type(&p.ty)
+                )
+            })
             .collect::<Vec<_>>()
             .join(",");
         self.line(format!(
             "fn vera_function_{}({params})->Result<{},ErrorCode>{{",
             function.id.0,
-            rust_type(&function.result_type)
+            self.value_rust_type(&function.result_type)
         ));
         let env = function
             .params
@@ -1507,7 +1660,13 @@ impl Generator<'_> {
         let params = transition
             .params
             .iter()
-            .map(|p| format!(",{}:{}", self.binding(p.binding), rust_type(&p.ty)))
+            .map(|p| {
+                format!(
+                    ",{}:{}",
+                    self.binding(p.binding),
+                    self.value_rust_type(&p.ty)
+                )
+            })
             .collect::<String>();
         let args = transition
             .params
@@ -1518,15 +1677,9 @@ impl Generator<'_> {
             .params
             .iter()
             .filter_map(|p| {
-                if let ScalarType::Enum(tags) = &p.ty {
-                    Some(format!(
-                        "if ({} as usize)>={}{{return Err(ErrorCode::InvalidEncoding);}}",
-                        self.binding(p.binding),
-                        tags.len()
-                    ))
-                } else {
-                    None
-                }
+                let valid = self.value_validate(&self.binding(p.binding), &p.ty);
+                (valid != "true")
+                    .then(|| format!("if !({valid}){{return Err(ErrorCode::InvalidEncoding);}}"))
             })
             .collect::<String>();
         self.line(format!("pub fn {}(state:&mut State{params})->Result<(),ErrorCode>{{{checks}let mut staged=state.clone();let outcome=transition_{}(&mut staged,state{args});if outcome.is_ok(){{*state=staged;}}outcome}}",self.transition_functions[index],transition.name));
@@ -1600,7 +1753,7 @@ impl Generator<'_> {
                 .params
                 .iter()
                 .zip(names)
-                .map(|(p, name)| format!("{name}:{}", rust_type(&p.ty)))
+                .map(|(p, name)| format!("{name}:{}", self.value_rust_type(&p.ty)))
                 .collect::<Vec<_>>()
                 .join(",");
             self.line(format!(
@@ -1638,7 +1791,7 @@ impl Generator<'_> {
                 names.join(",")
             ));
             for (param, name) in transition.params.iter().zip(names) {
-                self.line(encode_scalar(&format!("*{name}"), &param.ty));
+                self.line(self.value_encode(&format!("*{name}"), &param.ty));
             }
             self.line(format!("{}u32}},", transition.id.0));
         }
@@ -1654,7 +1807,7 @@ impl Generator<'_> {
                 .iter()
                 .zip(parameter_fields(&transition.params))
             {
-                self.line(format!("{name}:{},", decode_scalar(&param.ty)));
+                self.line(format!("{name}:{},", self.value_decode(&param.ty)));
             }
             self.line("},");
         }

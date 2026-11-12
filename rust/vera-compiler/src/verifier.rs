@@ -20,7 +20,7 @@ use num_bigint::BigInt;
 use num_traits::{One, ToPrimitive};
 use serde::Serialize;
 use z3::{
-    ast::{Bool, BV},
+    ast::{Ast, Bool, Dynamic, BV},
     SatResult, Solver,
 };
 
@@ -31,8 +31,8 @@ use crate::{
         eval_expression, rebuild_indexes, recompute_aggregates, validate_state, FailureKind,
         Machine, RuntimeError, State, TraceStep,
     },
-    types::{Domain, ScalarType},
-    value::Value,
+    types::{Domain, ExprType, ScalarType, ValueType},
+    value::{coerce_value, value_to_json, zero_value, Value},
 };
 use terms::{
     and, arithmetic, boolean, bv, cmp, eq, extend, fits, implies, ite, not, or, truncate, Path,
@@ -83,6 +83,8 @@ impl ObligationResult {
 pub struct Counterexample {
     pub target_kind: String,
     pub return_value: Option<Value>,
+    /// Source-named canonical JSON for an independently replayed function return.
+    pub typed_return_value: Option<EffectArgument>,
     pub transition: String,
     pub obligation: String,
     pub law: String,
@@ -230,10 +232,10 @@ struct Write {
 
 #[derive(Clone)]
 enum Location {
-    Parameter(String, ScalarType),
+    Parameter(String, ValueType),
     Occupied(TableId, usize),
     Generation(TableId, usize),
-    Column(ColumnId, usize, ScalarType),
+    Column(ColumnId, usize, ValueType),
 }
 
 #[derive(Clone)]
@@ -280,16 +282,92 @@ fn diagnostic(code: &str, message: impl Into<String>, span: Span) -> Diagnostic 
     }
 }
 
-fn sort(domain: &Domain) -> Sort {
-    if domain.scalar.is_bool() {
-        Sort::Bool
-    } else {
-        Sort::Bits(u32::from(domain.width))
+fn sort(domain: &ExprType) -> Sort {
+    match domain {
+        ExprType::Named(id) => Sort::Named(*id),
+        ExprType::Scalar(domain) if domain.scalar.is_bool() => Sort::Bool,
+        ExprType::Scalar(domain) => Sort::Bits(u32::from(domain.width)),
     }
 }
-
-fn scalar_sort(ty: &ScalarType) -> Sort {
-    sort(&Domain::scalar(ty.clone()))
+fn value_sort(ty: &ValueType) -> Sort {
+    match ty {
+        ValueType::Named(id) => Sort::Named(*id),
+        ValueType::Scalar(ty) if ty.is_bool() => Sort::Bool,
+        ValueType::Scalar(ty) => Sort::Bits(u32::from(ty.bits())),
+    }
+}
+fn expr_signed(domain: &ExprType) -> bool {
+    domain.as_scalar().is_some_and(ScalarType::signed)
+}
+fn value_signed(ty: &ValueType) -> bool {
+    ty.as_scalar().is_some_and(ScalarType::signed)
+}
+fn scalar_domain(domain: &ExprType) -> &Domain {
+    domain.scalar_domain().expect("resolved scalar operation")
+}
+fn constructor(ty: TypeId, variant: Option<VariantId>) -> String {
+    variant.map_or_else(
+        || format!("record_{}", ty.0),
+        |v| format!("variant_{}_{}", ty.0, v.0),
+    )
+}
+fn selector(ty: TypeId, field: usize) -> String {
+    format!("field_{}_{}", ty.0, field)
+}
+fn payload_selector(ty: TypeId, variant: VariantId) -> String {
+    format!("payload_{}_{}", ty.0, variant.0)
+}
+fn application(name: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        name.to_owned()
+    } else {
+        format!("({name} {})", args.join(" "))
+    }
+}
+fn valid_value(ty: &ValueType, text: &str) -> String {
+    match ty {
+        ValueType::Named(id) => format!("(valid_{} {text})", id.0),
+        ValueType::Scalar(ScalarType::Enum(tags)) if tags.len() < 256 => {
+            cmp("lt", text, &bv(tags.len(), 8), false)
+        }
+        _ => "true".into(),
+    }
+}
+fn zero_term(ty: &ValueType) -> String {
+    match ty {
+        ValueType::Named(id) => format!("zero_{}", id.0),
+        ValueType::Scalar(ty) if ty.is_bool() => "false".into(),
+        ValueType::Scalar(ty) => bv(0, u32::from(ty.bits())),
+    }
+}
+fn value_literal(program: &CheckedProgram, value: &Value, ty: &ValueType) -> String {
+    match (value, ty) {
+        (Value::Bool(value), _) => boolean(*value),
+        (Value::Int(value), ValueType::Scalar(ty)) => bv(value.clone(), u32::from(ty.bits())),
+        (Value::Record { ty, fields }, _) => {
+            let TypeDefinitionKind::Record(defs) = &program.type_definition(*ty).kind else {
+                unreachable!("typed record")
+            };
+            application(
+                &constructor(*ty, None),
+                &fields
+                    .iter()
+                    .zip(defs)
+                    .map(|(v, d)| value_literal(program, v, &d.ty))
+                    .collect::<Vec<_>>(),
+            )
+        }
+        (Value::Variant { ty, tag, payload }, _) => {
+            let TypeDefinitionKind::Union(defs) = &program.type_definition(*ty).kind else {
+                unreachable!("typed variant")
+            };
+            application(
+                &constructor(*ty, Some(*tag)),
+                &[value_literal(program, payload, &defs[tag.0].payload)],
+            )
+        }
+        _ => unreachable!("typed scalar literal"),
+    }
 }
 
 impl<'a> Encoding<'a> {
@@ -380,6 +458,7 @@ impl<'a> Encoding<'a> {
             effect_args: BTreeMap::new(),
             effect_count: Term::bits(bv(0, 64), 64),
         };
+        this.declare_types()?;
         for table in tables {
             let mut rows = Vec::new();
             for slot in 0..table.capacity as usize {
@@ -398,15 +477,11 @@ impl<'a> Encoding<'a> {
                 for column in &table.columns {
                     let term = this.input(
                         &format!("pre_t{}_s{slot}_c{}", table.id.0, column.id.index),
-                        scalar_sort(&column.ty),
+                        value_sort(&column.ty),
                         Location::Column(column.id, slot, column.ty.clone()),
                     );
-                    this.constrain_domain(&term, &Domain::scalar(column.ty.clone()));
-                    let zero = if column.ty.is_bool() {
-                        "false".into()
-                    } else {
-                        bv(0, u32::from(column.ty.bits()))
-                    };
+                    this.constrain_value(&term, &column.ty);
+                    let zero = zero_term(&column.ty);
                     this.script
                         .assert(implies(&not(&occupied.text), &eq(&term.text, &zero)));
                     columns.push(term);
@@ -423,7 +498,7 @@ impl<'a> Encoding<'a> {
                 let inverse = format!("pre_t{}_c{}_inverse", table.id.0, column.id.index);
                 this.script.declaration(format!(
                     "(declare-const {inverse} (Array {} (_ BitVec 64)))",
-                    scalar_sort(&column.ty).smt()
+                    value_sort(&column.ty).smt()
                 ));
                 for (slot, row) in rows.iter().enumerate() {
                     this.check_script_budget(column.span)?;
@@ -439,7 +514,13 @@ impl<'a> Encoding<'a> {
             let mut aggregates = Vec::new();
             for column in &table.columns {
                 aggregates.push(if column.tracked_sum {
-                    let width = u32::from(column.ty.aggregate_width());
+                    let width = u32::from(
+                        column
+                            .ty
+                            .as_scalar()
+                            .expect("tracked scalar")
+                            .aggregate_width(),
+                    );
                     let mut total = bv(0, width);
                     // Unoccupied physical columns are constrained to zero by
                     // the state schema, so this is precisely the live-row sum.
@@ -452,7 +533,12 @@ impl<'a> Encoding<'a> {
                                 "sum_prefix",
                                 format!(
                                     "(bvadd {total} {})",
-                                    extend(&value.text, value.width(), width, column.ty.signed())
+                                    extend(
+                                        &value.text,
+                                        value.width(),
+                                        width,
+                                        value_signed(&column.ty)
+                                    )
                                 ),
                                 Sort::Bits(width),
                             )
@@ -470,10 +556,10 @@ impl<'a> Encoding<'a> {
         for parameter in &transition.params {
             let term = this.input(
                 &format!("p_{}", parameter.binding.0),
-                scalar_sort(&parameter.ty),
+                value_sort(&parameter.ty),
                 Location::Parameter(parameter.name.clone(), parameter.ty.clone()),
             );
-            this.constrain_domain(&term, &Domain::scalar(parameter.ty.clone()));
+            this.constrain_value(&term, &parameter.ty);
             this.env.insert(parameter.binding, term);
         }
         let pre_invariants = if target_function.is_some() {
@@ -542,13 +628,128 @@ impl<'a> Encoding<'a> {
         term
     }
 
-    fn constrain_domain(&mut self, term: &Term, domain: &Domain) {
-        if let ScalarType::Enum(tags) = &domain.scalar {
-            if tags.len() < 256 {
-                self.script
-                    .assert(cmp("lt", &term.text, &bv(tags.len(), term.width()), false));
+    /// Datatypes encode products/sums directly. Shared validity predicates
+    /// constrain enum leaves without Cartesian expansion of variants.
+    fn declare_types(&mut self) -> LowerResult<()> {
+        if self.program.types().is_empty() {
+            return Ok(());
+        }
+        self.script.enable_datatypes();
+        let headers = self
+            .program
+            .types()
+            .iter()
+            .map(|d| format!("(type_{} 0)", d.id.0))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let mut definitions = Vec::new();
+        for definition in self.program.types() {
+            let id = definition.id;
+            let constructors = match &definition.kind {
+                TypeDefinitionKind::Record(fields) => vec![format!(
+                    "({} {})",
+                    constructor(id, None),
+                    fields
+                        .iter()
+                        .map(|f| format!("({} {})", selector(id, f.id.0), value_sort(&f.ty).smt()))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )],
+                TypeDefinitionKind::Union(variants) => variants
+                    .iter()
+                    .map(|v| {
+                        format!(
+                            "({} ({} {}))",
+                            constructor(id, Some(v.id)),
+                            payload_selector(id, v.id),
+                            value_sort(&v.payload).smt()
+                        )
+                    })
+                    .collect(),
+            };
+            definitions.push(format!("({})", constructors.join(" ")));
+        }
+        self.script.declaration(format!(
+            "(declare-datatypes ({headers}) ({}))",
+            definitions.join(" ")
+        ));
+        // The semantic arena rejects by-value cycles. Emit helpers in dependency
+        // order even when declarations refer forward in the source file.
+        let mut done = BTreeSet::new();
+        while done.len() < self.program.types().len() {
+            let before = done.len();
+            for definition in self.program.types() {
+                if done.contains(&definition.id) {
+                    continue;
+                }
+                let children = match &definition.kind {
+                    TypeDefinitionKind::Record(fields) => {
+                        fields.iter().map(|f| &f.ty).collect::<Vec<_>>()
+                    }
+                    TypeDefinitionKind::Union(variants) => {
+                        variants.iter().map(|v| &v.payload).collect()
+                    }
+                };
+                if children
+                    .iter()
+                    .any(|ty| matches!(ty,ValueType::Named(id) if !done.contains(id)))
+                {
+                    continue;
+                }
+                let id = definition.id;
+                let (zero, valid) = match &definition.kind {
+                    TypeDefinitionKind::Record(fields) => (
+                        application(
+                            &constructor(id, None),
+                            &fields.iter().map(|f| zero_term(&f.ty)).collect::<Vec<_>>(),
+                        ),
+                        and(fields
+                            .iter()
+                            .map(|f| valid_value(&f.ty, &format!("({} x)", selector(id, f.id.0))))),
+                    ),
+                    TypeDefinitionKind::Union(variants) => {
+                        let first = variants.first().expect("nonempty checked union");
+                        (
+                            application(
+                                &constructor(id, Some(first.id)),
+                                &[zero_term(&first.payload)],
+                            ),
+                            or(variants.iter().map(|v| {
+                                and([
+                                    format!("((_ is {}) x)", constructor(id, Some(v.id))),
+                                    valid_value(
+                                        &v.payload,
+                                        &format!("({} x)", payload_selector(id, v.id)),
+                                    ),
+                                ])
+                            })),
+                        )
+                    }
+                };
+                self.script.declaration(format!(
+                    "(define-fun zero_{} () type_{} {zero})",
+                    id.0, id.0
+                ));
+                self.script.declaration(format!(
+                    "(define-fun valid_{} ((x type_{})) Bool {valid})",
+                    id.0, id.0
+                ));
+                done.insert(id);
+                self.check_script_budget(definition.span)?;
+            }
+            if done.len() == before {
+                return Err(diagnostic(
+                    "D_VERIFY_LOWER",
+                    "cyclic structured type reached verifier",
+                    self.transition.span,
+                ));
             }
         }
+        Ok(())
+    }
+
+    fn constrain_value(&mut self, term: &Term, ty: &ValueType) {
+        self.script.assert(valid_value(ty, &term.text));
     }
 
     fn state(&self, snapshot: Snapshot) -> &SymbolicState {
@@ -559,11 +760,11 @@ impl<'a> Encoding<'a> {
         }
     }
 
-    fn coerce(&self, value: &Term, domain: &Domain, signed: bool) -> Term {
-        if value.sort == Sort::Bool {
+    fn coerce(&self, value: &Term, domain: &ExprType, signed: bool) -> Term {
+        if value.sort == Sort::Bool || matches!(domain, ExprType::Named(_)) {
             return value.clone();
         }
-        let width = u32::from(domain.width);
+        let width = u32::from(scalar_domain(domain).width);
         Term::bits(
             if value.width() > width {
                 truncate(&value.text, value.width(), width)
@@ -578,14 +779,26 @@ impl<'a> Encoding<'a> {
         self.script.bind("value", value.text, value.sort)
     }
 
-    fn narrow(&mut self, value: Term, target: &ScalarType) -> Term {
-        if target.is_bool() {
+    fn narrow(&mut self, value: Term, target: &ValueType) -> Term {
+        if let ValueType::Named(_) = target {
+            self.script
+                .trap_if(&mut self.path, &not(&valid_value(target, &value.text)));
             return value;
         }
-        let width = u32::from(target.bits());
-        let okay = fits(&value.text, value.width(), width, target.signed());
-        self.script.trap_if(&mut self.path, &not(&okay));
-        self.coerce(&value, &Domain::scalar(target.clone()), target.signed())
+        let ty = target.as_scalar().expect("scalar narrowing");
+        if ty.is_bool() {
+            return value;
+        }
+        let width = u32::from(ty.bits());
+        self.script.trap_if(
+            &mut self.path,
+            &not(&fits(&value.text, value.width(), width, ty.signed())),
+        );
+        self.coerce(
+            &value,
+            &ExprType::Scalar(Domain::scalar(ty.clone())),
+            ty.signed(),
+        )
     }
 
     fn expr_at(&mut self, id: ExprId, snapshot: Snapshot) -> LowerResult<Term> {
@@ -685,11 +898,11 @@ impl<'a> Encoding<'a> {
             }))
     }
 
-    fn sum(&mut self, column: ColumnId, snapshot: Snapshot, domain: &Domain) -> Term {
+    fn sum(&mut self, column: ColumnId, snapshot: Snapshot, domain: &ExprType) -> Term {
         let total = self.state(snapshot).aggregates[column.table.0][column.index]
             .as_ref()
             .expect("resolved tracked sum");
-        self.coerce(total, domain, domain.signed())
+        self.coerce(total, domain, expr_signed(domain))
     }
 
     fn update_aggregate(
@@ -705,7 +918,7 @@ impl<'a> Encoding<'a> {
         // Carriers cover capacity times the full scalar range. Removing one
         // live scalar and adding its replacement cannot overflow that carrier.
         let width = previous.width();
-        let signed = self.program.column(column).ty.signed();
+        let signed = value_signed(&self.program.column(column).ty);
         let previous_text = previous.text.clone();
         let base = old.map_or_else(
             || previous_text.clone(),
@@ -750,12 +963,102 @@ impl<'a> Encoding<'a> {
         );
         let domain = &expression.domain;
         let value = match expression.kind {
-            ExprKind::Constant(value) => match value {
-                Value::Bool(value) => Term::boolean(boolean(value)),
-                Value::Int(value) => {
-                    Term::bits(bv(value, u32::from(domain.width)), u32::from(domain.width))
+            ExprKind::Constant(value) => {
+                let text = match &value {
+                    Value::Int(v) => bv(v.clone(), u32::from(scalar_domain(domain).width)),
+                    _ => value_literal(self.program, &value, &domain.value_type()),
+                };
+                Term {
+                    text,
+                    sort: sort(domain),
                 }
-            },
+            }
+            ExprKind::Record { ty, fields } => {
+                let TypeDefinitionKind::Record(definitions) =
+                    &self.program.type_definition(ty).kind
+                else {
+                    unreachable!("record IR")
+                };
+                let mut values = BTreeMap::new();
+                for (field, expression) in fields {
+                    let value = self.expr(expression)?;
+                    values.insert(field, self.narrow(value, &definitions[field.0].ty));
+                }
+                Term {
+                    text: application(
+                        &constructor(ty, None),
+                        &definitions
+                            .iter()
+                            .map(|f| values[&f.id].text.clone())
+                            .collect::<Vec<_>>(),
+                    ),
+                    sort: Sort::Named(ty),
+                }
+            }
+            ExprKind::Field { record, field } => {
+                let value = self.expr(record)?;
+                let Sort::Named(ty) = value.sort else {
+                    unreachable!("record receiver")
+                };
+                let TypeDefinitionKind::Record(definitions) =
+                    &self.program.type_definition(ty).kind
+                else {
+                    unreachable!("record receiver")
+                };
+                Term {
+                    text: format!("({} {})", selector(ty, field.0), value.text),
+                    sort: value_sort(&definitions[field.0].ty),
+                }
+            }
+            ExprKind::Variant {
+                ty,
+                variant,
+                payload,
+            } => {
+                let TypeDefinitionKind::Union(definitions) = &self.program.type_definition(ty).kind
+                else {
+                    unreachable!("union IR")
+                };
+                let value = self.expr(payload)?;
+                let value = self.narrow(value, &definitions[variant.0].payload);
+                Term {
+                    text: application(&constructor(ty, Some(variant)), &[value.text]),
+                    sort: Sort::Named(ty),
+                }
+            }
+            ExprKind::IsVariant { value, variant } => {
+                let value = self.expr(value)?;
+                let Sort::Named(ty) = value.sort else {
+                    unreachable!("union receiver")
+                };
+                Term::boolean(format!(
+                    "((_ is {}) {})",
+                    constructor(ty, Some(variant)),
+                    value.text
+                ))
+            }
+            ExprKind::Payload { value, variant } => {
+                let value = self.expr(value)?;
+                let Sort::Named(ty) = value.sort else {
+                    unreachable!("union receiver")
+                };
+                self.script.trap_if(
+                    &mut self.path,
+                    &not(&format!(
+                        "((_ is {}) {})",
+                        constructor(ty, Some(variant)),
+                        value.text
+                    )),
+                );
+                let TypeDefinitionKind::Union(definitions) = &self.program.type_definition(ty).kind
+                else {
+                    unreachable!("union receiver")
+                };
+                Term {
+                    text: format!("({} {})", payload_selector(ty, variant), value.text),
+                    sort: value_sort(&definitions[variant.0].payload),
+                }
+            }
             ExprKind::Binding(binding) => self.env.get(&binding).cloned().ok_or_else(|| {
                 diagnostic(
                     "D_VERIFY_LOWER",
@@ -768,14 +1071,17 @@ impl<'a> Encoding<'a> {
                 match op {
                     UnaryOp::Not => Term::boolean(not(&value.text)),
                     UnaryOp::Neg => {
-                        let value =
-                            self.coerce(&value, domain, self.program.expr(operand).domain.signed());
+                        let value = self.coerce(
+                            &value,
+                            domain,
+                            expr_signed(&self.program.expr(operand).domain),
+                        );
                         let wide = value.width() + 1;
                         let result = format!(
                             "(bvneg {})",
-                            extend(&value.text, value.width(), wide, domain.signed())
+                            extend(&value.text, value.width(), wide, expr_signed(domain))
                         );
-                        let okay = fits(&result, wide, value.width(), domain.signed());
+                        let okay = fits(&result, wide, value.width(), expr_signed(domain));
                         self.script.trap_if(&mut self.path, &not(&okay));
                         Term::bits(truncate(&result, wide, value.width()), value.width())
                     }
@@ -794,7 +1100,7 @@ impl<'a> Encoding<'a> {
                 } else if op.comparison() {
                     let left_domain = &self.program.expr(left).domain;
                     let right_domain = &self.program.expr(right).domain;
-                    if a.sort == Sort::Bool {
+                    if a.sort == Sort::Bool || matches!(a.sort, Sort::Named(_)) {
                         Term::boolean(if op == BinaryOp::Eq {
                             eq(&a.text, &b.text)
                         } else {
@@ -802,26 +1108,36 @@ impl<'a> Encoding<'a> {
                         })
                     } else {
                         let carrier = Domain {
-                            scalar: left_domain.scalar.clone(),
-                            width: left_domain.width.max(right_domain.width),
+                            scalar: scalar_domain(left_domain).scalar.clone(),
+                            width: scalar_domain(left_domain)
+                                .width
+                                .max(scalar_domain(right_domain).width),
                         };
-                        let a = self.coerce(&a, &carrier, left_domain.signed());
-                        let b = self.coerce(&b, &carrier, right_domain.signed());
+                        let a = self.coerce(
+                            &a,
+                            &ExprType::Scalar(carrier.clone()),
+                            expr_signed(left_domain),
+                        );
+                        let b = self.coerce(
+                            &b,
+                            &ExprType::Scalar(carrier.clone()),
+                            expr_signed(right_domain),
+                        );
                         Term::boolean(cmp(op.name(), &a.text, &b.text, carrier.signed()))
                     }
                 } else {
-                    let a = self.coerce(&a, domain, self.program.expr(left).domain.signed());
-                    let b = self.coerce(&b, domain, self.program.expr(right).domain.signed());
+                    let a = self.coerce(&a, domain, expr_signed(&self.program.expr(left).domain));
+                    let b = self.coerce(&b, domain, expr_signed(&self.program.expr(right).domain));
                     let (value, okay) = arithmetic(
                         op.name(),
                         &a.text,
                         &b.text,
-                        u32::from(domain.width),
-                        domain.signed(),
-                        domain.scale(),
+                        u32::from(scalar_domain(domain).width),
+                        expr_signed(domain),
+                        scalar_domain(domain).scale(),
                     );
                     self.script.trap_if(&mut self.path, &not(&okay));
-                    Term::bits(value, u32::from(domain.width))
+                    Term::bits(value, u32::from(scalar_domain(domain).width))
                 }
             }
             ExprKind::Select { condition, yes, no } => {
@@ -832,10 +1148,16 @@ impl<'a> Encoding<'a> {
                 self.path.active = and([outer.clone(), not(&condition.text)]);
                 let no_value = self.expr(no)?;
                 self.path.active = outer;
-                let yes_value =
-                    self.coerce(&yes_value, domain, self.program.expr(yes).domain.signed());
-                let no_value =
-                    self.coerce(&no_value, domain, self.program.expr(no).domain.signed());
+                let yes_value = self.coerce(
+                    &yes_value,
+                    domain,
+                    expr_signed(&self.program.expr(yes).domain),
+                );
+                let no_value = self.coerce(
+                    &no_value,
+                    domain,
+                    expr_signed(&self.program.expr(no).domain),
+                );
                 Term {
                     text: ite(&condition.text, &yes_value.text, &no_value.text),
                     sort: sort(domain),
@@ -870,7 +1192,7 @@ impl<'a> Encoding<'a> {
                     let resident = self.coerce(
                         &row.columns[column.index],
                         &value_domain,
-                        self.program.column(column).ty.signed(),
+                        value_signed(&self.program.column(column).ty),
                     );
                     let found = and([row.occupied.text.clone(), eq(&value.text, &resident.text)]);
                     key = ite(&found, &self.key(column.table, slot, &row.generation), &key);
@@ -888,7 +1210,7 @@ impl<'a> Encoding<'a> {
             ExprKind::KeyOf { table: _, value } => {
                 let input = self.expr(value)?;
                 let input_domain = &self.program.expr(value).domain;
-                self.coerce(&input, domain, input_domain.signed())
+                self.coerce(&input, domain, expr_signed(input_domain))
             }
             ExprKind::Call { function, args } => {
                 self.function_call(function, &args, expression.span)?
@@ -907,7 +1229,7 @@ impl<'a> Encoding<'a> {
                 let hit = self.effect_hit(effect, &index);
                 self.script.trap_if(&mut self.path, &not(&hit));
                 let parameter_type = &self.program.effect(effect).params[parameter].ty;
-                let element = scalar_sort(parameter_type);
+                let element = value_sort(parameter_type);
                 let array = self
                     .effect_args
                     .get(&(effect, parameter))
@@ -920,11 +1242,11 @@ impl<'a> Encoding<'a> {
                     ),
                     sort: element,
                 };
-                self.coerce(&value, domain, domain.signed())
+                self.coerce(&value, domain, expr_signed(domain))
             }
             ExprKind::Fold(fold) => self.fold(&fold)?,
         };
-        let value = self.coerce(&value, domain, domain.signed());
+        let value = self.coerce(&value, domain, expr_signed(domain));
         Ok(if direct { value } else { self.bind(value) })
     }
 
@@ -959,12 +1281,12 @@ impl<'a> Encoding<'a> {
             let parameters = function
                 .params
                 .iter()
-                .map(|p| scalar_sort(&p.ty).smt())
+                .map(|p| value_sort(&p.ty).smt())
                 .collect::<Vec<_>>()
                 .join(" ");
             self.script.declaration(format!(
                 "(declare-fun {symbol} ({parameters}) {})",
-                scalar_sort(&function.result_type).smt()
+                value_sort(&function.result_type).smt()
             ));
         }
         let application = if values.is_empty() {
@@ -981,17 +1303,13 @@ impl<'a> Encoding<'a> {
         };
         let result = self.bind(Term {
             text: application,
-            sort: scalar_sort(&function.result_type),
+            sort: value_sort(&function.result_type),
         });
         let active = and([self.path.live.clone(), self.path.active.clone()]);
-        if let ScalarType::Enum(tags) = &function.result_type {
-            if tags.len() < 256 {
-                self.script.assert(implies(
-                    &active,
-                    &cmp("lt", &result.text, &bv(tags.len(), result.width()), false),
-                ));
-            }
-        }
+        self.script.assert(implies(
+            &active,
+            &valid_value(&function.result_type, &result.text),
+        ));
         self.env.insert(function.result, result.clone());
         for ensure in &function.ensures {
             let condition = self.spec(ensure.value, false)?;
@@ -1011,6 +1329,12 @@ impl<'a> Encoding<'a> {
                 match element {
                     Sort::Bits(w) => w,
                     Sort::Bool => 1,
+                    Sort::Named(id) => {
+                        return format!(
+                            "((as const (Array (_ BitVec 64) type_{})) zero_{})",
+                            id.0, id.0
+                        )
+                    }
                 },
             )
         };
@@ -1315,7 +1639,14 @@ impl<'a> Encoding<'a> {
         let hi = self.narrow(hi, &self.program.binding(fold.index).ty);
         let outer_env = self.env.clone();
         let outer_active = self.path.active.clone();
-        let index_domain = Domain::scalar(self.program.binding(fold.index).ty.clone());
+        let index_domain = Domain::scalar(
+            self.program
+                .binding(fold.index)
+                .ty
+                .as_scalar()
+                .expect("integer index")
+                .clone(),
+        );
         let index_width = lo.width();
         let extra = (u32::BITS - fold.limit.max(1).leading_zeros()) + 1;
         let wide = index_width + extra;
@@ -1457,6 +1788,18 @@ fn row_local(
     let own_key =
         |key| matches!(program.expr(key).kind, ExprKind::Binding(binding) if binding == quantifier);
     match &program.expr(expression).kind {
+        ExprKind::Record { fields, .. } => fields
+            .iter()
+            .all(|(_, e)| row_local(program, *e, table, quantifier, stable_occupancy)),
+        ExprKind::Field { record, .. } => {
+            row_local(program, *record, table, quantifier, stable_occupancy)
+        }
+        ExprKind::Variant { payload, .. } => {
+            row_local(program, *payload, table, quantifier, stable_occupancy)
+        }
+        ExprKind::IsVariant { value, .. } | ExprKind::Payload { value, .. } => {
+            row_local(program, *value, table, quantifier, stable_occupancy)
+        }
         ExprKind::Constant(_) => true,
         ExprKind::Binding(binding) => *binding == quantifier,
         ExprKind::Unary { operand, .. } => {
@@ -1538,8 +1881,102 @@ fn parse_bv(text: &str) -> Result<BigInt, String> {
         .ok_or_else(|| format!("unsupported Z3 model numeral {text}"))
 }
 
-fn model_term(model: &z3::Model, term: &Term) -> Result<Value, String> {
+/// Read native constructor ASTs, never parse printed datatype expressions.
+fn model_value(
+    program: &CheckedProgram,
+    model: &z3::Model,
+    expression: &Dynamic,
+    ty: &ValueType,
+) -> Result<Value, String> {
+    let value = model
+        .eval(expression, true)
+        .ok_or("missing structured model value")?;
+    let result = match ty {
+        ValueType::Scalar(ScalarType::Bool) => Value::Bool(
+            value
+                .as_bool()
+                .and_then(|v| v.as_bool())
+                .ok_or("model boolean sort mismatch")?,
+        ),
+        ValueType::Scalar(scalar) => {
+            let bits = value.as_bv().ok_or("model scalar sort mismatch")?;
+            if bits.get_size() != u32::from(scalar.bits()) {
+                return Err("model scalar width mismatch".into());
+            }
+            scalar_signed_value(Value::Int(parse_bv(&bits.to_string())?), scalar)
+        }
+        ValueType::Named(id) => {
+            if value.as_datatype().is_none() {
+                return Err("model datatype sort mismatch".into());
+            }
+            let name = value.decl().name();
+            match &program.type_definition(*id).kind {
+                TypeDefinitionKind::Record(fields) => {
+                    if name != constructor(*id, None) || value.num_children() != fields.len() {
+                        return Err("model record constructor mismatch".into());
+                    }
+                    let mut values = Vec::new();
+                    for field in fields {
+                        values.push(model_value(
+                            program,
+                            model,
+                            &value.nth_child(field.id.0).ok_or("missing record child")?,
+                            &field.ty,
+                        )?);
+                    }
+                    Value::Record {
+                        ty: *id,
+                        fields: values,
+                    }
+                }
+                TypeDefinitionKind::Union(variants) => {
+                    let variant = variants
+                        .iter()
+                        .find(|v| name == constructor(*id, Some(v.id)))
+                        .ok_or("model union constructor mismatch")?;
+                    if value.num_children() != 1 {
+                        return Err("model union payload arity mismatch".into());
+                    }
+                    let payload = model_value(
+                        program,
+                        model,
+                        &value.nth_child(0).ok_or("missing union payload")?,
+                        &variant.payload,
+                    )?;
+                    Value::Variant {
+                        ty: *id,
+                        tag: variant.id,
+                        payload: Box::new(payload),
+                    }
+                }
+            }
+        }
+    };
+    coerce_value(program, &result, ty)
+}
+fn model_named_constant(model: &z3::Model, name: &str) -> Option<Dynamic> {
+    model
+        .iter()
+        .find(|decl| decl.arity() == 0 && decl.name() == name)
+        .map(|decl| decl.apply(&[]))
+}
+fn typed_signed_value(value: Value, ty: &ValueType) -> Value {
+    match ty {
+        ValueType::Scalar(ty) => scalar_signed_value(value, ty),
+        ValueType::Named(_) => value,
+    }
+}
+
+fn model_term(program: &CheckedProgram, model: &z3::Model, term: &Term) -> Result<Value, String> {
     match term.sort {
+        Sort::Named(id) => {
+            let Some(expression) = model_named_constant(model, &term.text) else {
+                // Z3 omits unconstrained constants; canonical zero is one valid
+                // completion, subsequently independently checked by replay.
+                return Ok(zero_value(program, &ValueType::Named(id)));
+            };
+            model_value(program, model, &expression, &ValueType::Named(id))
+        }
         Sort::Bool => {
             let expression = Bool::new_const(term.text.as_str());
             model
@@ -1560,6 +1997,14 @@ fn model_term(model: &z3::Model, term: &Term) -> Result<Value, String> {
 
 fn model_equality(model: &z3::Model, term: &Term) -> Result<Bool, String> {
     match term.sort {
+        Sort::Named(_) => {
+            let expression = model_named_constant(model, &term.text)
+                .ok_or("unconstrained datatype has no blocking declaration")?;
+            model
+                .eval(&expression, true)
+                .map(|value| expression.eq(&value))
+                .ok_or_else(|| format!("missing datatype model value {}", term.text))
+        }
         Sort::Bool => {
             let expression = Bool::new_const(term.text.as_str());
             model
@@ -1577,7 +2022,7 @@ fn model_equality(model: &z3::Model, term: &Term) -> Result<Bool, String> {
     }
 }
 
-fn signed_value(value: Value, ty: &ScalarType) -> Value {
+fn scalar_signed_value(value: Value, ty: &ScalarType) -> Value {
     match value {
         Value::Int(value)
             if ty.signed() && value >= (BigInt::one() << (u32::from(ty.bits()) - 1)) =>
@@ -1600,10 +2045,10 @@ fn project(encoding: &Encoding<'_>, model: &z3::Model) -> Result<Candidate, Stri
     };
     let mut params = BTreeMap::new();
     for variable in &encoding.projections {
-        let value = model_term(model, &variable.term)?;
+        let value = model_term(encoding.program, model, &variable.term)?;
         match &variable.location {
             Location::Parameter(name, ty) => {
-                params.insert(name.clone(), signed_value(value, ty));
+                params.insert(name.clone(), typed_signed_value(value, ty));
             }
             Location::Occupied(table, slot) => {
                 state.tables[table.0].occupied[*slot] = value.boolean()?;
@@ -1615,7 +2060,8 @@ fn project(encoding: &Encoding<'_>, model: &z3::Model) -> Result<Candidate, Stri
                     .ok_or("generation model exceeds u32")?;
             }
             Location::Column(column, slot, ty) => {
-                state.tables[column.table.0].columns[column.index][*slot] = signed_value(value, ty);
+                state.tables[column.table.0].columns[column.index][*slot] =
+                    typed_signed_value(value, ty);
             }
         }
     }
@@ -1670,14 +2116,16 @@ fn emitted_effects(program: &CheckedProgram, pre: &State, current: &State) -> Ve
                 .zip(&record.args)
                 .map(|(parameter, value)| {
                     let scalar_type = match &parameter.ty {
-                        ScalarType::Id64(table) => format!("id64<{}>", program.table(*table).name),
-                        ty => ty.to_string(),
+                        ValueType::Scalar(ScalarType::Id64(table)) => {
+                            format!("id64<{}>", program.table(*table).name)
+                        }
+                        ty => program.value_type_name(ty),
                     };
                     (
                         parameter.name.clone(),
                         EffectArgument {
                             scalar_type,
-                            value: value.to_json(&parameter.ty),
+                            value: value_to_json(program, value, &parameter.ty),
                         },
                     )
                 })
@@ -1814,7 +2262,11 @@ fn replay_function(
         .first()
         .cloned()
         .unwrap_or_else(|| "concrete returning function execution".into());
-    Ok(Counterexample {target_kind:"function".into(),return_value,transition:function.name.clone(),obligation:obligation.name().into(),law,params:candidate.params.clone(),pre_state:candidate.state.clone(),trace,failure,violated,emitted_effects:Vec::new(),failed_ensures:details,directive:"Correct the function body or its independently justified contract; callers cannot assume an unproved summary.".into()})
+    let typed_return_value = return_value.as_ref().map(|value| EffectArgument {
+        scalar_type: encoding.program.value_type_name(&function.result_type),
+        value: value_to_json(encoding.program, value, &function.result_type),
+    });
+    Ok(Counterexample {target_kind:"function".into(),return_value,typed_return_value,transition:function.name.clone(),obligation:obligation.name().into(),law,params:candidate.params.clone(),pre_state:candidate.state.clone(),trace,failure,violated,emitted_effects:Vec::new(),failed_ensures:details,directive:"Correct the function body or its independently justified contract; callers cannot assume an unproved summary.".into()})
 }
 
 fn replay(
@@ -1899,6 +2351,7 @@ fn replay(
     Ok(Counterexample {
         target_kind: "transition".into(),
         return_value: None,
+        typed_return_value: None,
         transition: encoding.transition.name.clone(),
         obligation: obligation.name().into(),
         law,
@@ -1989,20 +2442,26 @@ fn solve(
                         .projections
                         .iter()
                         .map(|variable| {
-                            model_term(&model, &variable.term).map(|value| {
+                            model_term(encoding.program, &model, &variable.term).map(|value| {
                                 let literal = match value {
                                     Value::Bool(value) => boolean(value),
                                     Value::Int(value) => bv(value, variable.term.width()),
+                                    value @ (Value::Record { ty, .. }
+                                    | Value::Variant { ty, .. }) => value_literal(
+                                        encoding.program,
+                                        &value,
+                                        &ValueType::Named(ty),
+                                    ),
                                 };
                                 eq(&variable.term.text, &literal)
                             })
                         })
                         .collect::<Result<Vec<_>, _>>();
                     match project(encoding, &model)
-                        .and_then(|candidate| replay(encoding, &candidate, obligation))
+                        .map(|candidate| replay(encoding, &candidate, obligation))
                     {
-                        Ok(witness) => return ("sat", None, Some(witness)),
-                        Err(reason) if encoding.summary_calls > 0 => {
+                        Ok(Ok(witness)) => return ("sat", None, Some(witness)),
+                        Ok(Err(reason)) if encoding.summary_calls > 0 => {
                             return (
                                 "unknown",
                                 Some(format!(
@@ -2011,7 +2470,9 @@ fn solve(
                                 None,
                             );
                         }
-                        Err(reason) => {
+                        // Index/state materialization failures are independent
+                        // of summary precision; continue physical candidates.
+                        Err(reason) | Ok(Err(reason)) => {
                             last_spurious = Some(reason);
                         }
                     }
@@ -2243,6 +2704,12 @@ fn statement_dependencies(
 fn expression_dependencies(program: &CheckedProgram, id: ExprId, out: &mut BTreeSet<FunctionId>) {
     let mut children = Vec::new();
     match &program.expr(id).kind {
+        ExprKind::Record { fields, .. } => children.extend(fields.iter().map(|(_, e)| *e)),
+        ExprKind::Field { record, .. } => children.push(*record),
+        ExprKind::Variant { payload, .. } => children.push(*payload),
+        ExprKind::IsVariant { value, .. } | ExprKind::Payload { value, .. } => {
+            children.push(*value)
+        }
         ExprKind::Call { function, args } => {
             out.insert(*function);
             children.extend(args);

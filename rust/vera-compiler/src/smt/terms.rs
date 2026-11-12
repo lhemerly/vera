@@ -6,6 +6,7 @@ use num_bigint::BigInt;
 pub(super) enum Sort {
     Bool,
     Bits(u32),
+    Named(crate::ir::TypeId),
 }
 
 impl Sort {
@@ -13,6 +14,7 @@ impl Sort {
         match self {
             Self::Bool => "Bool".into(),
             Self::Bits(width) => format!("(_ BitVec {width})"),
+            Self::Named(id) => format!("type_{}", id.0),
         }
     }
 }
@@ -42,6 +44,7 @@ impl Term {
         match self.sort {
             Sort::Bits(width) => width,
             Sort::Bool => 1,
+            Sort::Named(_) => panic!("named value has no numeric width"),
         }
     }
 }
@@ -187,6 +190,7 @@ pub(super) struct Script {
     bytes: usize,
     max_bytes: Option<usize>,
     exceeded: bool,
+    datatypes: bool,
 }
 
 impl Script {
@@ -198,7 +202,12 @@ impl Script {
             bytes: 0,
             max_bytes,
             exceeded: false,
+            datatypes: false,
         }
+    }
+
+    pub fn enable_datatypes(&mut self) {
+        self.datatypes = true;
     }
 
     pub fn bytes(&self) -> usize {
@@ -281,7 +290,12 @@ impl Script {
     }
 
     pub fn query(&self, assertion: &str, timeout_ms: Option<u32>) -> String {
-        let mut lines = vec!["(set-logic QF_AUFBV)".into()];
+        let mut lines = vec![if self.datatypes {
+            "(set-logic ALL)"
+        } else {
+            "(set-logic QF_AUFBV)"
+        }
+        .into()];
         if let Some(timeout_ms) = timeout_ms {
             lines.push(format!("(set-option :timeout {timeout_ms})"));
         }

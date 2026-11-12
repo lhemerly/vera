@@ -13,7 +13,7 @@ use crate::ir::{
 use crate::runtime::{
     bind_params, eval_expression, validate_state, FailureKind, RuntimeError, State,
 };
-use crate::types::ScalarType;
+use crate::types::{ScalarType, ValueType};
 use crate::value::Value;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -21,16 +21,18 @@ pub struct ParameterBounds {
     pub min: Option<Value>,
     pub max: Option<Value>,
     pub exact: Option<Value>,
-    scalar: ScalarType,
+    scalar: Option<ScalarType>,
+    exact_json: Option<Json>,
 }
 
 impl ParameterBounds {
-    fn new(scalar: ScalarType) -> Self {
+    fn new(ty: ValueType) -> Self {
         Self {
             min: None,
             max: None,
             exact: None,
-            scalar,
+            scalar: ty.as_scalar().cloned(),
+            exact_json: None,
         }
     }
 }
@@ -44,7 +46,13 @@ impl Serialize for ParameterBounds {
             ("exact", &self.exact),
         ] {
             if let Some(value) = value {
-                map.serialize_entry(name, &value.to_json(&self.scalar))?;
+                if let Some(scalar) = &self.scalar {
+                    map.serialize_entry(name, &value.to_json(scalar))?;
+                } else if name == "exact" {
+                    if let Some(json) = &self.exact_json {
+                        map.serialize_entry(name, json)?;
+                    }
+                }
             }
         }
         map.end()
@@ -84,7 +92,7 @@ pub fn build_affordance_frame(
         .projection_id(name)
         .ok_or_else(|| RuntimeError::new("D_PROJECTION", FailureKind::Input))?;
     let projection = program.projection(id);
-    let bindings = bind_params(&projection.params, args)?;
+    let bindings = bind_params(program, &projection.params, args)?;
     validate_state(program, state)?;
     let mut frame = AffordanceFrame {
         projection: name.into(),
@@ -113,7 +121,11 @@ pub fn build_affordance_frame(
             let live = rows.valid(table, key);
             let exposed = if live {
                 let slot = (key & (table.capacity - 1)) as usize;
-                rows.columns[column.id.index][slot].to_json(&column.ty)
+                crate::value::value_to_json(
+                    program,
+                    &rows.columns[column.id.index][slot],
+                    &column.ty,
+                )
             } else {
                 Json::Null
             };
@@ -127,7 +139,11 @@ pub fn build_affordance_frame(
                 if let Some(key) = rows.key_at(table, slot) {
                     let mut row = serde_json::Map::new();
                     row.insert("id".into(), Json::from(key));
-                    let value = rows.columns[column.id.index][slot].to_json(&column.ty);
+                    let value = crate::value::value_to_json(
+                        program,
+                        &rows.columns[column.id.index][slot],
+                        &column.ty,
+                    );
                     if column.name == "id" {
                         row.insert("columns".into(), json!({"id": value}));
                     } else {
@@ -177,7 +193,7 @@ fn derive_bounds(
         .iter()
         .filter_map(|p| {
             args.get(&p.name)
-                .and_then(|v| crate::value::coerce(v, &p.ty).ok())
+                .and_then(|v| crate::value::coerce_value(program, v, &p.ty).ok())
                 .map(|v| (p.binding, v))
         })
         .collect();
@@ -255,7 +271,14 @@ fn collect_bound(
         return;
     };
     match op {
-        BinaryOp::Eq => bound.exact = Some(value),
+        BinaryOp::Eq => {
+            bound.exact_json = Some(crate::value::value_to_json(
+                program,
+                &value,
+                &program.binding(binding).ty,
+            ));
+            bound.exact = Some(value);
+        }
         BinaryOp::Ge | BinaryOp::Gt => {
             let Ok(number) = value.int() else {
                 return;
@@ -311,6 +334,12 @@ fn contains_binding(
         ExprKind::Constant(_) | ExprKind::Sum { .. } | ExprKind::EffectCount => {}
         ExprKind::EffectIs { index, .. } | ExprKind::EffectArg { index, .. } => {
             children.push(*index)
+        }
+        ExprKind::Record { fields, .. } => children.extend(fields.iter().map(|(_, value)| *value)),
+        ExprKind::Field { record, .. } => children.push(*record),
+        ExprKind::Variant { payload, .. } => children.push(*payload),
+        ExprKind::IsVariant { value, .. } | ExprKind::Payload { value, .. } => {
+            children.push(*value)
         }
         ExprKind::Call { args, .. } => children.extend(args),
         ExprKind::Unary { operand, .. } => children.push(*operand),

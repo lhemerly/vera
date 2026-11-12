@@ -130,9 +130,8 @@ default timeout. It correctly remained unverified.
 Arbitrary cross-row, nonlinear, or heavily nested specifications can still be
 expensive. See [proof budgets](PROOF_BUDGETS.md).
 
-General named record values, user-defined tagged payload unions,
-variable-length bounded bytes and source-language codec primitives are
-**not implemented**. Pure scalar modular verified functions are now implemented
-as a separate compositional feature. Existing distinct effect declarations
-provide typed outbox variants, not general-purpose structured values.
+Named records and tagged payload unions are now general shared value types;
+effects and compositional functions can carry them directly. See
+[structured values](STRUCTURED_VALUES.md). Variable-length bounded bytes and
+source-language codec primitives remain unimplemented.
 [Compositional functions](COMPOSITIONAL_FUNCTIONS.md) describes the implemented feature and its soundness and scaling boundaries.

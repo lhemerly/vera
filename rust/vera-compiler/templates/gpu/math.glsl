@@ -120,7 +120,10 @@ if(op<2u){V r = v_zero();if(op==0u){r=v_add(a,b);}else{r=v_sub(a,b);}bool ok = v
 }
 
 V v_mul64(V a, V b) {
-W p = w_mul(v_norm(a,64u,false),v_norm(b,64u,false));return v_norm(w_low(p),64u,false);
+// Exact low 64 bits; never construct a 512-bit product for hashing.
+uint a0=a.w[0]&65535u;uint a1=a.w[0]>>16u;uint b0=b.w[0]&65535u;uint b1=b.w[0]>>16u;
+uint p0=a0*b0;uint p1=a1*b0+(p0>>16u);uint p2=a0*b1+(p1&65535u);
+V r=v_zero();r.w[0]=(p2<<16u)|(p0&65535u);r.w[1]=a1*b1+(p1>>16u)+(p2>>16u)+a.w[1]*b.w[0]+a.w[0]*b.w[1];return r;
 }
 
 V vera_mix(V a) {

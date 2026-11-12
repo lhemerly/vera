@@ -1,0 +1,40 @@
+module StructuredMessages;
+
+record Transfer {
+  destination : u64;
+  amount : u64;
+}
+record Empty {}
+union Message {
+  Send : Transfer;
+  Cancel : u64;
+  None : Empty;
+}
+
+function transfer(destination : u64, amount : u64) -> Transfer
+  ensure destination : eq(field(result, destination), destination);
+  ensure amount : eq(field(result, amount), amount);
+  body { yield record<Transfer>(destination:destination, amount:amount); }
+
+function amount(message : Message) -> u64
+  ensure exact : eq(result,
+    select(is_variant<Message,Send>(message),
+           field(payload<Message,Send>(message), amount), 0));
+  body {
+    yield select(is_variant<Message,Send>(message),
+                 field(payload<Message,Send>(message), amount), 0);
+  }
+
+effect Routed(message : Message, amount : u64);
+transition dispatch(message : Message)
+  reads [] writes []
+  ensure count : eq(effect_count(), 1);
+  ensure kind : effect_is(Routed, 0);
+  ensure message : eq(effect_arg(Routed, 0, message), message);
+  ensure amount : eq(effect_arg(Routed, 0, amount),
+    select(is_variant<Message,Send>(message),
+           field(payload<Message,Send>(message), amount), 0));
+  body {
+    emit Routed(message, amount(message));
+    commit;
+  }

@@ -183,6 +183,9 @@ impl Parser {
     }
 
     fn declaration(&mut self) -> Result<Decl> {
+        if matches!(&self.peek().kind,TokenKind::Ident(name) if name=="record" || name=="union") {
+            return self.structured_declaration();
+        }
         if matches!(&self.peek().kind, TokenKind::Ident(name) if name == "function") {
             return self.function().map(Decl::Function);
         }
@@ -206,7 +209,7 @@ impl Parser {
         let token = self.peek().clone();
         let name = match &token.kind {
             TokenKind::Keyword(name) => name.clone(),
-            TokenKind::Ident(name) => return Err(self.error(format!("unknown type {name:?}"))),
+            TokenKind::Ident(name) => name.clone(),
             _ => return Err(self.error(format!("expected type but found {:?}", token.text))),
         };
         let mut type_args = Vec::new();
@@ -238,6 +241,9 @@ impl Parser {
                     }
                 }
                 self.expect_punct("}")?;
+            }
+            _ if matches!(token.kind, TokenKind::Ident(_)) => {
+                self.advance();
             }
             _ => return Err(self.error(format!("unknown type {name:?}"))),
         }
@@ -449,6 +455,111 @@ impl Parser {
             enable_intents,
             span: self.cover(start),
         })
+    }
+
+    fn structured_declaration(&mut self) -> Result<Decl> {
+        let start = self.advance();
+        let name = self.ident()?.0;
+        self.expect_punct("{")?;
+        let mut fields = Vec::new();
+        while !self.accept_punct("}") {
+            let (name, span) = self.ident()?;
+            self.expect_punct(":")?;
+            let ty = self.type_ref()?;
+            self.expect_punct(";")?;
+            fields.push(Param { name, ty, span });
+        }
+        let span = self.cover(start.span);
+        Ok(if start.text == "record" {
+            Decl::Record(RecordDecl { name, fields, span })
+        } else {
+            Decl::Union(UnionDecl {
+                name,
+                variants: fields,
+                span,
+            })
+        })
+    }
+    fn structured_expression(&mut self, logic: bool) -> Result<Option<Expr>> {
+        let token = self.peek().clone();
+        let name = token.text.as_str();
+        if name == "field"
+            && self
+                .tokens
+                .get(self.position + 1)
+                .is_some_and(|t| t.text == "(")
+        {
+            self.advance();
+            self.expect_punct("(")?;
+            let record = Box::new(self.expression(logic)?);
+            self.expect_punct(",")?;
+            let field = self.ident()?.0;
+            self.expect_punct(")")?;
+            return Ok(Some(Expr::Field(FieldExpr {
+                record,
+                field,
+                span: self.cover(token.span),
+            })));
+        }
+        if !matches!(name, "record" | "variant" | "is_variant" | "payload")
+            || self
+                .tokens
+                .get(self.position + 1)
+                .is_none_or(|t| t.text != "<")
+        {
+            return Ok(None);
+        }
+        self.advance();
+        self.expect_punct("<")?;
+        let ty = self.ident()?.0;
+        if name == "record" {
+            self.expect_punct(">")?;
+            self.expect_punct("(")?;
+            let mut fields = Vec::new();
+            if !self.accept_punct(")") {
+                loop {
+                    let field = self.ident()?.0;
+                    self.expect_punct(":")?;
+                    fields.push((field, self.expression(logic)?));
+                    if self.accept_punct(")") {
+                        break;
+                    }
+                    self.expect_punct(",")?;
+                }
+            }
+            return Ok(Some(Expr::Record(RecordExpr {
+                ty,
+                fields,
+                span: self.cover(token.span),
+            })));
+        }
+        self.expect_punct(",")?;
+        let variant = self.ident()?.0;
+        self.expect_punct(">")?;
+        self.expect_punct("(")?;
+        let value = Box::new(self.expression(logic)?);
+        self.expect_punct(")")?;
+        let span = self.cover(token.span);
+        Ok(Some(match name {
+            "variant" => Expr::Variant(VariantExpr {
+                ty,
+                variant,
+                payload: value,
+                span,
+            }),
+            "is_variant" => Expr::IsVariant(VariantAccess {
+                ty,
+                variant,
+                value,
+                span,
+            }),
+            _ => Expr::Payload(VariantAccess {
+                ty,
+                variant,
+                value,
+                span,
+            }),
+        }))
     }
 
     fn function(&mut self) -> Result<FunctionDecl> {
@@ -729,7 +840,7 @@ impl Parser {
             && self
                 .tokens
                 .get(self.position + 1)
-                .is_some_and(|t| matches!(&t.kind, TokenKind::Punct(p) if p == "("))
+                .is_some_and(|t| matches!(&t.kind, TokenKind::Punct(p) if p == "(" || (p=="<" && matches!(self.peek().text.as_str(),"record"|"variant"|"is_variant"|"payload"))))
     }
 
     fn pure_expr_inner(&mut self) -> Result<Expr> {
@@ -822,6 +933,9 @@ impl Parser {
     }
 
     fn call(&mut self, logic: bool) -> Result<Expr> {
+        if let Some(value) = self.structured_expression(logic)? {
+            return Ok(value);
+        }
         let token = self.peek().clone();
         let name = match &token.kind {
             TokenKind::Keyword(name) | TokenKind::Ident(name) => name.as_str(),

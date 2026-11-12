@@ -55,18 +55,18 @@ Explicit host execution/batching configuration is separate from proof defaults.
 | Priority | Status |
 | --- | --- |
 | Effect postconditions and symbolic outbox | Implemented for existing scalar payloads |
-| Pure reusable verified functions | Implemented with independent dependency proofs and reusable summaries |
+| Pure reusable verified functions | Implemented for scalar and structured values with independent dependency proofs and reusable summaries |
 | Stateful component contracts | Not implemented; need invariant ownership and explicit read/write/effect frames |
-| General records and user-defined tagged payload unions | Not implemented; distinct effect declarations remain typed outbox variants |
+| General records and tagged unions | Implemented across functions, effects, locals, state, projections and canonical host codecs |
 | Variable-length bounded bytes/strings and source codecs | Not implemented; bytes32 and host persistence codecs remain existing facilities |
 | AI self-repair | Precise verifiable evidence and proof boundaries, not autonomous specification weakening or automatic patch admission |
 
-Structured values must share one canonical type/layout/validation contract across
-runtime, SMT, generated targets and persistence. Tagged variants should not be
-Cartesian-expanded merely to verify an interface. Bytes/codecs need explicit
+Structured values now share one canonical type/layout/validation contract across
+runtime, SMT, generated targets and persistence. Shared datatypes and helpers avoid
+Cartesian expansion of interface variants. Bytes/codecs need explicit
 length, capacity, endianness, canonical representation, checked offsets and
-round-trip obligations. These are substantive remaining implementation, not
-capabilities implied by scalar functions.
+round-trip obligations. Source-level bytes/codecs remain substantive implementation, not a capability
+implied by the canonical host codecs.
 
 ## Validation and scaling evidence
 
@@ -107,3 +107,14 @@ regression: 300 passed, zero failed or ignored. Together with the five unchanged
 runtime tests, all 305 tests are covered against their final source inputs.
 The workspace runtime stress completed 50,000 iterations. Formatting, whitespace
 and all-target Clippy (with only the pre-existing lint noted above allowed) passed.
+
+The structured increment includes cold-cache GPU timing and growth evidence in
+[GPU scaling](GPU_SCALING.md). It removes a reproduced wide-multiply shader
+compiler bottleneck without weakening arithmetic/hash semantics or adding a
+validation cutoff. Explicit runtime value trees can still expand repeated nested
+shapes; shared type metadata does not imply compact physical values.
+
+Final structured milestone validation: 356 workspace tests passed, zero failed
+and zero ignored, with real GPU execution required and Mesa shader caching
+disabled. All-target lint passed allowing only the pre-existing runtime lint
+noted above; formatting and whitespace checks passed.

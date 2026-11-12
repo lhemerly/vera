@@ -52,6 +52,18 @@ There are no implicit numeric conversions. Literal types are inferred from their
 context. `id64<T>(integer)` explicitly interprets an integer's 64-bit bit pattern
 as a handle; it does not allocate or validate a row.
 
+## Structured values
+
+`record Name { field : Type; ... }` declares a finite nominal product;
+`union Name { Tag : PayloadType; ... }` declares a tagged sum. These types work
+in functions, effects, locals, columns and projections. Constructors are
+`record<Name>(field:value, ...)` and `variant<Name,Tag>(payload)`; observations
+are `field(value, field)`, `is_variant<Name,Tag>(value)` and partial
+`payload<Name,Tag>(value)`. Field arguments evaluate in written order.
+Wrong-tag payload access traps; lazy selection can protect an optional read.
+See [structured values](STRUCTURED_VALUES.md) for canonical codecs, JSON,
+uniqueness, layout and non-Cartesian proof representation.
+
 ## Expressions and evaluation
 
 Canonical operators use prefix notation. Specifications such as invariants,

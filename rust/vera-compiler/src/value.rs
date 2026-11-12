@@ -1,8 +1,8 @@
 //! Exact scalar values and the shared checked arithmetic semantics.
 use crate::{
     ast::LiteralValue,
-    ir::{BinaryOp, UnaryOp},
-    types::{Domain, ScalarType},
+    ir::{BinaryOp, CheckedProgram, TypeDefinitionKind, TypeId, UnaryOp, VariantId},
+    types::{Domain, ScalarType, ValueType},
 };
 use num_bigint::{BigInt, Sign};
 use num_traits::{Signed, ToPrimitive, Zero};
@@ -11,6 +11,15 @@ use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum Value {
+    Record {
+        ty: TypeId,
+        fields: Vec<Value>,
+    },
+    Variant {
+        ty: TypeId,
+        tag: VariantId,
+        payload: Box<Value>,
+    },
     Bool(bool),
     Int(BigInt),
 }
@@ -39,6 +48,9 @@ impl Value {
     }
     pub fn to_json(&self, ty: &ScalarType) -> serde_json::Value {
         match self {
+            Self::Record { .. } | Self::Variant { .. } => {
+                panic!("structured JSON requires value_to_json with its type arena")
+            }
             Self::Bool(v) => serde_json::Value::Bool(*v),
             Self::Int(v) => {
                 if matches!(ty, ScalarType::Bytes32) {
@@ -227,6 +239,9 @@ pub fn checked_binary(
 
 pub fn low_u64(value: &Value) -> u64 {
     match value {
+        Value::Record { .. } | Value::Variant { .. } => {
+            panic!("structured values require canonical hashing")
+        }
         Value::Bool(v) => u64::from(*v),
         Value::Int(v) => {
             let mask = (BigInt::from(1u8) << 64usize) - 1u8;
@@ -334,4 +349,233 @@ pub fn from_le_bytes(bytes: &[u8], ty: &ScalarType) -> Result<Value, String> {
         value -= BigInt::from(1u8) << (bytes.len() * 8);
     }
     coerce(&Value::Int(value), ty)
+}
+
+pub fn validate_value(
+    program: &CheckedProgram,
+    value: &Value,
+    ty: &ValueType,
+) -> Result<(), String> {
+    match ty {
+        ValueType::Scalar(t) => {
+            if t.is_bool() {
+                value.boolean()?;
+            } else {
+                let number = value.int()?;
+                if number < &t.min_value() || number > &t.max_value() {
+                    return Err(format!("value is outside {t}"));
+                }
+            }
+            Ok(())
+        }
+        ValueType::Named(id) => match (&program.type_definition(*id).kind, value) {
+            (TypeDefinitionKind::Record(defs), Value::Record { ty: actual, fields })
+                if actual == id && fields.len() == defs.len() =>
+            {
+                for (field, def) in fields.iter().zip(defs) {
+                    validate_value(program, field, &def.ty)?;
+                }
+                Ok(())
+            }
+            (
+                TypeDefinitionKind::Union(defs),
+                Value::Variant {
+                    ty: actual,
+                    tag,
+                    payload,
+                },
+            ) if actual == id => {
+                let def = defs.get(tag.0).ok_or("unknown union tag")?;
+                validate_value(program, payload, &def.payload)
+            }
+            _ => Err(format!(
+                "value does not match nominal type {}",
+                program.type_definition(*id).name
+            )),
+        },
+    }
+}
+
+pub fn coerce_value(
+    program: &CheckedProgram,
+    value: &Value,
+    ty: &ValueType,
+) -> Result<Value, String> {
+    validate_value(program, value, ty)?;
+    Ok(value.clone())
+}
+pub fn zero_value(program: &CheckedProgram, ty: &ValueType) -> Value {
+    match ty {
+        ValueType::Scalar(t) => Value::zero(t),
+        ValueType::Named(id) => match &program.type_definition(*id).kind {
+            TypeDefinitionKind::Record(fields) => Value::Record {
+                ty: *id,
+                fields: fields.iter().map(|f| zero_value(program, &f.ty)).collect(),
+            },
+            TypeDefinitionKind::Union(variants) => Value::Variant {
+                ty: *id,
+                tag: VariantId(0),
+                payload: Box::new(zero_value(program, &variants[0].payload)),
+            },
+        },
+    }
+}
+pub fn value_to_json(program: &CheckedProgram, value: &Value, ty: &ValueType) -> serde_json::Value {
+    match ty {
+        ValueType::Scalar(t) => value.to_json(t),
+        ValueType::Named(id) => match (&program.type_definition(*id).kind, value) {
+            (TypeDefinitionKind::Record(defs), Value::Record { fields, .. }) => {
+                serde_json::Value::Object(
+                    defs.iter()
+                        .zip(fields)
+                        .map(|(d, v)| (d.name.clone(), value_to_json(program, v, &d.ty)))
+                        .collect(),
+                )
+            }
+            (TypeDefinitionKind::Union(defs), Value::Variant { tag, payload, .. }) => {
+                serde_json::json!({"tag":defs[tag.0].name,"payload":value_to_json(program,payload,&defs[tag.0].payload)})
+            }
+            _ => panic!("validated value required for JSON conversion"),
+        },
+    }
+}
+pub fn value_from_json(
+    program: &CheckedProgram,
+    json: &serde_json::Value,
+    ty: &ValueType,
+) -> Result<Value, String> {
+    match ty {
+        ValueType::Scalar(t) => from_json(t, json),
+        ValueType::Named(id) => match &program.type_definition(*id).kind {
+            TypeDefinitionKind::Record(defs) => {
+                let obj = json.as_object().ok_or("record requires an object")?;
+                if obj.len() != defs.len() {
+                    return Err("record fields differ from its declaration".into());
+                }
+                Ok(Value::Record {
+                    ty: *id,
+                    fields: defs
+                        .iter()
+                        .map(|d| {
+                            value_from_json(
+                                program,
+                                obj.get(&d.name)
+                                    .ok_or_else(|| format!("missing field {}", d.name))?,
+                                &d.ty,
+                            )
+                        })
+                        .collect::<Result<Vec<_>, String>>()?,
+                })
+            }
+            TypeDefinitionKind::Union(defs) => {
+                let obj = json.as_object().ok_or("union requires a tagged object")?;
+                if obj.len() != 2 {
+                    return Err("union object requires exactly tag and payload".into());
+                }
+                let name = obj
+                    .get("tag")
+                    .and_then(|v| v.as_str())
+                    .ok_or("union requires a string tag")?;
+                let def = defs
+                    .iter()
+                    .find(|d| d.name == name)
+                    .ok_or("unknown union tag")?;
+                let payload = value_from_json(
+                    program,
+                    obj.get("payload").ok_or("union requires payload")?,
+                    &def.payload,
+                )?;
+                Ok(Value::Variant {
+                    ty: *id,
+                    tag: def.id,
+                    payload: Box::new(payload),
+                })
+            }
+        },
+    }
+}
+pub fn encode_value(
+    program: &CheckedProgram,
+    value: &Value,
+    ty: &ValueType,
+) -> Result<Vec<u8>, String> {
+    validate_value(program, value, ty)?;
+    fn encode(
+        program: &CheckedProgram,
+        value: &Value,
+        ty: &ValueType,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        match ty {
+            ValueType::Scalar(t) => out.extend(to_le_bytes(value, t.byte_width(), t.signed())?),
+            ValueType::Named(id) => match (&program.type_definition(*id).kind, value) {
+                (TypeDefinitionKind::Record(defs), Value::Record { fields, .. }) => {
+                    for (def, value) in defs.iter().zip(fields) {
+                        encode(program, value, &def.ty, out)?;
+                    }
+                }
+                (TypeDefinitionKind::Union(defs), Value::Variant { tag, payload, .. }) => {
+                    let start = out.len();
+                    out.extend(
+                        u32::try_from(tag.0)
+                            .map_err(|_| "union tag exceeds u32 wire representation")?
+                            .to_le_bytes(),
+                    );
+                    encode(program, payload, &defs[tag.0].payload, out)?;
+                    out.resize(
+                        start
+                            .checked_add(program.value_wire_width(ty)?)
+                            .ok_or("wire length exceeds usize")?,
+                        0,
+                    );
+                }
+                _ => return Err("invalid structured value".into()),
+            },
+        };
+        Ok(())
+    }
+    let width = program.value_wire_width(ty)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(width)
+        .map_err(|_| "cannot allocate canonical value encoding")?;
+    encode(program, value, ty, &mut out)?;
+    Ok(out)
+}
+pub fn decode_value(
+    program: &CheckedProgram,
+    bytes: &[u8],
+    ty: &ValueType,
+) -> Result<Value, String> {
+    if bytes.len() != program.value_wire_width(ty)? {
+        return Err("canonical value width mismatch".into());
+    }
+    match ty {
+        ValueType::Scalar(t) => from_le_bytes(bytes, t),
+        ValueType::Named(id) => match &program.type_definition(*id).kind {
+            TypeDefinitionKind::Record(defs) => {
+                let mut pos = 0usize;
+                let mut fields = Vec::new();
+                for def in defs {
+                    let width = program.value_wire_width(&def.ty)?;
+                    fields.push(decode_value(program, &bytes[pos..pos + width], &def.ty)?);
+                    pos += width;
+                }
+                Ok(Value::Record { ty: *id, fields })
+            }
+            TypeDefinitionKind::Union(defs) => {
+                let tag = VariantId(u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize);
+                let def = defs.get(tag.0).ok_or("invalid canonical union tag")?;
+                let width = program.value_wire_width(&def.payload)?;
+                let payload = decode_value(program, &bytes[4..4 + width], &def.payload)?;
+                if bytes[4 + width..].iter().any(|b| *b != 0) {
+                    return Err("noncanonical union padding".into());
+                }
+                Ok(Value::Variant {
+                    ty: *id,
+                    tag,
+                    payload: Box::new(payload),
+                })
+            }
+        },
+    }
 }

@@ -1,6 +1,6 @@
 # Compositional pure functions
 
-Pure scalar functions are implemented across the frontend, native execution,
+Pure first-order functions are implemented across the frontend, native execution,
 verification and generated Rust/GLSL/WGSL/CUDA targets. They provide reusable
 verified contracts without copying a callee's body into every caller proof.
 
@@ -19,8 +19,8 @@ caller and callee names cannot capture one another.
 
 ## Scope and execution
 
-Functions take and return existing scalar types, including enums, bytes32,
-decimals and typed handles. Bodies are pure expressions, pure bounded folds, and
+Functions take and return scalar types, including enums, bytes32, decimals and
+typed handles, and nominal records/tagged unions from the shared type arena. Bodies are pure expressions, pure bounded folds, and
 calls to other pure functions. They cannot read tables, occupancy, aggregates,
 old state or effects, or perform writes, allocations or emissions. Purity is
 checked even in inactive/dead branches and unused functions.
@@ -28,8 +28,8 @@ checked even in inactive/dead branches and unused functions.
 Function requires and ensures refer only to parameters and, for ensures, result.
 Calls are not yet supported inside a function's own contract. Call expressions
 are supported in ordinary transition/specification/projection expressions;
-the frontend checks their types once. General structured signatures, recursion,
-higher-order functions and stateful component contracts are not implemented.
+the frontend checks their types once. Recursion, higher-order functions and stateful component contracts are not
+implemented. Structured signatures reuse the same nominal types as state and effects.
 
 Actual arguments evaluate left to right exactly once, then narrow to declared
 scalar types. A function evaluates its requires in source order. A false
@@ -57,7 +57,7 @@ contracts as assumptions. Each reachable dependency must first pass:
 2. Panic freedom: reachable evaluated requires/body operations cannot trap.
 3. Non-vacuity: a concrete typed input can satisfy the requirements and return.
 
-A function proof models only its scalar parameters and return, not unrelated
+A function proof models only its typed parameters and return, not unrelated
 program tables or state invariants. An inconsistent state invariant therefore
 cannot make a false pure-function contract appear proved. Native replay of a
 function witness allocates no unrelated table state.
@@ -92,7 +92,7 @@ Verification JSON identifies `target_kind` (`function` or `transition`) and
 includes direct-edge `contract_dependencies` evidence rather than copying
 transitive proof DAGs into each caller. `verify_all` emits each target proof once;
 selected-target evidence reports its direct admitted dependencies. A function counterexample reports concrete parameter and return
-values, the failing named ensure/value or error and source spans. Function
+values, including source-named `typed_return_value` JSON for structured results, the failing named ensure/value or error and source spans. Function
 precondition failures in transition replay retain their source location. A pure
 function witness has empty state tables/outbox, not a fabricated stateful input.
 Non-vacuity means a function returned, not that every ensure held on that witness.
@@ -121,9 +121,9 @@ sufficiently deep source/execution trees depend on available host stack.
 
 Stateful component contracts require explicit read/write/effect frames, alias
 rules and invariant ownership; pure scalar functions do not supply those.
-General named records and tagged unions need a single resolved type/layout
-contract across all targets and persistence, without enumerating Cartesian
-products of variants. Bounded bytes need explicit logical length/capacity,
+Named records and tagged unions now use one resolved type/layout contract across
+all targets and persistence, without enumerating Cartesian products of variants.
+See [structured values](STRUCTURED_VALUES.md). Bounded bytes need explicit logical length/capacity,
 consistent trailing-byte semantics and checked indexing/slicing. Source-language
 codec primitives need precise endianness, canonical encoding, length/tag checks,
 error behavior and independent round-trip proofs. Those remain future
