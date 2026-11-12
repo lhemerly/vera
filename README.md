@@ -114,7 +114,8 @@ rustc --edition 2021 --crate-type lib counter.rs
 | Specifications | Row/global invariants, preconditions, postconditions, old-state values |
 | Transactions | Checked reads and writes, allocation, guards, atomic commit, typed effects |
 | Folds | Inclusive declared-bounded iteration with scoped accumulator and index bindings |
-| Functions | Pure scalar helpers with independently verified reusable contracts |
+| Functions | Pure scalar/structured helpers with independently verified reusable contracts |
+| Components | Owned table mutation and independently proved leaf operations with state/effect frames |
 | Projections | Authorized state slices and available intents with parameter hints |
 | Persistence | Typed intent logs, checksummed snapshots, deterministic replay |
 

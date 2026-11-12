@@ -19,7 +19,7 @@ use vera_compiler::{
     semantic::analyze,
     types::{ScalarType, ValueType},
     value::{self, Value},
-    verifier::{verify_all, verify_function, verify_transition, VerifierConfig},
+    verifier::{verify_all, verify_function, verify_operation, verify_transition, VerifierConfig},
 };
 
 type Result<T> = std::result::Result<T, (u8, String)>;
@@ -37,7 +37,8 @@ Usage: vera <command> <file|-> [options]
   fuzz      Search native execution traces for violations
 
 Common: --json, --setup FILE
-Proofs: --transition NAME or --function NAME, --emit-smt PREFIX, --exact-sum
+Proofs: --transition NAME, --function NAME or --operation Component.name,
+        --emit-smt PREFIX, --exact-sum
 Optional proof budgets (all unset by default): --timeout MS,
         --max-state-cells N, --max-unroll N, --witness-attempts N,
         --max-expression-steps N, --max-smt-bytes N, --max-effect-events N
@@ -126,6 +127,7 @@ fn options(mut args: Vec<OsString>) -> Result<Options> {
             &[
                 "--transition",
                 "--function",
+                "--operation",
                 "--timeout",
                 "--emit-smt",
                 "--max-state-cells",
@@ -591,6 +593,10 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
                 if !functions.is_empty() {
                     report["functions"] = json!(functions);
                 }
+                if !program.components().is_empty() {
+                    report["components"] = json!(program.components().iter().map(|c| json!({"name":c.name,"owns":c.tables.iter().map(|id| &program.table(*id).name).collect::<Vec<_>>(),"invariants":c.invariants.iter().map(|index| &program.invariants()[*index].name).collect::<Vec<_>>()})).collect::<Vec<_>>());
+                    report["operations"] = json!(program.operations().iter().map(|o| json!({"name":o.transition.name,"component":program.component(o.component).name,"reads":o.reads.len(),"writes":o.writes.len(),"effects":o.effects.iter().map(|id| &program.effect(*id).name).collect::<Vec<_>>(),"wcet_bound":o.transition.wcet_bound})).collect::<Vec<_>>());
+                }
                 print_json(report)?;
             } else {
                 println!(
@@ -612,8 +618,16 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             let config = opts.config()?;
             let selected_transition = opts.text("--transition")?;
             let selected_function = opts.text("--function")?;
-            if selected_transition.is_some() && selected_function.is_some() {
-                return Err(input("select --transition or --function, not both"));
+            let selected_operation = opts.text("--operation")?;
+            if [selected_transition, selected_function, selected_operation]
+                .iter()
+                .filter(|v| v.is_some())
+                .count()
+                > 1
+            {
+                return Err(input(
+                    "select one of --transition, --function or --operation",
+                ));
             }
             let results = if let Some(name) = selected_transition {
                 if program.transition_id(name).is_none() {
@@ -625,6 +639,11 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
                     return Err(input("unknown function"));
                 }
                 vec![verify_function(&program, name, &config)]
+            } else if let Some(name) = selected_operation {
+                if program.operation_id(name).is_none() {
+                    return Err(input("unknown operation"));
+                }
+                vec![verify_operation(&program, name, &config)]
             } else {
                 verify_all(&program, &config)
             };
@@ -636,8 +655,8 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
                         ("liveness", &r.smt_liveness),
                     ] {
                         let mut path = prefix.clone();
-                        if r.target_kind == "function" {
-                            path.push(format!(".function.{}.{kind}.smt2", r.transition));
+                        if r.target_kind == "function" || r.target_kind == "operation" {
+                            path.push(format!(".{}.{}.{kind}.smt2", r.target_kind, r.transition));
                         } else {
                             path.push(format!(".{}.{kind}.smt2", r.transition));
                         }

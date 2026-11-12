@@ -14,8 +14,8 @@ use num_traits::ToPrimitive;
 use crate::{
     diagnostic::{Diagnostic, Span},
     ir::{
-        BinaryOp, BindingId, CheckedProgram, ColumnId, ExprId, ExprKind, Snapshot, Stmt, StmtKind,
-        TableId, Transition, TypeDefinitionKind, TypeId, UnaryOp,
+        BinaryOp, BindingId, CheckedProgram, ColumnId, ExprId, ExprKind, Operation, Snapshot, Stmt,
+        StmtKind, TableId, Transition, TypeDefinitionKind, TypeId, UnaryOp,
     },
     types::{ScalarType, ValueType, MAX_PROBES},
     value::{symbol_id, Value},
@@ -359,6 +359,8 @@ impl Output {
         if let Some((slots, payloads)) = effects {
             context.extend([
                 ("emitted_count", "u32", None),
+                ("emitted_stride", "u32", None),
+                ("emitted_record", "bool", None),
                 ("emitted_kind", "u32", Some(slots)),
                 ("emitted_args", "V", Some(payloads)),
             ]);
@@ -473,6 +475,12 @@ fn emission_bound(program: &CheckedProgram, statements: &[Stmt]) -> usize {
             StmtKind::Emit { args, .. } => args
                 .iter()
                 .fold(1usize, |n, id| n.saturating_add(child(*id))),
+            StmtKind::OperationCall {
+                operation, args, ..
+            } => args.iter().fold(
+                emission_bound(program, &program.operation(*operation).transition.body),
+                |n, id| n.saturating_add(child(*id)),
+            ),
             StmtKind::Commit => 0,
         };
         total.saturating_add(count)
@@ -524,21 +532,55 @@ fn effect_stride(program: &CheckedProgram, id: ExprId) -> Option<usize> {
             .max(
                 fold.body
                     .iter()
-                    .filter_map(|statement| match statement.kind {
-                        StmtKind::Let { value, .. } | StmtKind::Eval(value) => child(value),
-                        _ => None, // Specification folds can only bind pure values.
-                    })
+                    .filter_map(|statement| statement_effect_stride(program, statement))
                     .max(),
             ),
         ExprKind::Constant(_) | ExprKind::Binding(_) | ExprKind::Sum { .. } => None,
     }
 }
+fn statement_effect_stride(program: &CheckedProgram, statement: &Stmt) -> Option<usize> {
+    let child = |id| effect_stride(program, id);
+    match &statement.kind {
+        StmtKind::Let { value, .. } | StmtKind::Eval(value) => child(*value),
+        StmtKind::Guard { condition, .. } => child(*condition),
+        StmtKind::TableSet { key, value, .. } => child(*key).max(child(*value)),
+        StmtKind::Allocate { fields, .. } => fields.iter().filter_map(|(_, id)| child(*id)).max(),
+        StmtKind::Emit { args, .. } => args.iter().filter_map(|id| child(*id)).max(),
+        StmtKind::OperationCall {
+            operation, args, ..
+        } => transition_effect_stride(program, &program.operation(*operation).transition)
+            .max(args.iter().filter_map(|id| child(*id)).max()),
+        StmtKind::Commit => None,
+    }
+}
+
 fn transition_effect_stride(program: &CheckedProgram, transition: &Transition) -> Option<usize> {
     transition
         .ensures
         .iter()
         .filter_map(|ensure| effect_stride(program, ensure.value))
         .max()
+}
+
+// Helpers share code, not a cross-product between one caller's event count
+// and an unrelated caller's payload width. Each invocation carries its exact
+// transaction layout in the context.
+fn operation_effect_stride(program: &CheckedProgram) -> Option<usize> {
+    program
+        .transitions()
+        .iter()
+        .chain(program.operations().iter().map(|o| &o.transition))
+        .filter_map(|t| transition_effect_stride(program, t))
+        .max()
+}
+fn effective_effect_stride(program: &CheckedProgram, transition: &Transition) -> Option<usize> {
+    transition_effect_stride(program, transition).max(
+        transition
+            .body
+            .iter()
+            .filter_map(|statement| statement_effect_stride(program, statement))
+            .max(),
+    )
 }
 
 struct Generator<'a> {
@@ -556,6 +598,7 @@ struct Generator<'a> {
     effect_storage: Option<(usize, usize)>,
     record_effects: bool,
     effect_stride: usize,
+    effect_base: String,
     function_result: Option<ValueType>,
     named_effects: BTreeSet<(usize, usize)>,
     type_order: Vec<TypeId>,
@@ -592,6 +635,7 @@ impl<'a> Generator<'a> {
             effect_storage: None,
             record_effects: false,
             effect_stride: 0,
+            effect_base: "0u".into(),
             function_result: None,
             named_effects: BTreeSet::new(),
             type_order: Vec::new(),
@@ -661,8 +705,12 @@ impl<'a> Generator<'a> {
         }) {
             let mut slots = 1usize;
             let mut payloads = 1usize;
-            for transition in program.transitions() {
-                if let Some(stride) = transition_effect_stride(program, transition) {
+            for transition in program
+                .transitions()
+                .iter()
+                .chain(program.operations().iter().map(|o| &o.transition))
+            {
+                if let Some(stride) = effective_effect_stride(program, transition) {
                     let bound = emission_bound(program, &transition.body);
                     slots = slots.max(bound);
                     payloads = payloads.max(bound.saturating_mul(stride));
@@ -1021,6 +1069,9 @@ impl<'a> Generator<'a> {
             self.function(function);
         }
         self.invariants();
+        for operation in self.program.operations() {
+            self.operation(operation);
+        }
         for transition in self.program.transitions() {
             self.transition(transition);
         }
@@ -1412,21 +1463,29 @@ impl<'a> Generator<'a> {
                 .get(binding)
                 .expect("checked binding is in GPU scope")
                 .clone(),
-            ExprKind::EffectCount => self.temporary("V", format!("v_small({c}.emitted_count)")),
+            ExprKind::EffectCount => self.temporary(
+                "V",
+                format!("v_small({c}.emitted_count-{})", self.effect_base),
+            ),
             ExprKind::EffectIs { effect, index } | ExprKind::EffectArg { effect, index, .. } => {
                 let index = self.expression(*index, env);
                 let found = self.temporary("bool", "false");
                 // Check all limbs before indexing. Short-circuiting is not relied
                 // upon for out-of-range storage accesses on any shader target.
-                self.push(format!("if(v_ucmp({index},v_small({c}.emitted_count))==0u){{{found}=({c}.emitted_kind[{index}.w[0]]=={}u);}}", effect.0));
+                let absolute = format!("({index}.w[0]+{})", self.effect_base);
+                self.push(format!("if(v_ucmp({index},v_small({c}.emitted_count-{}))==0u){{{found}=({c}.emitted_kind[{absolute}]=={}u);}}", self.effect_base, effect.0));
                 if let ExprKind::EffectArg { parameter, .. } = &expression.kind {
                     self.push(format!("if(!{found}){{{c}.trap=1u;{failure}}}"));
-                    let stride = self.effect_stride;
+                    let stride = if self.program.operations().is_empty() {
+                        format!("{}u", self.effect_stride)
+                    } else {
+                        format!("{c}.emitted_stride")
+                    };
                     let ty = &self.program.effect(*effect).params[*parameter].ty;
                     let access = if !matches!(ty, ValueType::Scalar(_)) {
-                        format!("{c}.emitted_e{}_p{parameter}[{index}.w[0]]", effect.0)
+                        format!("{c}.emitted_e{}_p{parameter}[{absolute}]", effect.0)
                     } else {
-                        format!("{c}.emitted_args[{index}.w[0]*{stride}u+{parameter}u]")
+                        format!("{c}.emitted_args[{absolute}*{stride}+{parameter}u]")
                     };
                     self.temporary(&Self::gpu_type(ty), access)
                 } else {
@@ -1708,6 +1767,15 @@ impl<'a> Generator<'a> {
                 if self.record_effects {
                     let slots = self.effect_storage.expect("effect recording storage").0;
                     let stride = self.effect_stride;
+                    let shared = !self.program.operations().is_empty();
+                    let physical_stride = if shared {
+                        format!("{c}.emitted_stride")
+                    } else {
+                        format!("{stride}u")
+                    };
+                    if shared {
+                        self.push(format!("if({c}.emitted_record){{"));
+                    }
                     self.push(format!(
                         "if({c}.emitted_count>={slots}u){{{c}.trap=1u;{failure}}}"
                     ));
@@ -1716,16 +1784,25 @@ impl<'a> Generator<'a> {
                         effect.id.0
                     ));
                     for (parameter, value) in values.iter().take(stride).enumerate() {
+                        if shared {
+                            self.push(format!("if({parameter}u<{c}.emitted_stride){{"));
+                        }
                         if matches!(effect.params[parameter].ty, ValueType::Scalar(_)) {
-                            self.push(format!("{c}.emitted_args[{c}.emitted_count*{stride}u+{parameter}u]={value};"));
+                            self.push(format!("{c}.emitted_args[{c}.emitted_count*{physical_stride}+{parameter}u]={value};"));
                         } else if self.named_effects.contains(&(effect.id.0, parameter)) {
                             self.push(format!(
                                 "{c}.emitted_e{}_p{parameter}[{c}.emitted_count]={value};",
                                 effect.id.0
                             ));
                         }
+                        if shared {
+                            self.push("}");
+                        }
                     }
                     self.push(format!("{c}.emitted_count={c}.emitted_count+1u;"));
+                    if shared {
+                        self.push("}");
+                    }
                 }
                 self.push(format!("{c}.s.effect_count={c}.s.effect_count+1u;{c}.s.effect_digest=v_add({c}.s.effect_digest,{});", Self::constant(&BigInt::from(symbol_id(&effect.name)))));
                 for (value, parameter) in values.iter().zip(&effect.params) {
@@ -1739,6 +1816,23 @@ impl<'a> Generator<'a> {
                     ));
                 }
             }
+            StmtKind::OperationCall {
+                operation, args, ..
+            } => {
+                let operation = self.program.operation(*operation);
+                let values = args
+                    .iter()
+                    .zip(&operation.transition.params)
+                    .map(|(argument, parameter)| {
+                        self.typed_expression(*argument, env, &parameter.ty)
+                    })
+                    .collect::<Vec<_>>();
+                let suffix = values.iter().map(|v| format!(",{v}")).collect::<String>();
+                self.push(format!(
+                    "if(!vera_operation_{}(ctx{suffix})){{{failure}}}",
+                    operation.id.0
+                ));
+            }
             StmtKind::Eval(value) => {
                 self.expression(*value, env);
             }
@@ -1746,35 +1840,111 @@ impl<'a> Generator<'a> {
         }
     }
 
-    fn invariants(&mut self) {
+    fn invariant(&mut self, invariant: &crate::ir::Invariant) {
         let c = self.context();
+        let mut env = Environment::new();
+        if let Some((table, binding)) = invariant.quantifier {
+            let offset = self.table_offsets[table.0];
+            let slot = self.temporary("u32", "0u");
+            self.push(format!(
+                "for(;{slot}<{}u;{slot}={slot}+1u){{if({c}.s.occ[{slot}+{offset}u]!=0u){{",
+                self.program.table(table).capacity
+            ));
+            let key = self.temporary(
+                "V",
+                format!("{}_key(ctx,{slot},false)", Self::table_name(table)),
+            );
+            env.insert(binding, key);
+            let value = self.expression(invariant.condition, &env);
+            self.push(format!("if(!v_truth({value})){{return false;}}}}}}"));
+        } else {
+            let value = self.expression(invariant.condition, &env);
+            self.push(format!("if(!v_truth({value})){{return false;}}"));
+        }
+    }
+
+    fn invariants(&mut self) {
         for invariant in self.program.invariants() {
-            let mut env = Environment::new();
-            if let Some((table, binding)) = invariant.quantifier {
-                let offset = self.table_offsets[table.0];
-                let slot = self.temporary("u32", "0u");
-                self.push(format!(
-                    "for(;{slot}<{}u;{slot}={slot}+1u){{if({c}.s.occ[{slot}+{offset}u]!=0u){{",
-                    self.program.table(table).capacity
-                ));
-                let key = self.temporary(
-                    "V",
-                    format!("{}_key(ctx,{slot},false)", Self::table_name(table)),
-                );
-                env.insert(binding, key);
-                let value = self.expression(invariant.condition, &env);
-                self.push(format!("if(!v_truth({value})){{return false;}}}}}}"));
-            } else {
-                let value = self.expression(invariant.condition, &env);
-                self.push(format!("if(!v_truth({value})){{return false;}}"));
-            }
+            self.invariant(invariant);
         }
         self.push("return true;");
         self.finish_function("vera_invariants", "bool", Vec::new());
+        for component in self.program.components() {
+            for index in &component.invariants {
+                self.invariant(&self.program.invariants()[*index]);
+            }
+            self.push("return true;");
+            self.finish_function(
+                &format!("vera_component_{}_invariants", component.id.0),
+                "bool",
+                Vec::new(),
+            );
+        }
+    }
+
+    fn operation(&mut self, operation: &Operation) {
+        self.record_effects = operation_effect_stride(self.program).is_some();
+        self.effect_stride = operation_effect_stride(self.program).unwrap_or(0);
+        let transition = &operation.transition;
+        let params = transition
+            .params
+            .iter()
+            .map(|p| (format!("arg_v_{}", p.name), Self::gpu_type(&p.ty)))
+            .collect::<Vec<_>>();
+        let base_env = transition
+            .params
+            .iter()
+            .map(|p| (p.binding, format!("arg_v_{}", p.name)))
+            .collect::<Environment>();
+        let mut env = base_env.clone();
+        let c = self.context();
+        for require in &transition.requires {
+            let value = self.expression(require.value, &env);
+            self.push(format!(
+                "if(!v_truth({value})){{{c}.trap=1u;return false;}}"
+            ));
+        }
+        for statement in &transition.body {
+            self.statement(statement, &mut env);
+        }
+        self.push("return true;");
+        self.finish_function(
+            &format!("vera_operation_{}_apply", operation.id.0),
+            "bool",
+            params.clone(),
+        );
+        self.effect_base = "operation_effect_base".into();
+        for ensure in &transition.ensures {
+            let value = self.expression(ensure.value, &base_env);
+            self.push(format!("if(!v_truth({value})){{return false;}}"));
+        }
+        self.push(format!(
+            "return vera_component_{}_invariants(ctx);",
+            operation.component.0
+        ));
+        let mut post_params = params.clone();
+        post_params.push(("operation_effect_base".into(), "u32".into()));
+        self.finish_function(
+            &format!("vera_operation_{}_post", operation.id.0),
+            "bool",
+            post_params,
+        );
+        self.effect_base = "0u".into();
+        let args = params
+            .iter()
+            .map(|(name, _)| format!(",{name}"))
+            .collect::<String>();
+        let base = if self.effect_storage.is_some() {
+            format!("{c}.emitted_count")
+        } else {
+            "0u".into()
+        };
+        self.context_function(&format!("vera_operation_{}", operation.id.0), "bool", params,
+            &format!("State saved_pre={c}.pre;u32 effect_base={base};{c}.pre={c}.s;bool ok=vera_operation_{}_apply(ctx{args});if(ok){{if(!vera_operation_{}_post(ctx{args},effect_base)){{{c}.trap=1u;ok=false;}}}}{c}.pre=saved_pre;return ok;", operation.id.0, operation.id.0));
     }
 
     fn transition(&mut self, transition: &Transition) {
-        let stride = transition_effect_stride(self.program, transition);
+        let stride = effective_effect_stride(self.program, transition);
         self.record_effects = stride.is_some();
         self.effect_stride = stride.unwrap_or(0);
         let tn = Self::transition_name(transition);
@@ -1825,7 +1995,11 @@ impl<'a> Generator<'a> {
         };
         let c = self.context();
         let reset_effects = if self.effect_storage.is_some() {
-            format!("{c}.emitted_count=0u;")
+            format!(
+                "{c}.emitted_count=0u;{c}.emitted_stride={}u;{c}.emitted_record={};",
+                self.effect_stride,
+                Self::bool_text(self.record_effects)
+            )
         } else {
             String::new()
         };

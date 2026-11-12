@@ -50,6 +50,7 @@ impl Module {
 serialize_node!(Module, "Module", name => "name", decls => "decls");
 
 node_enum!(Decl {
+    Component(ComponentDecl),
     Table(TableDecl),
     Invariant(InvariantDecl),
     Projection(ProjectionDecl),
@@ -59,6 +60,30 @@ node_enum!(Decl {
     Record(RecordDecl),
     Union(UnionDecl),
 });
+
+#[derive(Clone, Debug)]
+pub struct ComponentDecl {
+    pub name: String,
+    pub owns: Vec<String>,
+    pub invariants: Vec<InvariantDecl>,
+    pub operations: Vec<OperationDecl>,
+    pub span: Span,
+}
+serialize_node!(ComponentDecl, "ComponentDecl", name => "name", owns => "owns", invariants => "invariants", operations => "operations");
+#[derive(Clone, Debug)]
+pub struct OperationDecl {
+    pub transition: TransitionDecl,
+    pub effects: Vec<String>,
+}
+serialize_node!(OperationDecl, "OperationDecl", transition => "contract", effects => "effects");
+#[derive(Clone, Debug)]
+pub struct OperationCall {
+    pub component: String,
+    pub operation: String,
+    pub args: Vec<Expr>,
+    pub span: Span,
+}
+serialize_node!(OperationCall, "OperationCall", component => "component", operation => "operation", args => "args");
 
 #[derive(Clone, Debug)]
 pub struct TypeRef {
@@ -372,6 +397,7 @@ pub struct Fold {
 serialize_node!(Fold, "Fold", n => "n", acc_name => "acc_name", acc_type => "acc_type", init => "init", index_name => "index_name", lo => "lo", hi => "hi", body => "body", yield_expr => "yield_expr");
 
 node_enum!(Stmt {
+    OperationCall(OperationCall),
     Let(Let),
     Guard(Guard),
     TableSet(TableSet),

@@ -13,6 +13,9 @@ use crate::ir::{self as i, *};
 use crate::types::{compute_value_layout, Domain, ExprType, ScalarType, ValueType};
 use crate::value::{literal_in_domain, symbol_id, Value};
 
+#[path = "semantic/components.rs"]
+mod components;
+
 type Result<T> = std::result::Result<T, Diagnostic>;
 type Scope = BTreeMap<String, BindingId>;
 
@@ -78,6 +81,7 @@ struct Analyzer {
     transition_names: BTreeMap<String, TransitionId>,
     function_names: BTreeMap<String, FunctionId>,
     stats: FoldStats,
+    active_component: Option<ComponentId>,
 }
 
 fn diagnostic(code: &str, message: impl Into<String>, span: Span) -> Diagnostic {
@@ -102,6 +106,7 @@ impl Analyzer {
             transition_names: BTreeMap::new(),
             function_names: BTreeMap::new(),
             stats: FoldStats::default(),
+            active_component: None,
         }
     }
 
@@ -124,6 +129,7 @@ impl Analyzer {
                 self.transition_names.insert(transition.name.clone(), id);
             }
         }
+        self.collect_components(&declarations)?;
         self.functions(&declarations)?;
         let mut invariant_names = BTreeSet::new();
         for declaration in &declarations {
@@ -136,6 +142,11 @@ impl Analyzer {
                     ));
                 }
                 self.invariant(invariant)?;
+            }
+        }
+        for declaration in &declarations {
+            if let a::Decl::Component(component) = declaration {
+                self.component(component)?;
             }
         }
         for declaration in &declarations {
@@ -860,6 +871,7 @@ impl Analyzer {
             Context::specification(Snapshot::Current),
         )?;
         self.program.invariants.push(Invariant {
+            owner: self.active_component,
             name: invariant.name.clone(),
             quantifier,
             condition: expression.id,
@@ -938,6 +950,18 @@ impl Analyzer {
     }
 
     fn transition(&mut self, transition: &a::TransitionDecl) -> Result<()> {
+        let first_expression = self.program.expressions.len();
+        let lowered = self.lower_transition(transition)?;
+        self.check_owned_writes(&lowered.body)?;
+        for expression in &self.program.expressions[first_expression..] {
+            if let ExprKind::Fold(fold) = &expression.kind {
+                self.check_owned_writes(&fold.body)?;
+            }
+        }
+        self.program.transitions.push(lowered);
+        Ok(())
+    }
+    fn lower_transition(&mut self, transition: &a::TransitionDecl) -> Result<Transition> {
         let commits = transition
             .body
             .iter()
@@ -1040,8 +1064,12 @@ impl Analyzer {
         } else {
             1
         };
-        self.program.transitions.push(Transition {
-            id: self.transition_names[&transition.name],
+        Ok(Transition {
+            id: self
+                .transition_names
+                .get(&transition.name)
+                .copied()
+                .unwrap_or(TransitionId(usize::MAX)),
             name: transition.name.clone(),
             params,
             reads: actual_reads,
@@ -1054,8 +1082,7 @@ impl Analyzer {
             max_fold_product: self.stats.product,
             tier,
             span: transition.span,
-        });
-        Ok(())
+        })
     }
 
     fn accesses(&mut self, paths: &[a::AccessPath], scope: &Scope) -> Result<Vec<Access>> {
@@ -2446,6 +2473,74 @@ impl Analyzer {
             ));
         }
         let (kind, cost) = match statement {
+            a::Stmt::OperationCall(call) => {
+                if self.active_component.is_some() {
+                    return Err(diagnostic(
+                        "D_OPERATION_NESTING",
+                        "stateful operations are leaf helpers; compose calls in a transition",
+                        span,
+                    ));
+                }
+                let name = format!("{}.{}", call.component, call.operation);
+                let id = self.program.operation_id(&name).ok_or_else(|| {
+                    diagnostic(
+                        "D_UNKNOWN_OPERATION",
+                        format!("unknown operation {name:?}"),
+                        span,
+                    )
+                })?;
+                let operation = self.program.operation(id).clone();
+                if call.args.len() != operation.transition.params.len() {
+                    return Err(diagnostic(
+                        "D_TYPE_MISMATCH",
+                        "operation argument count differs from its declaration",
+                        span,
+                    ));
+                }
+                let mut args = Vec::new();
+                let mut cost = operation.transition.wcet_bound;
+                for (arg, parameter) in call.args.iter().zip(&operation.transition.params) {
+                    let value = self.expression(
+                        arg,
+                        scope,
+                        Some(ExprType::scalar(parameter.ty.clone())),
+                        context,
+                    )?;
+                    cost = add_cost(cost, value.cost, span)?;
+                    args.push(value.id);
+                }
+                self.stats.depth = self.stats.depth.max(operation.transition.fold_depth);
+                self.stats.product = self.stats.product.max(
+                    context
+                        .fold_product
+                        .checked_mul(operation.transition.max_fold_product)
+                        .ok_or_else(|| {
+                            diagnostic(
+                                "D_WCET_OVERFLOW",
+                                "operation fold product exceeds u32",
+                                span,
+                            )
+                        })?,
+                );
+                let replacements = operation
+                    .transition
+                    .params
+                    .iter()
+                    .zip(&args)
+                    .map(|(p, arg)| (p.binding, *arg))
+                    .collect();
+                let reads = self.instantiate_frame(&operation.reads, &replacements);
+                let writes = self.instantiate_frame(&operation.writes, &replacements);
+                (
+                    StmtKind::OperationCall {
+                        operation: id,
+                        args,
+                        reads,
+                        writes,
+                    },
+                    add_cost(1, cost, span)?,
+                )
+            }
             a::Stmt::Let(binding) => {
                 if scope.contains_key(&binding.name) {
                     return Err(diagnostic(
@@ -2681,6 +2776,7 @@ impl Analyzer {
 
     fn statement_state_dependent(&self, statement: &a::Stmt, scope: &Scope) -> bool {
         match statement {
+            a::Stmt::OperationCall(_) => true,
             a::Stmt::Let(binding) => self.source_state_dependent(&binding.value, scope),
             a::Stmt::Guard(guard) => self.source_state_dependent(&guard.cond, scope),
             a::Stmt::TableSet(_) | a::Stmt::TableAlloc(_) => true,
@@ -2892,6 +2988,17 @@ impl Analyzer {
                     fields.iter().map(|(_, expression)| *expression).collect()
                 }
                 StmtKind::Emit { args, .. } => args.clone(),
+                StmtKind::OperationCall {
+                    args,
+                    reads: call_reads,
+                    writes: call_writes,
+                    ..
+                } => {
+                    reads.extend(call_reads.iter().cloned());
+                    writes.extend(call_writes.iter().cloned());
+                    *tier_two = true;
+                    args.clone()
+                }
                 StmtKind::Commit => Vec::new(),
             };
             for expression in expressions {
@@ -3217,6 +3324,7 @@ fn binary_op(name: &str) -> Option<BinaryOp> {
 
 fn statement_span(statement: &a::Stmt) -> Span {
     match statement {
+        a::Stmt::OperationCall(value) => value.span,
         a::Stmt::Let(value) => value.span,
         a::Stmt::Guard(value) => value.span,
         a::Stmt::TableSet(value) => value.span,

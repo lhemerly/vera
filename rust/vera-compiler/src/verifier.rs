@@ -9,6 +9,9 @@
 
 #[path = "smt/codecs.rs"]
 mod codecs;
+#[path = "smt/components.rs"]
+mod components;
+use components::operation_dependencies;
 #[path = "smt/terms.rs"]
 mod terms;
 
@@ -250,6 +253,9 @@ struct Encoding<'a> {
     program: &'a CheckedProgram,
     transition: Transition,
     target_function: Option<FunctionId>,
+    target_operation: Option<OperationId>,
+    verified_operations: &'a BTreeSet<OperationId>,
+    invocation_pre: Option<SymbolicState>,
     verified_functions: &'a BTreeSet<FunctionId>,
     declared_functions: BTreeSet<FunctionId>,
     summary_calls: usize,
@@ -394,6 +400,8 @@ impl<'a> Encoding<'a> {
         config: &'a VerifierConfig,
         verified_functions: &'a BTreeSet<FunctionId>,
         target_function: Option<FunctionId>,
+        target_operation: Option<OperationId>,
+        verified_operations: &'a BTreeSet<OperationId>,
     ) -> LowerResult<Self> {
         let tables = if target_function.is_some() {
             &[][..]
@@ -440,6 +448,9 @@ impl<'a> Encoding<'a> {
             program,
             transition: transition.clone(),
             target_function,
+            target_operation,
+            verified_operations,
+            invocation_pre: None,
             verified_functions,
             declared_functions: BTreeSet::new(),
             summary_calls: 0,
@@ -601,6 +612,21 @@ impl<'a> Encoding<'a> {
         for requirement in &transition.requires {
             let condition = this.expr(requirement.value)?;
             this.script.guard(&mut this.path, &condition.text);
+        }
+        // An operation's frames are executable contract expressions. Their
+        // definedness is proved under requirements, before body mutation, even
+        // when a declared frame is wider than the body's inferred accesses.
+        if let Some(id) = target_operation {
+            for frame in program
+                .operation(id)
+                .reads
+                .iter()
+                .chain(&program.operation(id).writes)
+            {
+                if let Some(key) = frame.key {
+                    this.expr(key)?;
+                }
+            }
         }
         this.statements(&transition.body)?;
         let mut postconditions = vec![if target_function.is_some() {
@@ -787,7 +813,7 @@ impl<'a> Encoding<'a> {
 
     fn state(&self, snapshot: Snapshot) -> &SymbolicState {
         if snapshot == Snapshot::Pre || self.pre_context {
-            &self.pre
+            self.invocation_pre.as_ref().unwrap_or(&self.pre)
         } else {
             &self.current
         }
@@ -1602,6 +1628,9 @@ impl<'a> Encoding<'a> {
                 StmtKind::Eval(value) => {
                     self.expr(*value)?;
                 }
+                StmtKind::OperationCall {
+                    operation, args, ..
+                } => self.operation_call(*operation, args, statement.span)?,
                 StmtKind::Commit => {}
             }
         }
@@ -1834,6 +1863,12 @@ impl<'a> Encoding<'a> {
             .map(|table| table.id)
             .collect::<Vec<_>>();
         for invariant in self.program.invariants() {
+            if self
+                .target_operation
+                .is_some_and(|id| invariant.owner != Some(self.program.operation(id).component))
+            {
+                continue;
+            }
             if let Some((table, binding)) = invariant.quantifier {
                 if !pre
                     && row_local(
@@ -2242,8 +2277,13 @@ fn project(encoding: &Encoding<'_>, model: &z3::Model) -> Result<Candidate, Stri
         .map_err(|error| format!("aggregate materialization: {}", error.code))?;
     rebuild_indexes(encoding.program, &mut state)
         .map_err(|error| format!("index materialization: {}", error.code))?;
-    validate_state(encoding.program, &state)
-        .map_err(|error| format!("pre-state validation: {}", error.code))?;
+    if let Some(id) = encoding.target_operation {
+        Machine::with_state_operation(encoding.program, state.clone(), id)
+            .map_err(|error| format!("operation pre-state validation: {}", error.code))?;
+    } else {
+        validate_state(encoding.program, &state)
+            .map_err(|error| format!("pre-state validation: {}", error.code))?;
+    }
     Ok(Candidate { params, state })
 }
 
@@ -2317,6 +2357,7 @@ fn violated_postconditions(
     pre: &State,
     current: &State,
     bindings: &BTreeMap<BindingId, Value>,
+    owner: Option<ComponentId>,
 ) -> (Vec<String>, Vec<FailedEnsure>) {
     let failed_ensures = failed_ensures(program, transition, pre, current, bindings);
     let mut violated = failed_ensures
@@ -2324,6 +2365,9 @@ fn violated_postconditions(
         .map(|ensure| format!("ensure {}", ensure.name))
         .collect::<Vec<_>>();
     for invariant in program.invariants() {
+        if owner.is_some_and(|owner| invariant.owner != Some(owner)) {
+            continue;
+        }
         if let Some((table, binding)) = invariant.quantifier {
             let table_info = program.table(table);
             let table_state = &current.tables[table.0];
@@ -2447,9 +2491,22 @@ fn replay(
     if let Some(function) = encoding.target_function {
         return replay_function(encoding, candidate, obligation, function);
     }
-    let mut machine = Machine::with_state(encoding.program, candidate.state.clone())
-        .map_err(|error| format!("native state admission: {}", error.code))?;
-    let execution = machine.execute(&encoding.transition.name, &candidate.params, true);
+    if matches!(obligation, Obligation::Panic) {
+        if let Some(counterexample) = components::replay_frame_definedness(encoding, candidate)? {
+            return Ok(counterexample);
+        }
+    }
+    let mut machine = if let Some(id) = encoding.target_operation {
+        Machine::with_state_operation(encoding.program, candidate.state.clone(), id)
+    } else {
+        Machine::with_state(encoding.program, candidate.state.clone())
+    }
+    .map_err(|error| format!("native state admission: {}", error.code))?;
+    let execution = if let Some(id) = encoding.target_operation {
+        machine.execute_operation(id, &candidate.params, true)
+    } else {
+        machine.execute(&encoding.transition.name, &candidate.params, true)
+    };
     let mut ensure_failures = Vec::new();
     let (trace, violated, law, directive, failure) = match (obligation, execution) {
         (Obligation::Panic, Err(error)) if error.kind == FailureKind::Trap => {
@@ -2479,6 +2536,9 @@ fn replay(
                 &candidate.state,
                 &machine.state,
                 &execution.bindings,
+                encoding
+                    .target_operation
+                    .map(|id| encoding.program.operation(id).component),
             );
             if violated.is_empty() {
                 return Err(
@@ -2519,7 +2579,12 @@ fn replay(
         }
     };
     Ok(Counterexample {
-        target_kind: "transition".into(),
+        target_kind: if encoding.target_operation.is_some() {
+            "operation"
+        } else {
+            "transition"
+        }
+        .into(),
         return_value: None,
         typed_return_value: None,
         transition: encoding.transition.name.clone(),
@@ -2741,6 +2806,8 @@ struct VerificationSession<'a> {
     config: &'a VerifierConfig,
     results: BTreeMap<FunctionId, VerificationResult>,
     verified: BTreeSet<FunctionId>,
+    operation_results: BTreeMap<OperationId, VerificationResult>,
+    verified_operations: BTreeSet<OperationId>,
 }
 
 impl<'a> VerificationSession<'a> {
@@ -2750,6 +2817,8 @@ impl<'a> VerificationSession<'a> {
             config,
             results: BTreeMap::new(),
             verified: BTreeSet::new(),
+            operation_results: BTreeMap::new(),
+            verified_operations: BTreeSet::new(),
         }
     }
     fn function(&mut self, id: FunctionId) {
@@ -2786,6 +2855,8 @@ impl<'a> VerificationSession<'a> {
                     self.config,
                     &self.verified,
                     Some(id),
+                    None,
+                    &self.verified_operations,
                 )
             };
             result.target_kind = "function".into();
@@ -2813,16 +2884,44 @@ impl<'a> VerificationSession<'a> {
             .collect()
     }
     fn transition(&mut self, transition: &Transition) -> VerificationResult {
+        let operations = operation_dependencies(self.program, transition);
+        for id in &operations {
+            self.operation(*id);
+        }
         let dependencies = transition_dependencies(self.program, transition);
         for dependency in &dependencies {
             self.function(*dependency);
         }
-        let mut result = if dependencies.iter().any(|id| !self.verified.contains(id)) {
+        let mut result = if dependencies.iter().any(|id| !self.verified.contains(id))
+            || operations
+                .iter()
+                .any(|id| !self.verified_operations.contains(id))
+        {
             failed(&transition.name,diagnostic("D_VERIFY_DEPENDENCY","a called function failed verification; no caller proof may assume its contract",transition.span),self.config)
         } else {
-            verify_target(self.program, transition, self.config, &self.verified, None)
+            verify_target(
+                self.program,
+                transition,
+                self.config,
+                &self.verified,
+                None,
+                None,
+                &self.verified_operations,
+            )
         };
         result.contract_dependencies = self.dependency_evidence(&dependencies);
+        result
+            .contract_dependencies
+            .extend(operations.iter().map(|id| {
+                let result = &self.operation_results[id];
+                ContractDependency {
+                    function: self.program.operation(*id).transition.name.clone(),
+                    safety: result.safety.status.clone(),
+                    panic: result.panic.status.clone(),
+                    liveness: result.liveness.status.clone(),
+                    ok: result.ok(),
+                }
+            }));
         result
     }
 }
@@ -2868,7 +2967,7 @@ fn statement_dependencies(
             StmtKind::Guard { condition, .. } => vec![*condition],
             StmtKind::TableSet { key, value, .. } => vec![*key, *value],
             StmtKind::Allocate { fields, .. } => fields.iter().map(|(_, value)| *value).collect(),
-            StmtKind::Emit { args, .. } => args.clone(),
+            StmtKind::Emit { args, .. } | StmtKind::OperationCall { args, .. } => args.clone(),
             StmtKind::Commit => Vec::new(),
         };
         for expression in expressions {
@@ -2950,8 +3049,18 @@ fn verify_target(
     config: &VerifierConfig,
     verified: &BTreeSet<FunctionId>,
     function: Option<FunctionId>,
+    operation: Option<OperationId>,
+    verified_operations: &BTreeSet<OperationId>,
 ) -> VerificationResult {
-    let encoding = match Encoding::new(program, transition, config, verified, function) {
+    let encoding = match Encoding::new(
+        program,
+        transition,
+        config,
+        verified,
+        function,
+        operation,
+        verified_operations,
+    ) {
         Ok(encoding) => encoding,
         Err(diagnostic) => return failed(&transition.name, diagnostic, config),
     };
@@ -2985,6 +3094,8 @@ fn verify_target(
     VerificationResult {
         target_kind: if function.is_some() {
             "function"
+        } else if operation.is_some() {
+            "operation"
         } else {
             "transition"
         }
@@ -3066,6 +3177,12 @@ pub fn verify_all(program: &CheckedProgram, config: &VerifierConfig) -> Vec<Veri
         .iter()
         .map(|f| session.results[&f.id].clone())
         .collect::<Vec<_>>();
+    for operation in program.operations() {
+        session.operation(operation.id);
+        results.push(session.operation_results[&operation.id].clone());
+    }
     results.extend(program.transitions().iter().map(|t| session.transition(t)));
     results
 }
+
+pub use components::verify_operation;

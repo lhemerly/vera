@@ -244,6 +244,9 @@ impl<'a> Generator<'a> {
         for function in program.functions() {
             reserved.insert(format!("vera_function_{}", function.id.0));
         }
+        for operation in program.operations() {
+            reserved.insert(format!("vera_operation_{}", operation.id.0));
+        }
         for ty in program.types() {
             for stem in [
                 "vera_valid_type",
@@ -301,6 +304,7 @@ impl<'a> Generator<'a> {
             "InvalidEncoding",
             "EffectAccess",
             "FunctionPrecondition",
+            "OperationPrecondition",
             "VariantAccess",
             "BytesBounds",
             "BytesCapacity",
@@ -311,6 +315,9 @@ impl<'a> Generator<'a> {
         .collect::<BTreeSet<_>>();
         for transition in &program.transitions {
             collect_error_codes(&transition.body, &mut error_codes);
+        }
+        for operation in program.operations() {
+            collect_error_codes(&operation.transition.body, &mut error_codes);
         }
         for expression in &program.expressions {
             if let ExprKind::Fold(fold) = &expression.kind {
@@ -392,6 +399,9 @@ impl<'a> Generator<'a> {
         self.state();
         for function in self.program.functions() {
             self.function(function)?;
+        }
+        for operation in self.program.operations() {
+            self.operation(operation)?;
         }
         for index in 0..self.program.transitions.len() {
             self.transition(index)?;
@@ -895,7 +905,7 @@ impl Generator<'_> {
                             }
                             locals.push(*binding);
                         }
-                        StmtKind::Emit { args, .. } => {
+                        StmtKind::Emit { args, .. } | StmtKind::OperationCall { args, .. } => {
                             for id in args {
                                 self.expression_bindings(*id, result)
                             }
@@ -1666,6 +1676,26 @@ impl Generator<'_> {
                     assignments.join(",")
                 ));
             }
+            StmtKind::OperationCall {
+                operation, args, ..
+            } => {
+                let operation = self.program.operation(*operation);
+                let mut values = Vec::new();
+                for (argument, parameter) in args.iter().zip(&operation.transition.params) {
+                    let value = self.narrowed(*argument, env, &parameter.ty)?;
+                    let temp = self.fresh("operation_arg");
+                    self.line(format!(
+                        "let {temp}:{}={value};",
+                        self.value_rust_type(&parameter.ty)
+                    ));
+                    values.push(temp);
+                }
+                let suffix = values.iter().map(|v| format!(",{v}")).collect::<String>();
+                self.line(format!(
+                    "vera_operation_{}(state{suffix})?;",
+                    operation.id.0
+                ));
+            }
             StmtKind::Eval(id) => {
                 let value = self.expr(*id, env)?;
                 self.line(format!("let _={value};"));
@@ -1706,6 +1736,38 @@ impl Generator<'_> {
         }
         let result = self.narrowed(function.body, &env, &function.result_type)?;
         self.line(format!("Ok({result})}}"));
+        Ok(())
+    }
+
+    fn operation(&mut self, operation: &Operation) -> Result<(), Diagnostic> {
+        let transition = &operation.transition;
+        let params = transition
+            .params
+            .iter()
+            .map(|p| {
+                format!(
+                    ",{}:{}",
+                    self.binding(p.binding),
+                    self.value_rust_type(&p.ty)
+                )
+            })
+            .collect::<String>();
+        self.line(format!("fn vera_operation_{}(state:&mut State{params})->Result<(),ErrorCode>{{let entry=state.clone();let pre=&entry;", operation.id.0));
+        let mut env = transition
+            .params
+            .iter()
+            .map(|p| (p.binding, self.binding(p.binding)))
+            .collect::<Environment>();
+        for requirement in &transition.requires {
+            let condition = self.expr(requirement.value, &env)?;
+            self.line(format!(
+                "if !({condition}){{return Err(ErrorCode::OperationPrecondition);}}"
+            ));
+        }
+        for statement in &transition.body {
+            self.statement(statement, &mut env)?;
+        }
+        self.line("Ok(())}");
         Ok(())
     }
 

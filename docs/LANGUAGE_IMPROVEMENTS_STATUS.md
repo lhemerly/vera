@@ -56,9 +56,9 @@ Explicit host execution/batching configuration is separate from proof defaults.
 | --- | --- |
 | Effect postconditions and symbolic outbox | Implemented for existing scalar payloads |
 | Pure reusable verified functions | Implemented for scalar and structured values with independent dependency proofs and reusable summaries |
-| Stateful component contracts | Not implemented; need invariant ownership and explicit read/write/effect frames |
+| Stateful component contracts | Owned invariants and independently verified leaf operations with explicit read/write/effect frames; allocation/nested operations remain outside this increment |
 | General records and tagged unions | Implemented across functions, effects, locals, state, projections and canonical host codecs |
-| Variable-length bounded bytes/strings and source codecs | Not implemented; bytes32 and host persistence codecs remain existing facilities |
+| Variable-length bounded bytes/strings and source codecs | Bounded bytes and canonical source codecs implemented; UTF-8 strings remain separate future work |
 | AI self-repair | Precise verifiable evidence and proof boundaries, not autonomous specification weakening or automatic patch admission |
 
 Structured values now share one canonical type/layout/validation contract across
@@ -135,3 +135,23 @@ same three unchanged runtime-lint warnings allowed as above. Independent static
 review found no circular decoder/round-trip assumption in the encoding.
 UTF-8 strings and stateful component ownership/frame contracts are not part of
 this completed byte milestone.
+
+The component increment adds exclusive table-mutation ownership, owner-scoped
+independent operation proofs and admitted state/effect summaries, invocation-local
+old/outbox semantics and native/Rust/CUDA/GLSL/WGSL execution. Its supported
+subset and deliberate exclusions are specified in
+[component contracts](COMPONENT_CONTRACTS.md). It does not claim allocation or
+operation-to-operation composition support, or proof-memory independence from
+unrelated table capacities. Final validation results are recorded separately.
+
+Final component milestone validation: all 440 workspace tests are covered against
+the final source, with zero failed or ignored: a fresh 435-test compiler run and
+five runtime tests, including the 50,000-iteration transfer stress (185.57 seconds).
+The compiler run required actual EGL shader execution with Mesa shader caching
+disabled and `RUST_MIN_STACK` unset. The EGL test host uses Mesa's software
+renderer, not the hardware GPU; CUDA tests use host execution. All 33 new
+component tests passed, including invalid-summary admission, foreign-invariant
+isolation, undefined frame keys, exact aggregate frames, repeated-call old/outbox
+boundaries and atomic rollback. The documented component example also verifies
+and executes successfully. Formatting, whitespace and all-target Clippy passed
+with only the same pre-existing runtime lint allowed above.

@@ -182,7 +182,62 @@ impl Parser {
         })
     }
 
+    fn word(&self, wanted: &str) -> bool {
+        matches!(&self.peek().kind, TokenKind::Ident(v) | TokenKind::Keyword(v) if v == wanted)
+    }
+    fn expect_word(&mut self, wanted: &str) -> Result<Token> {
+        if !self.word(wanted) {
+            return Err(self.error(format!("expected {wanted:?}")));
+        }
+        Ok(self.advance())
+    }
+    fn names(&mut self) -> Result<Vec<String>> {
+        self.expect_punct("[")?;
+        let mut names = Vec::new();
+        if !self.accept_punct("]") {
+            loop {
+                names.push(self.ident()?.0);
+                if !self.accept_punct(",") {
+                    break;
+                }
+            }
+            self.expect_punct("]")?;
+        }
+        Ok(names)
+    }
+    fn component(&mut self) -> Result<ComponentDecl> {
+        let start = self.expect_word("component")?.span;
+        let name = self.ident()?.0;
+        self.expect_word("owns")?;
+        let owns = self.names()?;
+        self.expect_punct("{")?;
+        let mut invariants = Vec::new();
+        let mut operations = Vec::new();
+        while !self.accept_punct("}") {
+            if self.keyword("invariant") {
+                invariants.push(self.invariant()?);
+            } else if self.word("operation") {
+                let (transition, effects) = self.transaction(true)?;
+                operations.push(OperationDecl {
+                    transition,
+                    effects,
+                });
+            } else {
+                return Err(self.error("expected component invariant or operation"));
+            }
+        }
+        Ok(ComponentDecl {
+            name,
+            owns,
+            invariants,
+            operations,
+            span: self.cover(start),
+        })
+    }
     fn declaration(&mut self) -> Result<Decl> {
+        if self.word("component") {
+            return self.component().map(Decl::Component);
+        }
         if matches!(&self.peek().kind,TokenKind::Ident(name) if name=="record" || name=="union") {
             return self.structured_declaration();
         }
@@ -730,13 +785,24 @@ impl Parser {
     }
 
     fn transition(&mut self) -> Result<TransitionDecl> {
-        let start = self.expect_keyword("transition")?.span;
+        self.transaction(false).map(|(transition, _)| transition)
+    }
+    fn transaction(&mut self, operation: bool) -> Result<(TransitionDecl, Vec<String>)> {
+        let start = self
+            .expect_word(if operation { "operation" } else { "transition" })?
+            .span;
         let name = self.ident()?.0;
         let params = self.params()?;
         self.expect_keyword("reads")?;
         let reads = self.access_list()?;
         self.expect_keyword("writes")?;
         let writes = self.access_list()?;
+        let effects = if operation {
+            self.expect_word("effects")?;
+            self.names()?
+        } else {
+            Vec::new()
+        };
         let mut requires = Vec::new();
         let mut ensures = Vec::new();
         while self.accept_keyword("require") {
@@ -760,16 +826,19 @@ impl Parser {
             span: self.cover(commit),
         }));
         self.expect_punct("}")?;
-        Ok(TransitionDecl {
-            name,
-            params,
-            reads,
-            writes,
-            requires,
-            ensures,
-            body,
-            span: self.cover(start),
-        })
+        Ok((
+            TransitionDecl {
+                name,
+                params,
+                reads,
+                writes,
+                requires,
+                ensures,
+                body,
+                span: self.cover(start),
+            },
+            effects,
+        ))
     }
 
     fn statements(&mut self, stop: &str) -> Result<Vec<Stmt>> {
@@ -788,6 +857,30 @@ impl Parser {
 
     fn statement(&mut self) -> Result<Stmt> {
         let token = self.peek().clone();
+        if self.word("call") {
+            self.advance();
+            let component = self.ident()?.0;
+            self.expect_punct(".")?;
+            let operation = self.ident()?.0;
+            self.expect_punct("(")?;
+            let mut args = Vec::new();
+            if !self.accept_punct(")") {
+                loop {
+                    args.push(self.pure_expr()?);
+                    if !self.accept_punct(",") {
+                        break;
+                    }
+                }
+                self.expect_punct(")")?;
+            }
+            self.expect_punct(";")?;
+            return Ok(Stmt::OperationCall(OperationCall {
+                component,
+                operation,
+                args,
+                span: self.cover(token.span),
+            }));
+        }
         match &token.kind {
             TokenKind::Keyword(name) => match name.as_str() {
                 "let" => self.let_statement(),

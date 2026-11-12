@@ -394,7 +394,7 @@ fn statement_expressions(statement: &Stmt, children: &mut Vec<ExprId>) {
         StmtKind::Allocate { fields, .. } => {
             children.extend(fields.iter().map(|(_, expression)| *expression))
         }
-        StmtKind::Emit { args, .. } => children.extend(args),
+        StmtKind::Emit { args, .. } | StmtKind::OperationCall { args, .. } => children.extend(args),
         StmtKind::Commit => {}
     }
 }

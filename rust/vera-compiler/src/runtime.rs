@@ -4,7 +4,7 @@
 //! A successful commit publishes the complete staged value; every failure drops
 //! it, including occupancy, generations, indexes, aggregates and effects.
 
-use crate::ir::FunctionId;
+use crate::ir::{ComponentId, FunctionId, OperationId};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -267,6 +267,28 @@ impl<'p> Machine<'p> {
         })
     }
 
+    /// Admission for an independently verified component operation: structural
+    /// validity is global, but only its owner's invariants are assumptions.
+    pub fn with_state_operation(
+        program: &'p CheckedProgram,
+        state: State,
+        operation: OperationId,
+    ) -> Result<Self, RuntimeError> {
+        validate_state_structure(program, &state)?;
+        check_component_invariants(
+            program,
+            &state,
+            &state,
+            program.operation(operation).component,
+        )?;
+        Ok(Self {
+            program,
+            state,
+            last_bindings: BTreeMap::new(),
+            last_trace: Vec::new(),
+        })
+    }
+
     pub fn from_state(program: &'p CheckedProgram, state: State) -> Result<Self, RuntimeError> {
         Self::with_state(program, state)
     }
@@ -300,6 +322,30 @@ impl<'p> Machine<'p> {
             .transition_id(name)
             .map(|id| self.program.transition(id))
             .ok_or_else(|| RuntimeError::new("ERR_UNKNOWN_TRANSITION", FailureKind::Input))?;
+        self.execute_transition(transition, args, record_trace)
+    }
+
+    pub fn execute_operation(
+        &mut self,
+        operation: OperationId,
+        args: &BTreeMap<String, Value>,
+        record_trace: bool,
+    ) -> Result<Execution, RuntimeError> {
+        self.execute_transition(
+            &self.program.operation(operation).transition,
+            args,
+            record_trace,
+        )
+    }
+
+    fn execute_transition(
+        &mut self,
+        transition: &Transition,
+        args: &BTreeMap<String, Value>,
+        record_trace: bool,
+    ) -> Result<Execution, RuntimeError> {
+        self.last_bindings.clear();
+        self.last_trace.clear();
         let bindings = bind_params(self.program, &transition.params, args)?;
         let mut staged = self.state.clone();
         let (result, bindings, mut trace) = {
@@ -560,6 +606,11 @@ pub fn rebuild_indexes(program: &CheckedProgram, state: &mut State) -> Result<()
 }
 
 pub fn validate_state(program: &CheckedProgram, state: &State) -> Result<(), RuntimeError> {
+    validate_state_structure(program, state)?;
+    check_invariants(program, state, state)
+}
+
+fn validate_state_structure(program: &CheckedProgram, state: &State) -> Result<(), RuntimeError> {
     validate_rows(program, state)?;
     for info in program.tables() {
         let table = &state.tables[info.id.0];
@@ -639,7 +690,7 @@ pub fn validate_state(program: &CheckedProgram, state: &State) -> Result<(), Run
             coerce_value(program, value, &param.ty).map_err(|_| invalid_state())?;
         }
     }
-    check_invariants(program, state, state)
+    Ok(())
 }
 
 /// Execute a pure function without allocating or validating unrelated program state.
@@ -696,6 +747,29 @@ pub fn check_invariants(
     current: &State,
     pre: &State,
 ) -> Result<(), RuntimeError> {
+    check_selected_invariants(program, current, pre, None)
+}
+
+pub fn check_component_invariants(
+    program: &CheckedProgram,
+    current: &State,
+    pre: &State,
+    component: ComponentId,
+) -> Result<(), RuntimeError> {
+    check_selected_invariants(
+        program,
+        current,
+        pre,
+        Some(&program.component(component).invariants),
+    )
+}
+
+fn check_selected_invariants(
+    program: &CheckedProgram,
+    current: &State,
+    pre: &State,
+    selected: Option<&[usize]>,
+) -> Result<(), RuntimeError> {
     let mut staged = current.clone();
     let mut evaluator = Evaluator {
         program,
@@ -705,7 +779,10 @@ pub fn check_invariants(
         trace: Vec::new(),
         record_trace: false,
     };
-    for invariant in program.invariants() {
+    for (index, invariant) in program.invariants().iter().enumerate() {
+        if selected.is_some_and(|indices| !indices.contains(&index)) {
+            continue;
+        }
         let error = || {
             RuntimeError::new(
                 format!("ERR_INVARIANT_{}", invariant.name),
@@ -1226,6 +1303,44 @@ impl Evaluator<'_, '_> {
         Ok(())
     }
 
+    fn call_operation(
+        &mut self,
+        operation: OperationId,
+        args: &[Value],
+    ) -> Result<(), RuntimeError> {
+        let operation = self.program.operation(operation);
+        let params = operation
+            .transition
+            .params
+            .iter()
+            .zip(args)
+            .map(|(p, v)| (p.name.clone(), v.clone()))
+            .collect();
+        let bindings = bind_params(self.program, &operation.transition.params, &params)?;
+        // The caller owns atomic rollback. This snapshot is the invocation's
+        // `old` state and outbox boundary, never the enclosing transaction's.
+        let pre = self.state.clone();
+        let mut child = Evaluator {
+            program: self.program,
+            state: self.state,
+            pre: &pre,
+            bindings,
+            trace: Vec::new(),
+            record_trace: self.record_trace,
+        };
+        let result = child
+            .transition(&operation.transition)
+            .map_err(|mut error| {
+                if error.kind == FailureKind::Precondition {
+                    error.kind = FailureKind::Trap;
+                    error.code = "ERR_OPERATION_PRECONDITION".into();
+                }
+                error
+            });
+        self.trace.extend(child.trace);
+        result
+    }
+
     fn statement(&mut self, statement: &Stmt, context: Snapshot) -> Result<(), RuntimeError> {
         self.statement_inner(&statement.kind, context, statement.span)
             .map_err(|error| error.at(statement.span))
@@ -1381,6 +1496,15 @@ impl Evaluator<'_, '_> {
                     effect: *effect,
                     args: values,
                 });
+            }
+            StmtKind::OperationCall {
+                operation, args, ..
+            } => {
+                let mut values = Vec::with_capacity(args.len());
+                for argument in args {
+                    values.push(self.value(*argument, context)?);
+                }
+                self.call_operation(*operation, &values)?;
             }
             StmtKind::Eval(value) => {
                 self.value(*value, context)?;

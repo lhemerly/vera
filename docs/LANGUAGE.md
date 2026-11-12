@@ -197,6 +197,18 @@ in function ensures. See [compositional functions](COMPOSITIONAL_FUNCTIONS.md)
 for precise admission, replay and current scope, and `examples/functions.vera`
 for a runnable state-free effect protocol using nested helpers.
 
+## Owned stateful components
+
+`component Name owns [Table, ...]` groups owned invariants and independently
+verified `operation` contracts. Operations declare `reads`, `writes`, and
+`effects [Effect, ...]`; transitions invoke them with `call Name.operation(args);`.
+Only an owner's operations may mutate its tables. Operation `old` and effect
+observations use call-entry boundaries, while the outer transaction retains
+atomic rollback. The current subset is leaf operations over existing rows with
+input-derived or wildcard frames; allocation and nested operation calls are
+rejected explicitly. See [component contracts](COMPONENT_CONTRACTS.md) for proof
+admission, scopes, supported targets and precise feature boundaries.
+
 ## Invariants and verification
 
 ```vera

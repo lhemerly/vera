@@ -15,6 +15,8 @@ macro_rules! id {
     )*};
 }
 id!(
+    ComponentId,
+    OperationId,
     TableId,
     ExprId,
     BindingId,
@@ -297,6 +299,12 @@ pub struct Stmt {
 }
 #[derive(Clone, Debug)]
 pub enum StmtKind {
+    OperationCall {
+        operation: OperationId,
+        args: Vec<ExprId>,
+        reads: Vec<Access>,
+        writes: Vec<Access>,
+    },
     Let {
         binding: BindingId,
         value: ExprId,
@@ -353,6 +361,7 @@ pub struct Transition {
 }
 #[derive(Clone, Debug)]
 pub struct Invariant {
+    pub owner: Option<ComponentId>,
     pub name: String,
     pub quantifier: Option<(TableId, BindingId)>,
     pub condition: ExprId,
@@ -386,9 +395,31 @@ pub struct Projection {
     pub span: Span,
 }
 
+/// Exclusive state ownership and the invariants justified at its public boundary.
+#[derive(Clone, Debug)]
+pub struct Component {
+    pub id: ComponentId,
+    pub name: String,
+    pub tables: Vec<TableId>,
+    pub invariants: Vec<usize>,
+}
+/// Stateful leaf helper. Declared frames are retained independently of actual
+/// accesses: caller abstraction must never use body details as a contract.
+#[derive(Clone, Debug)]
+pub struct Operation {
+    pub id: OperationId,
+    pub component: ComponentId,
+    pub transition: Transition,
+    pub reads: Vec<Access>,
+    pub writes: Vec<Access>,
+    pub effects: Vec<EffectId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct CheckedProgram {
     pub(crate) syntax: ast::Module,
+    pub(crate) components: Vec<Component>,
+    pub(crate) operations: Vec<Operation>,
     pub(crate) tables: Vec<Table>,
     pub(crate) types: Vec<TypeDefinition>,
     pub(crate) type_layouts: BTreeMap<TypeId, (usize, usize, u64)>,
@@ -405,6 +436,8 @@ impl CheckedProgram {
     pub(crate) fn empty(syntax: ast::Module) -> Self {
         Self {
             syntax,
+            components: Vec::new(),
+            operations: Vec::new(),
             tables: Vec::new(),
             types: Vec::new(),
             type_layouts: BTreeMap::new(),
@@ -420,6 +453,30 @@ impl CheckedProgram {
     }
     pub fn syntax(&self) -> &ast::Module {
         &self.syntax
+    }
+    pub fn components(&self) -> &[Component] {
+        &self.components
+    }
+    pub fn component(&self, id: ComponentId) -> &Component {
+        &self.components[id.0]
+    }
+    pub fn operations(&self) -> &[Operation] {
+        &self.operations
+    }
+    pub fn operation(&self, id: OperationId) -> &Operation {
+        &self.operations[id.0]
+    }
+    pub fn operation_id(&self, name: &str) -> Option<OperationId> {
+        self.operations
+            .iter()
+            .find(|o| o.transition.name == name)
+            .map(|o| o.id)
+    }
+    pub fn table_owner(&self, id: TableId) -> Option<ComponentId> {
+        self.components
+            .iter()
+            .find(|c| c.tables.contains(&id))
+            .map(|c| c.id)
     }
     pub fn tables(&self) -> &[Table] {
         &self.tables

@@ -1,0 +1,22 @@
+table T capacity 2 {key id:id64<T>;col v:u8;}
+effect Tick(v:u8);
+effect Prelude();
+component Counter owns [T] {
+  invariant bounded {forall k in T:le(T[k].v,10);}
+  operation inc(k:id64<T>) reads [T[k].v] writes [T[k].v] effects [Tick]
+  require live:table_exists(T,k);
+  require room:lt(table_get(T,k,v),10);
+  ensure exact:eq(table_get(T,k,v),add(old(T[k].v),1));
+  ensure count:eq(effect_count(),1);
+  ensure tag:effect_is(Tick,0);
+  ensure payload:eq(effect_arg(Tick,0,v),table_get(T,k,v));
+  body {let %v:u8=table_get(T,k,v);table_set(T,k,v,add(%v,1));emit Tick(add(%v,1));commit;}
+}
+transition twice(k:id64<T>,accept:bool) reads [T[k].v] writes [T[k].v]
+require live:table_exists(T,k);
+require room:le(table_get(T,k,v),8);
+ensure exact:eq(table_get(T,k,v),add(old(T[k].v),2));
+ensure count:eq(effect_count(),3);
+ensure first:effect_is(Prelude,0);
+ensure last:eq(effect_arg(Tick,2,v),table_get(T,k,v));
+body {emit Prelude();call Counter.inc(k);call Counter.inc(k);guard(accept,ERR_REJECT);commit;}
