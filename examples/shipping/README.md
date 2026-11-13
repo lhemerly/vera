@@ -9,6 +9,31 @@ The illustrative policy charges 1500 cents for express, otherwise 500 cents
 below a 5000-cent subtotal and zero at or above it. Weight must be 1–20000 grams.
 These are example business rules, not real shipping rates.
 
+## Try the policy before embedding it
+
+A pure function can be evaluated directly, without generating Rust or creating
+application state:
+
+```sh
+vera run examples/shipping/policy.vera --function shipping_fee \
+  --param weight_grams=1000 --param express=false --param subtotal_cents=4000 --json
+```
+
+The JSON `result` field is `500`. By default, VERA verifies the selected function and its
+called functions before execution. `proof_admitted` describes that proof step,
+not whether your business rules are complete. A failed precondition produces a
+runtime error and a nonzero exit status. `--unverified` explicitly skips proof
+for exploration and marks `proof_admitted` false in JSON mode; runtime checks
+still apply.
+State, snapshot and WAL options are intentionally not accepted for a pure call.
+
+Parameters use the existing CLI formats. For decimal types, `x=1` is the raw
+scaled integer carrier, while `x=1.0` means one whole unit. JSON outputs use
+scaled integers for decimals and declaration-order numeric tags for enums.
+Use `result_type` together with the type definition when interpreting values.
+
+## Embed the same policy
+
 With a built `vera` and `rustc` on PATH:
 
 ```sh

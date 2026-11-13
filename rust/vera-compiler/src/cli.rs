@@ -15,7 +15,7 @@ use vera_compiler::{
     parse_source,
     persistence::{self, Intent, Wal},
     projection::build_affordance_frame,
-    runtime::{rebuild_indexes, recompute_aggregates, Machine, State},
+    runtime::{eval_function, rebuild_indexes, recompute_aggregates, Machine, State},
     semantic::analyze,
     types::{ScalarType, ValueType},
     value::{self, Value},
@@ -31,7 +31,7 @@ Usage: vera <command> <file|-> [options]
   check     Resolve types, footprints, bounds and declarations
   verify    Prove safety, panic freedom and concrete non-vacuity
   contract  Freeze or compare a parser-backed specification (--json)
-  run       Execute --transition NAME [--param NAME=VALUE ...]
+  run       Execute --transition NAME or --function NAME [--param NAME=VALUE ...]
   project   Read --projection NAME [--param NAME=VALUE ...]
   replay    Recover --wal PATH from the initial --setup state
   codegen   Emit rust|glsl|wgsl|cuda: vera codegen TARGET FILE
@@ -44,6 +44,9 @@ Proofs: --transition NAME, --function NAME or --operation Component.name,
 Optional proof budgets (all unset by default): --timeout MS,
         --max-state-cells N, --max-unroll N, --witness-attempts N,
         --max-expression-steps N, --max-smt-bytes N, --max-effect-events N
+Pure functions: --param NAME=VALUE (scalars; bytes as 0xHEX; records/unions as JSON).
+           --function rejects --setup, --snapshot-in/out and --wal.
+           Results use typed JSON: decimals are scaled integers, enums numeric tags.
 Execution: --unverified (development), --snapshot-in FILE,
            --snapshot-out FILE, --wal FILE (recover, append and sync)
 Codegen: --out FILE, --api-out FILE (Rust interface JSON), --no-main, --runtime-crate, --depth N
@@ -145,6 +148,7 @@ fn options(mut args: Vec<OsString>) -> Result<Options> {
             &["--json", "--unverified"],
             &[
                 "--transition",
+                "--function",
                 "--param",
                 "--setup",
                 "--timeout",
@@ -709,6 +713,61 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             let ok = results.iter().all(|r| r.ok());
             if opts.flag("--json") {
                 print_json(json!({"ok":ok,"results":results}))?;
+            }
+            if !ok {
+                return Err((1, String::new()));
+            }
+        }
+        "run" if opts.values.contains_key("--function") => {
+            for option in [
+                "--transition",
+                "--setup",
+                "--snapshot-in",
+                "--snapshot-out",
+                "--wal",
+            ] {
+                if opts.values.contains_key(option) {
+                    return Err(input(format!(
+                        "--function cannot be combined with {option}"
+                    )));
+                }
+            }
+            let name = opts.required("--function")?;
+            let id = program
+                .function_id(name)
+                .ok_or_else(|| input(format!("unknown function {name:?}")))?;
+            let function = program.function(id);
+            let parameters = parameters(&program, &opts.params, &function.params)?;
+            let args = function
+                .params
+                .iter()
+                .map(|param| parameters[&param.name].clone())
+                .collect::<Vec<_>>();
+            if !opts.flag("--unverified") {
+                // Includes the full callee dependency closure; never assume an unproved contract.
+                let proof = verify_function(&program, name, &opts.config()?);
+                if !proof.ok() {
+                    return Err(failure(format!(
+                        "Compilation rejected: function {name:?} is not verified.\n{}",
+                        proof.summary()
+                    )));
+                }
+            }
+            let outcome = eval_function(&program, id, &args);
+            let ok = outcome.is_ok();
+            let result = outcome
+                .as_ref()
+                .ok()
+                .map(|result| value::value_to_json(&program, result, &function.result_type));
+            if opts.flag("--json") {
+                print_json(
+                    json!({"ok":ok,"function":name,"proof_admitted":!opts.flag("--unverified"),
+                    "result_type":program.value_type_name(&function.result_type),"result":result,"error":outcome.as_ref().err()}),
+                )?;
+            } else if let Some(result) = result {
+                print_json(result)?;
+            } else {
+                println!("ERROR({})", outcome.as_ref().unwrap_err());
             }
             if !ok {
                 return Err((1, String::new()));

@@ -111,6 +111,18 @@ vera codegen rust examples/counter.vera --no-main --out counter.rs
 rustc --edition 2021 --crate-type lib counter.rs
 ```
 
+## Evaluate a pure function immediately
+
+```sh
+vera run examples/shipping/policy.vera --function shipping_fee \
+  --param weight_grams=1000 --param express=false --param subtotal_cents=4000 --json
+```
+
+This proves the selected function and its callees, then returns its typed result
+without allocating application state or generating a host program. Use it for a
+short edit–verify–execute feedback loop. An explicit `--unverified` run skips
+proof and reports that fact in JSON mode; it is not proof admission.
+
 ## Call a verified function from your application
 
 Pure functions have stable, typed Rust exports under `functions::call_NAME`.
