@@ -1,5 +1,5 @@
 [workspace]
-members = ["rust/vera-compiler", "rust/vera-rt"]
+members = ["rust/vera-compiler", "rust/vera-rt", "rust/vera-build"]
 default-members = ["rust/vera-compiler"]
 resolver = "2"
 

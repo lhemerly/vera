@@ -1,0 +1,12 @@
+[package]
+name = "vera-build"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Proof-gated VERA core generation for Rust build scripts"
+repository = "https://github.com/lhemerly/vera"
+
+[dependencies]
+sha2 = "0.10"
+serde_json = "1"

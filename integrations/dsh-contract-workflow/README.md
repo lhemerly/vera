@@ -91,3 +91,11 @@ node --test test/*.test.js
 The native test uses a local fake HTTP provider, isolated DSH home and dummy key. It makes **zero external model calls**. It verifies distinct fresh sessions without owner-history leakage, denied tool bypass, protected-contract rejection, concrete counterexample/footprint feedback and final artifact admission. Other tests cover petitions, amendments, stale/forged evidence, owner isolation, cancellation, teardown failure, concurrent audit ordering and repair-feedback continuity.
 
 Tests do not establish model quality, specification completeness, or convergence of real AI repair loops.
+
+## Conventional Rust shells
+
+The [hybrid workflow](../../docs/HYBRID_RUST.md) shows how typed verified cores
+fit normal Rust applications and how to test genuine result use. Its standalone
+`vera-build` helper proves source contracts but does not enforce this workflow's
+frozen contract revisions. Keep the admission gate here when using Invariant God;
+do not replace it with a fresh proof of implementer-edited requirements.

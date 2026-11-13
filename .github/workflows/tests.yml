@@ -79,6 +79,14 @@ jobs:
       - name: Language, runtime and GPU tests
         run: cargo test --workspace --locked -- --test-threads=4
 
+      - name: Conventional Rust shell checks
+        env:
+          VERA: ${{ github.workspace }}/target/debug/vera
+        run: |
+          cargo fmt --manifest-path examples/parcel-quote/Cargo.toml -- --check
+          cargo clippy --manifest-path examples/parcel-quote/Cargo.toml --all-targets --locked -- -D warnings
+          cargo test --manifest-path examples/parcel-quote/Cargo.toml --locked
+
       - name: Build native package
         run: |
           sh tools/package_native.sh

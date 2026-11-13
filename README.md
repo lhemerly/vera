@@ -125,6 +125,11 @@ proof and reports that fact in JSON mode; it is not proof admission.
 
 ## Call a verified function from your application
 
+For a first-class Cargo build that proves the core before compiling an ordinary
+Rust application, see the [verified-core/Rust-shell workflow](docs/HYBRID_RUST.md)
+and [Parcel Quote application](examples/parcel-quote). The periphery stays normal
+Rust; its tests and checks are reported separately from the core proof.
+
 Pure functions have stable, typed Rust exports under `functions::call_NAME`.
 Generate a library and an API manifest, then import the file as a Rust module:
 

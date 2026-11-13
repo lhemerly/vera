@@ -1,0 +1,12 @@
+module Shipping;
+
+// Prices are integer cents. This is an illustrative policy, not a carrier quote.
+function shipping_fee(weight_grams : u64, express : bool, subtotal_cents : u64) -> u64
+  require supported_weight : and(gt(weight_grams, 0), le(weight_grams, 20000));
+  ensure express_rate : or(not(express), eq(result, 1500));
+  ensure standard_free : or(or(express, lt(subtotal_cents, 5000)), eq(result, 0));
+  ensure standard_paid : or(or(express, ge(subtotal_cents, 5000)), eq(result, 500));
+  ensure bounded_fee : le(result, 1500);
+  body {
+    yield select(express, 1500, select(ge(subtotal_cents, 5000), 0, 500));
+  }
