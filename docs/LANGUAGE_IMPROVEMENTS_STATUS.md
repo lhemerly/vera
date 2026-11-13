@@ -34,9 +34,8 @@ language feature is implemented.
 
 ## No imposed validation ceilings
 
-The owner's correction supersedes the initial budget defaults. There is now no
-default solver timeout, state-cell, expression-step, SMT-byte, candidate-effect,
-fold-unroll or witness-attempt ceiling. All optional controls are absent by
+Verification has no default solver timeout, state-cell, expression-step, SMT-byte,
+candidate-effect, fold-unroll or witness-attempt ceiling. All optional controls are absent by
 default (`None` / JSON `null`) and apply only when explicitly selected. The
 arbitrary fixed parser-nesting, fold-depth/product, function-count/call-depth,
 GPU effect-buffer and interpreter-state-byte policy ceilings have been removed.
