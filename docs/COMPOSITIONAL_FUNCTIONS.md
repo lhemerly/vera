@@ -117,14 +117,28 @@ parsing/evaluation can still be exhausted. In particular, removing the old
 parser nesting policy does not turn the recursive parser into an iterative one:
 sufficiently deep source/execution trees depend on available host stack.
 
-## Remaining language-wide work
+## Host integration
 
-Stateful component contracts require explicit read/write/effect frames, alias
-rules and invariant ownership; pure scalar functions do not supply those.
-Named records and tagged unions now use one resolved type/layout contract across
-all targets and persistence, without enumerating Cartesian products of variants.
-See [structured values](STRUCTURED_VALUES.md). Bounded bytes need explicit logical length/capacity,
-consistent trailing-byte semantics and checked indexing/slicing. Source-language
-codec primitives need precise endianness, canonical encoding, length/tag checks,
-error behavior and independent round-trip proofs. Those remain future
-implementation, not capabilities implied by this function feature.
+Generated Rust exposes pure functions as `functions::call_NAME` with typed
+parameters and a `Result` return. These public entrypoints validate host-supplied
+VERA domains before executing the function's checked preconditions and body.
+Use `vera codegen rust program.vera --no-main --out verified.rs --api-out api.json`
+to obtain the generated file and exact source-to-Rust API mapping. Import it as
+`mod verified;` from a neighboring host source file. Do not call internal
+ordinal helpers: those are deliberately private and are not a stable API.
+
+Use the returned value in the required behavior. `Result::is_ok()`, `Option::is_some()`
+or a discarded binding demonstrates only a call, not that the computation matters.
+A `must_use` warning is a reminder, not an integration proof. See the runnable
+[shipping policy example](../examples/shipping), including tests of external
+outputs and a negative mutation that discards the computed fee.
+
+## Related language features and remaining boundaries
+
+[Stateful components](COMPONENT_CONTRACTS.md) provide explicit ownership and
+state/effect frames for supported leaf operations. Named records and tagged
+unions use one resolved layout across targets and persistence. See
+[structured values](STRUCTURED_VALUES.md). [Bounded bytes and source codecs](BOUNDED_BYTES.md)
+provide checked byte operations and canonical encoders/decoders with round-trip
+proofs. These features have their own documented scope; pure-function admission
+does not prove arbitrary host I/O, integration, or the adequacy of a specification.

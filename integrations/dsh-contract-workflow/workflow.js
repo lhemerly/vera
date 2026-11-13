@@ -216,6 +216,8 @@ export class ContractWorkflow {
     if (this.#current(j) !== v)
       throw Error("Contract changed during code generation");
     if (!generated.ok) return { ok: false, evidence, generated };
+    if (!generated.host_api || typeof generated.host_api !== "object")
+      throw Error("Generated artifact is missing its Rust host API manifest");
     const receipt = safe({
       id: randomUUID(),
       workflow_id: id,
@@ -224,11 +226,21 @@ export class ContractWorkflow {
       contract_hash: v.contract_hash,
       source_hash: digest(source),
       artifact_hash: digest(generated.code),
+      host_api_hash: digest(generated.host_api),
+      admission_scope: "verified_core_only",
+      host_integration: "not_checked",
       compiler: this.backend.identity,
       evidence_id: evidence.id,
     });
     await this.#record(j, "artifact_admitted", receipt);
-    return { ok: true, receipt, code: generated.code, evidence };
+    return {
+      ok: true,
+      receipt,
+      code: generated.code,
+      host_api: clone(generated.host_api),
+      integration_guidance: "Use the source-named functions in host_api, not private numeric helpers. Consume returned values in observable behavior. Compile the actual host and test outputs that differ across inputs plus error paths; a constant-result mutation should fail those tests. This receipt proves only the core, not host integration.",
+      evidence,
+    };
   }
   async step({ id, owner, parent, signal }) {
     return this.#lock(id, async () => {

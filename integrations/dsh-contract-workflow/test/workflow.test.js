@@ -40,7 +40,7 @@ function fixture(outputs) {
       };
     },
     async codegen() {
-      return { ok: true, code: "generated artifact" };
+      return { ok: true, code: "generated artifact", host_api: { schema_version: 1, target: "rust", functions: [] } };
     },
   };
   const runRole = async (p) => {
@@ -88,6 +88,10 @@ test("separate roles, frozen contract and receipt bind exact compiler/source/art
   assert.equal(r.admitted.receipt.source_hash, digest(impl().source));
   assert.equal(r.admitted.receipt.compiler.sha256, "compiler-test");
   assert.equal(r.admitted.receipt.artifact_hash, digest("generated artifact"));
+  assert.equal(r.admitted.receipt.host_api_hash, digest(r.admitted.host_api));
+  assert.equal(r.admitted.receipt.admission_scope, "verified_core_only");
+  assert.equal(r.admitted.receipt.host_integration, "not_checked");
+  assert.match(r.admitted.integration_guidance, /observable behavior/);
   assert.match(f.calls[1].prompt, /UNKNOWN/);
 });
 test("cannot weaken contracts through implementation source", async () => {
@@ -305,4 +309,13 @@ test("rejected final candidate remains repairable", async () => {
   assert.equal((await step(f, j.id)).status, "not_verified");
   assert.equal((await step(f, j.id)).status, "admitted");
   assert.match(f.calls.at(-1).prompt, /Contract mismatch/);
+});
+
+test("admission fails closed if codegen omits host API metadata", async () => {
+  const f = fixture([spec(), impl()]);
+  f.backend.codegen = async () => ({ ok: true, code: "generated artifact" });
+  const j = await start(f);
+  await assert.rejects(step(f, j.id), /missing its Rust host API manifest/);
+  assert.equal(f.machine.view(j.id, "owner").status, "failed");
+  assert.equal(f.events.filter((e) => e.type === "artifact_admitted").length, 0);
 });

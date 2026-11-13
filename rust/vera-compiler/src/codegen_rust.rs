@@ -12,9 +12,12 @@ use crate::ir::*;
 use crate::types::{Domain, ExprType, ScalarType, ValueType};
 #[path = "codegen_rust/bytes.rs"]
 mod bytes;
+#[path = "codegen_rust/host_api.rs"]
+mod host_api;
 #[path = "codegen_rust/structured.rs"]
 mod structured;
 use crate::value::Value;
+pub use host_api::rust_api_manifest;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RustOptions {
@@ -233,7 +236,7 @@ impl<'a> Generator<'a> {
             .zip(pair_names)
             .map(|((id, _), name)| (*id, name))
             .collect::<HashMap<_, _>>();
-        let mut reserved = "main run_batch run_batch_serial restore snapshot mix64 decimal_mul decimal_div checksum replay_file atomic_write wide_product wide_quotient decimal_wide_result decimal_wide_mul decimal_wide_div projection_bound I256 U256".split_whitespace().map(str::to_owned).collect::<HashSet<_>>();
+        let mut reserved = "functions VERA_HOST_API_JSON main run_batch run_batch_serial restore snapshot mix64 decimal_mul decimal_div checksum replay_file atomic_write wide_product wide_quotient decimal_wide_result decimal_wide_mul decimal_wide_div projection_bound I256 U256".split_whitespace().map(str::to_owned).collect::<HashSet<_>>();
         for name in ["vera_encode_bytes", "vera_decode_bytes"] {
             reserved.insert(name.into());
         }
@@ -400,6 +403,7 @@ impl<'a> Generator<'a> {
         for function in self.program.functions() {
             self.function(function)?;
         }
+        self.host_api();
         for operation in self.program.operations() {
             self.operation(operation)?;
         }

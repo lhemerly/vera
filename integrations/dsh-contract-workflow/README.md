@@ -9,9 +9,27 @@ An **opt-in companion plugin** separating specification authority from implement
 3. `vera_workflow_step` starts a different, fresh executor session. Its capabilities are limited to language help, syntax checking and contract-bound proof/code generation. It cannot use filesystem, shell, arbitrary code execution or delegation tools.
 4. The executor returns an implementation or a structured petition. A petition goes to another independent specification-authority session with the original requirements, frozen contract, recorded evidence and proposed change. It may approve an explicit revision, deny, or request clarification.
 5. A subsequent step receives the previous attempt, counterexample or review feedback. Ordinary candidate rejection remains repairable. There is no silent contract weakening or unbounded internal retry loop.
-6. An admitted Rust artifact has a receipt binding the requirements, contract revision, source, compiler binary, proof evidence and generated artifact digests.
+6. An admitted Rust artifact has a receipt binding the requirements, contract revision, source, compiler binary, proof evidence generated artifact and host API manifest digests. The receipt explicitly says `admission_scope: "verified_core_only"` and `host_integration: "not_checked"`.
 
 `UNKNOWN`, timeout and failure to find an implementation are not proof that the requirements are impossible. A successful core proof is not proof of external behavior, independent acceptance tests, or specification adequacy.
+
+## Calling an admitted core
+
+`admitted.host_api` maps source names and types to stable public Rust functions,
+for example `functions::call_shipping_fee`. Save `admitted.code` unchanged in a
+Rust module and use that named API, not private `vera_function_N` helpers. The
+manifest is interface metadata, not an independent proof; its digest is bound
+into the core admission receipt together with the generated code digest.
+
+The owner must still compile and test the host. At least two inputs should
+require different externally observable results, and invalid inputs should have
+an observable rejection path. Replace the returned value with a constant as a
+negative integration test: if the tests still pass, they do not establish useful
+consumption of the decision. These cases are evidence, not a universal host-code
+proof. See [the executable shipping example](../../examples/shipping).
+
+Core admission does not execute the authority's acceptance-test text and does
+not automatically mark host integration complete.
 
 ## Scope and threat boundary
 
@@ -27,7 +45,7 @@ The original VERA tools remain available to ordinary sessions. Their successful 
 
 ## Installation
 
-Requires Linux, Node 24+, DSH `0.2.1-rc.5`, the ordinary native VERA plugin, the fresh `spawn` subagent provider, and a VERA compiler supporting `vera contract`.
+Requires Linux, Node 24+, DSH `0.2.1-rc.5`, the ordinary native VERA plugin, the fresh `spawn` subagent provider, and a VERA compiler supporting `vera contract` and Rust codegen `--api-out`.
 
 Add this optional row to an isolated DSH profile or your chosen profile, after enabling the ordinary VERA plugin and subagent runtime:
 

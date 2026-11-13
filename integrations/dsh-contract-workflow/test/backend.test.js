@@ -36,6 +36,9 @@ test(
     const generated = await backend.codegen(source, signal);
     assert.equal(generated.ok, true);
     assert.match(generated.code, /pub/);
+    assert.equal(generated.host_api.schema_version, 1);
+    assert.equal(generated.host_api.target, "rust");
+    assert.deepEqual(generated.host_api.functions, []);
   },
 );
 test(
@@ -93,8 +96,20 @@ test(
       signal,
     });
     assert.equal(done.status, "admitted");
+    assert.equal(done.admitted.receipt.admission_scope, "verified_core_only");
+    assert.equal(done.admitted.receipt.host_integration, "not_checked");
     assert.ok(
       done.admitted.evidence.proof.result.results[0].specification_footprint,
     );
   },
 );
+
+test("real compiler returns stable source-named pure-function host API", { skip: !binary }, async () => {
+  const backend = await compilerBackend(binary);
+  const generated = await backend.codegen("module Host; function identity(x:u64)->u64 ensure exact:eq(result,x); body { yield x; }", signal);
+  assert.equal(generated.ok, true);
+  assert.equal(generated.host_api.functions[0].name, "identity");
+  assert.equal(generated.host_api.functions[0].rust_path, "functions::call_identity");
+  assert.equal(generated.host_api.functions[0].host_domain_validation, true);
+  assert.match(generated.code, /pub fn call_identity/);
+});

@@ -118,16 +118,29 @@ export async function compilerBackend(binary) {
       return { ok: r.code === 0, result, diagnostic: r.stderr };
     },
     async codegen(source, signal) {
-      const r = await run(
-        ["codegen", "rust", "-", "--no-main"],
-        source,
-        signal,
-      );
-      return {
-        ok: r.code === 0,
-        code: r.code === 0 ? r.stdout : null,
-        diagnostic: r.stderr,
-      };
+      const dir = await mkdtemp(join(tmpdir(), "vera-host-api-"));
+      try {
+        const apiPath = join(dir, "api.json");
+        const r = await run(
+          ["codegen", "rust", "-", "--no-main", "--api-out", apiPath],
+          source,
+          signal,
+        );
+        if (r.code !== 0)
+          return { ok: false, code: null, diagnostic: r.stderr };
+        const manifest = parse({
+          stdout: await readFile(apiPath, "utf8"),
+          stderr: "Missing or invalid generated Rust host API manifest",
+        });
+        if (manifest.proof_admitted !== true ||
+            manifest.api?.schema_version !== 1 ||
+            manifest.api?.target !== "rust" ||
+            !Array.isArray(manifest.api?.functions))
+          throw Error("Compiler did not return a proof-admitted Rust host API manifest");
+        return { ok: true, code: r.stdout, host_api: manifest.api, diagnostic: r.stderr };
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
     },
   };
 }

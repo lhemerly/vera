@@ -271,7 +271,7 @@ export async function apply(ctx, config) {
   ctx.systemPrompt.section({
     name: "vera:contract-workflow",
     order: 3070,
-    text: "For independent specifications and implementation use the opt-in vera_workflow_start then vera_workflow_step. Contracts freeze before execution. Executor tools cannot modify them; petitions are independently reviewed and versioned. UNKNOWN/timeouts do not prove impossibility. An admitted VERA core does not prove external host behavior or requirements adequacy. Original six VERA tools remain ordinary unconstrained tools and do not carry workflow admission. After a restart historical workflows are audit-only; start a new one rather than trust replayed worktree claims.",
+    text: "For independent specifications and implementation use the opt-in vera_workflow_start then vera_workflow_step. Contracts freeze before execution. Executor tools cannot modify them; petitions are independently reviewed and versioned. UNKNOWN/timeouts do not prove impossibility. An admitted VERA core does not prove external host behavior or requirements adequacy. Admission returns host_api with stable source-named Rust functions: use those names, consume returned values in observable behavior, and test the built host with contrasting outputs and rejection cases. Do not treat calls, imports, or a discarded result as host integration. Original six VERA tools remain ordinary unconstrained tools and do not carry workflow admission. After a restart historical workflows are audit-only; start a new one rather than trust replayed worktree claims.",
     interpolate: false,
   });
   ctx.effect(() => async () => {

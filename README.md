@@ -111,6 +111,29 @@ vera codegen rust examples/counter.vera --no-main --out counter.rs
 rustc --edition 2021 --crate-type lib counter.rs
 ```
 
+## Call a verified function from your application
+
+Pure functions have stable, typed Rust exports under `functions::call_NAME`.
+Generate a library and an API manifest, then import the file as a Rust module:
+
+```bash
+vera codegen rust examples/shipping/policy.vera --no-main \
+  --out verified.rs --api-out api.json
+```
+
+```rust
+mod verified;
+// Consume the returned decision in observable behavior, not just `is_ok()`.
+let fee = verified::functions::call_shipping_fee(1000, false, 4000)?;
+println!("{fee}");
+```
+
+See the runnable [shipping policy application](examples/shipping) for a complete
+build, external input/output and a regression that catches a caller which
+invokes the function but discards its computed value. The generated module needs
+only Rust's standard library at runtime. Proof establishes the VERA contract;
+it does not prove arbitrary host parsing, I/O or that a host uses the result.
+
 ## Language features
 
 | Feature | What it provides |

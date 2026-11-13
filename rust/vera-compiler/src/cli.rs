@@ -9,7 +9,7 @@ use std::{
 };
 use vera_compiler::{
     codegen_gpu::{generate_gpu, GpuTarget},
-    codegen_rust::{generate_rust, RustOptions},
+    codegen_rust::{generate_rust, rust_api_manifest, RustOptions},
     fuzz::{fuzz_module, FuzzConfig},
     ir::{CheckedProgram, Param},
     parse_source,
@@ -46,7 +46,7 @@ Optional proof budgets (all unset by default): --timeout MS,
         --max-expression-steps N, --max-smt-bytes N, --max-effect-events N
 Execution: --unverified (development), --snapshot-in FILE,
            --snapshot-out FILE, --wal FILE (recover, append and sync)
-Codegen: --out FILE, --no-main, --runtime-crate, --depth N
+Codegen: --out FILE, --api-out FILE (Rust interface JSON), --no-main, --runtime-crate, --depth N
 Fuzzing: --steps N, --threads N, --seed N, --capacity N (seed row limit)
 
 All commands are native. The linked Z3 solver proves run/codegen/replay
@@ -182,6 +182,7 @@ fn options(mut args: Vec<OsString>) -> Result<Options> {
             &["--unverified", "--no-main", "--runtime-crate"],
             &[
                 "--out",
+                "--api-out",
                 "--timeout",
                 "--depth",
                 "--max-state-cells",
@@ -510,6 +511,9 @@ fn proof_gate(program: &CheckedProgram, opts: &Options, names: &[&str], all: boo
     Ok(())
 }
 fn paths_alias(left: &OsStr, right: &OsStr) -> bool {
+    if left == right {
+        return true;
+    }
     #[cfg(unix)]
     if let (Ok(a), Ok(b)) = (fs::metadata(left), fs::metadata(right)) {
         use std::os::unix::fs::MetadataExt;
@@ -820,6 +824,21 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             if target != "rust" && (opts.flag("--no-main") || opts.flag("--runtime-crate")) {
                 return Err(input("--no-main and --runtime-crate apply to Rust"));
             }
+            if opts.values.contains_key("--api-out") && target != "rust" {
+                return Err(input("--api-out applies to Rust"));
+            }
+            if let Some(api_path) = opts.values.get("--api-out") {
+                if opts
+                    .values
+                    .get("--out")
+                    .is_some_and(|output| paths_alias(api_path, output))
+                {
+                    return Err(input("--api-out and --out must be different files"));
+                }
+                if opts.positional[1] != "-" && paths_alias(api_path, &opts.positional[1]) {
+                    return Err(input("--api-out must not overwrite the source file"));
+                }
+            }
             proof_gate(&program, &opts, &all_names, true)?;
             let text = if target == "rust" {
                 generate_rust(
@@ -842,9 +861,17 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
             }
             .map_err(failure)?;
             if let Some(path) = opts.values.get("--out") {
-                fs::write(path, text).map_err(failure)?;
+                fs::write(path, &text).map_err(failure)?;
             } else {
                 print!("{text}");
+            }
+            if let Some(path) = opts.values.get("--api-out") {
+                let report = json!({"api": rust_api_manifest(&program), "proof_admitted": !opts.flag("--unverified"), "proof_scope": "checked_program_not_host_integration"});
+                fs::write(
+                    path,
+                    serde_json::to_string_pretty(&report).map_err(failure)?,
+                )
+                .map_err(failure)?;
             }
         }
         "fuzz" => {
