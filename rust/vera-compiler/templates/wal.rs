@@ -105,7 +105,7 @@ impl IntentRecord {
     }
 
     pub fn decode(frame: &[u8]) -> io::Result<Self> {
-        if frame.len() < WAL_ALIGNMENT || frame.len() % WAL_ALIGNMENT != 0 {
+        if frame.len() < WAL_ALIGNMENT || !frame.len().is_multiple_of(WAL_ALIGNMENT) {
             return Err(invalid("invalid intent frame length"));
         }
         if &frame[..4] != WAL_MAGIC
@@ -171,7 +171,10 @@ fn scan_records(data: &[u8]) -> io::Result<(Vec<IntentRecord>, usize)> {
         }
         let len = u32::from_le_bytes(remaining[8..12].try_into().unwrap()) as usize;
         let payload_len = u32::from_le_bytes(remaining[12..16].try_into().unwrap()) as usize;
-        if len < WAL_ALIGNMENT || len % WAL_ALIGNMENT != 0 || payload_len > len - WAL_HEADER - 4 {
+        if len < WAL_ALIGNMENT
+            || !len.is_multiple_of(WAL_ALIGNMENT)
+            || payload_len > len - WAL_HEADER - 4
+        {
             return Err(invalid("invalid intent WAL frame length"));
         }
         if len > remaining.len() {

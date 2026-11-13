@@ -209,7 +209,7 @@ impl IoUring {
             }
         }
         if params.sq_off.array % 4 != 0
-            || params.cq_off.cqes as usize % std::mem::align_of::<IoUringCqe>() != 0
+            || !(params.cq_off.cqes as usize).is_multiple_of(std::mem::align_of::<IoUringCqe>())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
