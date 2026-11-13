@@ -2678,20 +2678,21 @@ fn solve(
                         .iter()
                         .map(|variable| {
                             model_term(encoding.program, &model, &variable.term).map(|value| {
-                                let literal = match value {
-                                    Value::Bytes(bytes) => value_literal(
-                                        encoding.program,
-                                        &Value::Bytes(bytes),
-                                        &ValueType::Bytes { capacity: 0 },
-                                    ),
-                                    Value::Bool(value) => boolean(value),
-                                    Value::Int(value) => bv(value, variable.term.width()),
-                                    value @ (Value::Record { ty, .. }
-                                    | Value::Variant { ty, .. }) => value_literal(
+                                let literal = match &value {
+                                    Value::Bytes(_) => value_literal(
                                         encoding.program,
                                         &value,
-                                        &ValueType::Named(ty),
+                                        &ValueType::Bytes { capacity: 0 },
                                     ),
+                                    Value::Bool(value) => boolean(*value),
+                                    Value::Int(value) => bv(value.clone(), variable.term.width()),
+                                    Value::Record { ty, .. } | Value::Variant { ty, .. } => {
+                                        value_literal(
+                                            encoding.program,
+                                            &value,
+                                            &ValueType::Named(*ty),
+                                        )
+                                    }
                                 };
                                 eq(&variable.term.text, &literal)
                             })
