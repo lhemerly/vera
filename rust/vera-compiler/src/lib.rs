@@ -23,3 +23,7 @@ pub mod verifier;
 pub use diagnostic::{Diagnostic, Span};
 pub use parser::parse_source;
 pub use semantic::analyze;
+
+pub mod footprint;
+
+pub mod contract;

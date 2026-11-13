@@ -153,6 +153,8 @@ pub struct EncodingMetrics {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct VerificationResult {
+    /// Syntactic specification references, never a semantic coverage score.
+    pub specification_footprint: Option<crate::footprint::SpecificationFootprint>,
     pub target_kind: String,
     /// Flat dependency evidence; never recursively duplicate a proof DAG.
     pub contract_dependencies: Vec<ContractDependency>,
@@ -2783,6 +2785,7 @@ fn solve(
 fn failed(transition: &str, diagnostic: Diagnostic, config: &VerifierConfig) -> VerificationResult {
     let reason = Some(diagnostic.message.clone());
     VerificationResult {
+        specification_footprint: None,
         target_kind: "transition".into(),
         contract_dependencies: Vec::new(),
         transition: transition.into(),
@@ -2865,6 +2868,8 @@ impl<'a> VerificationSession<'a> {
             if result.ok() {
                 self.verified.insert(id);
             }
+            result.specification_footprint =
+                crate::footprint::specification_footprint(self.program, &result);
             self.results.insert(id, result);
         }
     }
@@ -2923,6 +2928,8 @@ impl<'a> VerificationSession<'a> {
                     ok: result.ok(),
                 }
             }));
+        result.specification_footprint =
+            crate::footprint::specification_footprint(self.program, &result);
         result
     }
 }
@@ -3093,6 +3100,7 @@ fn verify_target(
             .unwrap_or(0),
     });
     VerificationResult {
+        specification_footprint: None,
         target_kind: if function.is_some() {
             "function"
         } else if operation.is_some() {

@@ -277,6 +277,8 @@ impl VerificationSession<'_> {
         if result.ok() {
             self.verified_operations.insert(id);
         }
+        result.specification_footprint =
+            crate::footprint::specification_footprint(self.program, &result);
         self.operation_results.insert(id, result);
     }
 }

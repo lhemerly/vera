@@ -70,6 +70,12 @@ transaction start. The effect enters an outbox only when `commit` succeeds.
 See the complete [counter](examples/counter.vera) and [bank](examples/bank.vera)
 examples, including allocation, transfers, foreign-key rules, and projections.
 The [language reference](docs/LANGUAGE.md) explains the syntax and semantics.
+[Specification footprints](docs/SPECIFICATION_FOOTPRINT.md) expose what contracts
+mention without claiming completeness. [Frozen contracts](docs/FROZEN_CONTRACTS.md)
+let a trusted host restrict repairs to explicitly editable implementation bodies.
+The optional [DSH contract-authority workflow](integrations/dsh-contract-workflow)
+separates fresh specification and executor sessions without changing ordinary
+VERA tool behavior.
 
 ## Get started
 

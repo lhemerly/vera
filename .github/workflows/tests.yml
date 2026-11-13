@@ -86,6 +86,15 @@ jobs:
           target/release/vera verify examples/bank.vera
           env PATH="" target/release/vera verify examples/counter.vera
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Contract workflow compiler integration
+        env:
+          VERA_CONTRACT_BINARY: ${{ github.workspace }}/target/release/vera
+        run: node --test integrations/dsh-contract-workflow/test/backend.test.js
+
       - name: Upload native package
         uses: actions/upload-artifact@v4
         with:

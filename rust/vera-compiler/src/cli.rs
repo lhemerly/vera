@@ -30,6 +30,7 @@ Usage: vera <command> <file|-> [options]
   parse     Parse syntax; --json emits the canonical syntax AST
   check     Resolve types, footprints, bounds and declarations
   verify    Prove safety, panic freedom and concrete non-vacuity
+  contract  Freeze or compare a parser-backed specification (--json)
   run       Execute --transition NAME [--param NAME=VALUE ...]
   project   Read --projection NAME [--param NAME=VALUE ...]
   replay    Recover --wal PATH from the initial --setup state
@@ -37,6 +38,7 @@ Usage: vera <command> <file|-> [options]
   fuzz      Search native execution traces for violations
 
 Common: --json, --setup FILE
+Contracts: --editable TARGETS_JSON (optional allowlist), --frozen SNAPSHOT_JSON
 Proofs: --transition NAME, --function NAME or --operation Component.name,
         --emit-smt PREFIX, --exact-sum
 Optional proof budgets (all unset by default): --timeout MS,
@@ -122,6 +124,7 @@ fn options(mut args: Vec<OsString>) -> Result<Options> {
         .map_err(|_| input("command requires UTF-8 text"))?;
     let (flags, values): (&[&str], &[&str]) = match command.as_str() {
         "parse" | "check" => (&["--json"], &[]),
+        "contract" => (&["--json"], &["--editable", "--frozen"]),
         "verify" => (
             &["--json", "--exact-sum"],
             &[
@@ -420,7 +423,7 @@ fn initial_state(program: &CheckedProgram, opts: &Options) -> Result<State> {
                     }
                     if let Some(v) = columns.get(&column.name) {
                         target.columns[column.id.index][slot] =
-                            value::value_from_json(program, v, &column.ty).map_err(input)?;
+                            value::value_from_json(program, v, &column.ty).map_err(failure)?;
                     }
                 }
             }
@@ -555,7 +558,36 @@ pub fn run(args: Vec<OsString>) -> Result<()> {
     let opts = options(args)?;
     validate_outputs(&opts)?;
     let path = opts.positional.last().expect("validated source");
-    let module = parse_source(&source(path)?)
+    let source_text = source(path)?;
+    if opts.command == "contract" {
+        use vera_compiler::contract::{
+            compare_source, eligible_bodies, freeze_source, BodyTarget, FrozenContract,
+        };
+        if opts.values.contains_key("--frozen") && opts.values.contains_key("--editable") {
+            return Err(input(
+                "--editable cannot change the authority of a frozen contract",
+            ));
+        }
+        if let Some(path) = opts.values.get("--frozen") {
+            let frozen: FrozenContract =
+                serde_json::from_slice(&fs::read(path).map_err(failure)?).map_err(failure)?;
+            let comparison = compare_source(&frozen, &source_text).map_err(failure)?;
+            let matches = comparison.matches;
+            print_json(comparison)?;
+            return if matches {
+                Ok(())
+            } else {
+                Err((1, String::new()))
+            };
+        }
+        let editable: Vec<BodyTarget> = if let Some(path) = opts.values.get("--editable") {
+            serde_json::from_slice(&fs::read(path).map_err(failure)?).map_err(failure)?
+        } else {
+            eligible_bodies(&source_text).map_err(failure)?
+        };
+        return print_json(freeze_source(&source_text, &editable).map_err(failure)?);
+    }
+    let module = parse_source(&source_text)
         .map_err(|e| failure(format!("{}:{e}", Path::new(path).display())))?;
     if opts.command == "parse" {
         if opts.flag("--json") {
