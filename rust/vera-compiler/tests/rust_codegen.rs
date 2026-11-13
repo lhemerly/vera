@@ -1027,3 +1027,30 @@ fn bounded_byte_capacity_does_not_unroll_rust_codec_source() {
         "capacity expanded helper source: {sizes:?}"
     );
 }
+
+#[test]
+fn default_main_compiles_and_replays_without_transitions() {
+    for source in [
+        "module Minimal; function identity(x:u64)->u64 ensure same:eq(result,x); body {yield x;}",
+        "module Storage; table T capacity 1 {key id:id64<T>;col value:u64;}",
+        "module Effects; effect Notice(value:u64);",
+        "module Empty;",
+    ] {
+        for use_rt in [false, true] {
+            let output = run_case_with_options(
+                source,
+                "",
+                RustOptions {
+                    use_rt,
+                    include_main: true,
+                },
+            );
+            assert!(output.contains("wal tx_seq = 0"), "{output}");
+            assert!(output.contains("batch committed 0/0"), "{output}");
+            assert!(
+                output.contains("replay matches live state: deterministic"),
+                "{output}"
+            );
+        }
+    }
+}

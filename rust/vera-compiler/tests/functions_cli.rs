@@ -52,3 +52,56 @@ fn cli_verifies_and_reports_each_function_once_and_supports_selected_helper() {
     );
     assert!(!output.status.success());
 }
+
+#[test]
+fn verified_function_only_default_rust_codegen_compiles_and_runs() {
+    let source =
+        "module Minimal; function identity(x:u64)->u64 ensure same:eq(result,x); body {yield x;}";
+    let generated = cli(source, &["codegen", "rust", "-"]);
+    assert!(
+        generated.status.success(),
+        "{}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    struct Scratch(std::path::PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let folder =
+        Scratch(std::env::temp_dir().join(format!("vera-function-main-{}", std::process::id())));
+    std::fs::create_dir_all(&folder.0).unwrap();
+    let binary = folder.0.join("demo");
+    let mut compiler = Command::new("rustc")
+        .args(["--edition=2021", "--crate-name", "function_demo", "-"])
+        .arg("-o")
+        .arg(&binary)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    compiler
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&generated.stdout)
+        .unwrap();
+    let built = compiler.wait_with_output().unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let output = Command::new(binary)
+        .current_dir(&folder.0)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("batch committed 0/0"));
+}

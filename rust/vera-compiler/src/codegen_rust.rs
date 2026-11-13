@@ -1081,7 +1081,7 @@ impl Generator<'_> {
                 self.line(format!("{object}.agg_sum_{}=800000000;", column.name));
             }
         }
-        self.line("if initial.validate().is_err(){initial=State::new();}initial.validate().expect(\"program requires an application-supplied valid initial state\");let mut state=initial.clone();let intents=vec![");
+        self.line("if initial.validate().is_err(){initial=State::new();}initial.validate().expect(\"program requires an application-supplied valid initial state\");let mut state=initial.clone();let intents:Vec<Params>=vec![");
         for transition in self.program.transitions.iter().take(6) {
             let fields = transition
                 .params
