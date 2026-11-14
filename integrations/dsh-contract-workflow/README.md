@@ -174,3 +174,30 @@ external Codex/benchmark runners must wire it in and protect configuration/state
 It has not retroactively changed any prior benchmark or installed profile.
 Existing 0.1 configurations must migrate to the explicit trusted manifest before
 using this companion version. Ordinary six-tool VERA plugins are unaffected.
+
+
+### Protected broker deployment
+
+The optional `brokerSocket` and numeric `actorUid` configuration exposes only six
+lifecycle operations. Run this companion in a **separate trusted DSH process and
+UID** from an actor with shell access. Disable `headless-runner` in that process:
+the companion creates an idle owner Agent; only isolated specification/executor
+activations invoke models. Load `broker-client.js` with `{socketPath}` in the actor
+instead of loading the companion there.
+
+Host isolation is mandatory, not supplied by this transport. Protect compiler,
+plugin code, task manifest, authority HOME and state from actor writes, process
+signals and ptrace. A socket parent must be broker-owned, group traversable but
+not group writable (0750), with no world access; the socket is 0660. Use a narrow
+shared group containing only this run's actor and authority. Never expose a
+world-writable socket or share the authority state directory. Existing socket
+paths fail closed, rather than unlinking a possibly live authority. The actor
+cannot specify owner IDs, paths, tools, or replacement task manifests.
+
+Responses are journaled as `broker_response` in the protected audit before the
+client receives success. Grading must use this protected audit and exact returned
+artifact/receipt, plus independent actual-integration checks. No response implies
+host correctness. HTTP upload deadlines are unchanged; no proof deadline is
+introduced. Interrupted state recovery remains fail-closed. Same-UID local tests
+exercise protocol behavior only and are **not** evidence of OS isolation; validate
+cross-UID tamper denial in the real runner before paid inference.

@@ -1,3 +1,4 @@
+import { callBroker } from "../broker.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
@@ -22,8 +23,8 @@ const parsed = (m) => {
     return null;
   }
 };
-test(
-  "real DSH fresh authority/executor sessions and denied bypass, local fake provider only",
+for (const brokerMode of [false, true]) test(
+  `real DSH fresh authority/executor sessions ${brokerMode ? "through broker" : "in process"}, local fake provider only`,
   { skip: !dsh || !native || !binary },
   async () => {
     const home = await mkdtemp(join(tmpdir(), "vera-contract-native-"));
@@ -241,6 +242,7 @@ test(
         "deepseek-account",
         "tool-web",
       ].map((id) => ({ id, disabled: true }));
+      if (brokerMode) patch.push({id:"headless-runner",disabled:true});
       patch.push(
         {
           id: "llm-pi-ai",
@@ -292,6 +294,7 @@ test(
                 stateDirectory: join(home, "state"),
                 taskManifest: join(home, "task.json"),
                 provider: "spawn",
+                ...(brokerMode ? {brokerSocket:join(home,"authority.sock"),actorUid:process.getuid()+1} : {}),
               },
             },
           ],
@@ -320,15 +323,28 @@ test(
       );
       child.stdout.on("data", (b) => (stdout += b));
       child.stderr.on("data", (b) => (stderr += b));
-      const timer = setTimeout(() => child.kill("SIGKILL"), 120000);
-      const code = await new Promise((r, e) => {
-        child.once("close", r);
-        child.once("error", e);
-      });
-      clearTimeout(timer);
-      if (failure) throw failure;
-      assert.equal(code, 0, stderr + "\n" + stdout);
-      assert.equal(ownerStep, 3, stderr + "\n" + stdout);
+      if (brokerMode) {
+        let started=false;
+        for(let i=0;i<200;i++) {
+          if(child.exitCode!==null)throw Error("Broker exited: "+stderr);
+          try { await callBroker(join(home,"authority.sock"),"vera_task_get",{}); started=true; break; }
+          catch(e) { if(!['ENOENT','ECONNREFUSED'].includes(e.code))throw e; }
+          await new Promise(r=>setTimeout(r,25));
+        }
+        assert.ok(started,"Broker readiness: "+stderr);
+        const begun=await callBroker(join(home,"authority.sock"),"vera_workflow_start",{requirements:"Emit supplied u64 exactly"});
+        const result=await callBroker(join(home,"authority.sock"),"vera_workflow_step",{id:begun.id});
+        assert.match(JSON.stringify(result),/admitted/);
+        assert.equal(ownerStep,0,"No supervisor inference permitted");
+        if(failure)throw failure;
+      } else {
+        const timer = setTimeout(() => child.kill("SIGKILL"), 120000);
+        const code = await new Promise((r, e) => { child.once("close", r); child.once("error", e); });
+        clearTimeout(timer);
+        if (failure) throw failure;
+        assert.equal(code, 0, stderr + "\n" + stdout);
+        assert.equal(ownerStep, 3, stderr + "\n" + stdout);
+      }
       assert.equal(execStep, 4);
       assert.equal(
         requests.filter((r) => r.role === "specification").length,
@@ -343,6 +359,7 @@ test(
       assert.notEqual(reserved[0].child_id, reserved[1].child_id);
       assert.equal(log.filter((e) => e.type === "role_closed").length, 2);
       assert.ok(log.some((e) => e.type === "artifact_admitted"));
+      if(brokerMode) assert.ok(log.some(e=>e.type==="broker_response" && e.method==="vera_workflow_step"));
       assert.ok(log.some((e) => e.type === "authority_observed"));
       console.log(
         JSON.stringify({

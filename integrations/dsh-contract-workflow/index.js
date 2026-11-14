@@ -1,3 +1,4 @@
+import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
 import { randomUUID } from "node:crypto";
@@ -5,14 +6,17 @@ import { mkdir, readFile, open, lstat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { ContractWorkflow, taskManifest, digest } from "./workflow.js";
+import { serveBroker } from "./broker.js";
 import { compilerBackend } from "./backend.js";
 export const name = "vera-contract-workflow";
-export const inject = ["tools", "subagents", "agents", "systemPrompt"];
+export const inject = ["tools", "subagents", "agents", "systemPrompt", "agentDefaultModel"];
 export const Config = z.object({
   binary: z.string().required(),
   stateDirectory: z.string().required(),
   taskManifest: z.string().required(),
   provider: z.string().default("spawn"),
+  brokerSocket: z.string(),
+  actorUid: z.number(),
 });
 const output = {
   schema: { type: "object", additionalProperties: true },
@@ -261,10 +265,13 @@ export async function apply(ctx, config) {
     reserve,
     reserved: old.trim().length > 0,
   });
-  const register = (name, description, parameters, execute) =>
-    ctx.tools.register(
+  const lifecycle = new Map();
+  const register = (name, description, parameters, execute) => {
+    lifecycle.set(name, execute);
+    return ctx.tools.register(
       defineTool({ name, description, parameters, output, execute })
     );
+  };
   register(
     "vera_workflow_start",
     "Start the single host-registered task authority. Caller text is only an untrusted proposal; original requirements come from the trusted task manifest. Repeat starts fail closed; use petitions. Makes model calls.",
@@ -384,6 +391,24 @@ export async function apply(ctx, config) {
     text: "For independent specifications and implementation use the opt-in vera_workflow_start then vera_workflow_step. Contracts freeze before execution. Executor tools cannot modify them; petitions are independently reviewed and versioned. UNKNOWN/timeouts do not prove impossibility. An admitted VERA core does not prove external host behavior or requirements adequacy. Admission returns host_api with stable source-named Rust functions: use those names, consume returned values in observable behavior, and test the built host with contrasting outputs and rejection cases. Do not treat calls, imports, or a discarded result as host integration. Original six VERA tools remain ordinary unconstrained tools and do not carry workflow admission. The trusted host registers the original task and evidence before starting. Caller-supplied focus is not the task. Never replace a workflow to evade revisions: use vera_workflow_petition, also after admission. Restart recovery requires the trusted host; fresh starts remain blocked. Coverage is declared, not complete or proven. Whole-task acceptance must be enforced by the outer harness; ordinary VERA proofs cannot substitute for task-bound admission.",
     interpolate: false,
   });
+  if (config.brokerSocket) {
+    const selection = ctx.agentDefaultModel.currentSelection();
+    const handle = await ctx.agents.create({sessionId: randomUUID(),
+      meta:{cwd:process.cwd()}, agentOptions:{provider:selection.provider,model:selection.model},
+      setup: agentCtx => { installModelSelection(agentCtx,{current:selection,assembled:undefined}); }
+    });
+    let close;
+    try {
+      close = await serveBroker({socketPath: config.brokerSocket, actorUid: config.actorUid,
+        dispatch: async (method,args,signal) => {
+          const result = await lifecycle.get(method)(args,{agent:handle.agent,signal});
+          // Trusted journal, never an actor-supplied copy. Persist before acknowledging.
+          await journal({type:"broker_response",method,args,result,at:new Date().toISOString()});
+          return result;
+        }});
+    } catch(e) { await handle.dispose(); throw e; }
+    ctx.effect(() => async () => { await close(); await handle.dispose(); });
+  }
   ctx.effect(() => async () => {
     disposed = true;
     roles.clear();
