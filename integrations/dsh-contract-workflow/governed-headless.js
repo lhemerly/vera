@@ -5,6 +5,7 @@ import {installModelSelection} from '@deepseek-ai/dsh-agent';
 import {createUserMessage} from '@deepseek-ai/dsh-llm';
 import {SessionSeq} from '@deepseek-ai/dsh-session';
 import {defineTool} from '@deepseek-ai/dsh-tools';
+import {projectActorTrace} from './actor-trace.js';
 import {completionClient,governCompletion,completionProposal} from './completion.js';
 export const name='vera-governed-headless';
 export const inject=['agentDefaultModel','agents','sessions','tools','systemPrompt'];
@@ -28,6 +29,7 @@ export async function runGoverned(ctx,config,proposal=()=>null,resetProposal=()=
  if(!task.trim())throw Error('Task required');
  const selection=ctx.agentDefaultModel.currentSelection();
  const {agent}=await ctx.agents.create({sessionId:brandString('session-'+randomUUID()),meta:{cwd:process.cwd()},agentOptions:{provider:selection.provider,model:selection.model},setup:agentCtx=>{installModelSelection(agentCtx,{current:selection,assembled:undefined});}});
+ const trace=projectActorTrace(ctx,agent,process.stdout);
  let actorFailure;
  const stopErrors=ctx.on('agent/error',({agent:subject,error})=>{if(subject===agent)actorFailure=error;});
  const controller=new AbortController();let timedOut=false;
@@ -43,9 +45,10 @@ export async function runGoverned(ctx,config,proposal=()=>null,resetProposal=()=
   if(controller.signal.aborted)result={decision:timedOut?'time_expired':'cancelled',summary:'Original clock/cancellation stopped this partial attempt.'};
   else result={decision:'infrastructure_failure',summary:String(error)};
  }finally{
-  clearTimeout(timer);stopErrors();process.off('SIGTERM',stop);process.off('SIGINT',stop);await ctx.sessions.flush(agent.session);
+  clearTimeout(timer);stopErrors();process.off('SIGTERM',stop);process.off('SIGINT',stop);try{await ctx.sessions.flush(agent.session);}finally{trace.dispose();}
  }
  if(timedOut)result={...result,decision:'time_expired'};
+ trace.finish(latest(agent.session).text,result);
  process.stdout.write(JSON.stringify({type:'completion/final',session_id:agent.session.id,...result})+'\n');
  return result;
 }

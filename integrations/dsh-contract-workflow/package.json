@@ -36,6 +36,7 @@
     "discovery.js",
     "scope.js",
     "completion.js",
-    "governed-headless.js"
+    "governed-headless.js",
+    "actor-trace.js"
   ]
 }

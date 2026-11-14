@@ -385,3 +385,19 @@ before and after review, including during a hanging request. JSON records
 and infrastructure failure. Exit zero means ready for audit only. Native tests
 exercise the real DSH lifecycle with a local fake provider and reviewer, not
 production authority or semantic correctness.
+
+The governed driver also streams actor-only durable `session/event` envelopes,
+including initial setup events, before the first task followup. These retain full
+payloads without preview truncation. Familiar `session`, `status`, `tool_call`,
+`tool_result`, text/reasoning, and final-stop projections support live monitoring.
+They exclude authority/other sessions and do not replace the protected authority
+audit. Raw envelopes are canonical evidence of actor events; projections duplicate
+selected fields and must not be counted as additional calls. Step usage sums only
+reported safe counters across attempts. Missing/invalid usage remains explicitly
+unknown, never zero; optional counters are omitted when any attempt lacks them.
+Keep provider accounting as an independent source.
+
+Treat actor traces as private, untrusted execution artifacts, not proof of actual
+integration or a guarantee of complete logs after abrupt process loss. Hosts must
+retain canonical DSH HOME session files before temporary-home cleanup as well as
+capture stdout. A reviewer-outage, blocked, or deadline final is not a scored success.
