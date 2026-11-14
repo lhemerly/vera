@@ -414,6 +414,34 @@ pub fn atomic_write(path: &str, bytes: &[u8]) -> io::Result<()> {
 #[cfg(test)]
 mod wal_tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Generated programs may embed several copies of this module in one test
+    // process. A module-local counter alone does not separate those copies:
+    // reserve the directory atomically and never delete another test's path.
+    struct Scratch(std::path::PathBuf);
+    impl Scratch {
+        fn new() -> Self {
+            static NEXT: AtomicU64 = AtomicU64::new(0);
+            loop {
+                let path = std::env::temp_dir().join(format!(
+                    "vera-wal-test-{}-{}",
+                    std::process::id(),
+                    NEXT.fetch_add(1, Ordering::Relaxed)
+                ));
+                match std::fs::create_dir(&path) {
+                    Ok(()) => return Self(path),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => panic!("cannot reserve WAL test directory: {error}"),
+                }
+            }
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
 
     #[test]
     fn variable_payload_roundtrip() {
@@ -462,22 +490,20 @@ mod wal_tests {
 
     #[test]
     fn snapshot_replacement_is_complete_and_cleans_up_on_failure() {
-        let directory = std::env::temp_dir().join(format!("vera-snapshot-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&directory);
-        std::fs::create_dir(&directory).unwrap();
+        let scratch = Scratch::new();
+        let directory = &scratch.0;
         let path = directory.join("state.snap");
         atomic_write(path.to_str().unwrap(), b"old").unwrap();
         atomic_write(path.to_str().unwrap(), b"replacement").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"replacement");
         assert!(atomic_write(directory.to_str().unwrap(), b"cannot replace a directory").is_err());
-        assert_eq!(std::fs::read_dir(&directory).unwrap().count(), 1);
-        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(std::fs::read_dir(directory).unwrap().count(), 1);
     }
 
     #[test]
     fn partial_append_failure_does_not_publish_a_sequence() {
-        let path = std::env::temp_dir().join(format!("vera-wal-failure-{}", std::process::id()));
-        let _ = std::fs::remove_file(&path);
+        let scratch = Scratch::new();
+        let path = scratch.0.join("failure.wal");
         let mut wal = WAL::open(path.to_str().unwrap()).unwrap();
         let error = wal
             .append_using(9, b"first", |file, bytes, at| {
