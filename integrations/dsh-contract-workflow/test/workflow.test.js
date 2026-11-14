@@ -480,6 +480,26 @@ test("trusted host admission rejects bare proofs, modified artifact and supersed
   const j = await start(f);
   const r = await step(f, j.id);
   const input = { task: f.machine.task, audit: f.events, ...r.admitted };
+  assert.equal(r.admitted.receipt.kind, "artifact_admission_receipt");
+  assert.equal(r.admitted.evidence.kind, "verification_evidence");
+  assert.equal(r.admitted.evidence.source_hash, r.admitted.receipt.source_hash);
+  assert.equal(r.admitted.evidence.artifact_hash, undefined);
+  assert.throws(() => inspectAdmission({ ...input, receipt: r.admitted.evidence }), /Expected artifact_admission_receipt/);
+  const untypedProof = { ...r.admitted.evidence }; delete untypedProof.kind;
+  assert.throws(() => inspectAdmission({ ...input, receipt: untypedProof }), /not the latest/);
+  // A genuinely historical untyped audit and receipt still validate, not a typed receipt with its kind stripped.
+  const historicReceipt = { ...r.admitted.receipt }; delete historicReceipt.kind;
+  let previous = null;
+  const historicAudit = f.events.map(row => {
+    const { digest: oldDigest, ...event } = structuredClone(row);
+    if (event.type === "artifact_admitted") delete event.data.kind;
+    event.previous = previous;
+    const hash = digest(event); previous = hash;
+    return { ...event, digest: hash };
+  });
+  assert.equal(inspectAdmission({ ...input, audit: historicAudit, receipt: historicReceipt }).admission_scope, "verified_core_only");
+  assert.throws(() => inspectAdmission({ ...input, receipt: historicReceipt }), /not the latest/);
+
   assert.equal(
     inspectAdmission(input).coverage_completeness,
     "not_established"

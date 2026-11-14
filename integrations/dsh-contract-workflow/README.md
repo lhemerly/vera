@@ -407,3 +407,33 @@ beside `code`, `host_api`, and `receipt`. Persist all four together; preserve so
 bytes unchanged and check against `receipt.source_hash`. Do not reconstruct source
 from nested feedback, reformat it, or substitute generated Rust for the original
 VERA source. This is a handoff clarity improvement, not a new proof claim.
+
+### Persist the admission receipt, not proof evidence
+
+Successful `vera_workflow_step` returns `admitted.source`, `code`, `host_api`,
+`receipt`, and `evidence`. Their purposes differ:
+
+- `admitted.receipt.kind === "artifact_admission_receipt"`: binds the source,
+  generated code and host API to the current protected admission.
+- `admitted.evidence.kind === "verification_evidence"`: proof result only. A
+  matching `source_hash` does not make it an artifact admission receipt.
+
+Example field mapping (choose your own local filenames):
+
+```javascript
+const a = workflowResult.admitted;
+// Write source/code byte-for-byte, without formatting or reconstruction.
+writeFile("core.vera", a.source);
+writeFile("generated.rs", a.code);
+writeFile("host_api.json", JSON.stringify(a.host_api));
+writeFile("receipt.json", JSON.stringify(a.receipt)); // NOT a.evidence
+writeFile("proof-evidence.json", JSON.stringify(a.evidence)); // optional, separate
+```
+
+`writeFile` above is illustrative, not a new broker filesystem operation. Preserve
+all original task permissions. The trusted host must still validate its protected
+audit, exact artifact/API hashes and current disposition; labels and local files
+alone are not authentication. `inspectAdmission` rejects an explicitly wrong kind.
+Historical receipts without `kind` remain supported through the same full audit
+checks; removing a kind from a current receipt does not match its protected audit.
+Neither receipt nor proof establishes host integration or full task correctness.

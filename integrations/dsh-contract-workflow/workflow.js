@@ -527,6 +527,7 @@ export class ContractWorkflow {
     const proof = await this.backend.verify(source, signal);
     if (this.#current(j) !== v) throw Error("Contract changed during proof");
     const evidence = safe({
+      kind: "verification_evidence",
       id: randomUUID(),
       workflow_id: id,
       task_id: j.task_id,
@@ -560,6 +561,7 @@ export class ContractWorkflow {
     if (!generated.host_api || typeof generated.host_api !== "object")
       throw Error("Generated artifact is missing its Rust host API manifest");
     const receipt = safe({
+      kind: "artifact_admission_receipt",
       id: randomUUID(),
       workflow_id: id,
       task_id: j.task_id,
@@ -588,7 +590,7 @@ export class ContractWorkflow {
       code: generated.code,
       host_api: clone(generated.host_api),
       integration_guidance:
-        "Persist source exactly as returned, byte-for-byte, alongside code, host_api and receipt; its hash must match receipt.source_hash. Do not reconstruct it from feedback or rewrite/format it after admission. Use the source-named functions in host_api, not private numeric helpers. Consume returned values in observable behavior. Compile the actual host and test outputs that differ across inputs plus error paths; a constant-result mutation should fail those tests. This receipt proves only the core, not host integration.",
+        "Persist source exactly as returned, byte-for-byte, alongside code, host_api and receipt. Write receipt.json from admitted.receipt (artifact_admission_receipt), NEVER admitted.evidence (verification_evidence). Evidence is proof-only: its shared source_hash does not bind generated code or host_api. The source bytes must hash to receipt.source_hash. Do not reconstruct it from feedback or rewrite/format it after admission. Use the source-named functions in host_api, not private numeric helpers. Consume returned values in observable behavior. Compile the actual host and test outputs that differ across inputs plus error paths; a constant-result mutation should fail those tests. This receipt proves only the core, not host integration.",
       evidence,
     };
   }

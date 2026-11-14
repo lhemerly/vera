@@ -2,6 +2,9 @@ import { digest, taskManifest } from "./workflow.js";
 /** Trusted-host gate, NOT callable by the model. Read audit from the protected state
  * directory, never an executor-supplied copy. No claim of whole-task correctness. */
 export function inspectAdmission({ task, audit, receipt, code, host_api }) {
+  // Untyped historical receipts remain valid only through the full protected audit gate.
+  if (receipt?.kind !== undefined && receipt.kind !== "artifact_admission_receipt")
+    throw Error("Expected artifact_admission_receipt, not proof evidence or another kind");
   const expected = taskManifest(task);
   const events = audit.filter(
     (row) => row.workflow_id === receipt?.workflow_id
