@@ -331,3 +331,57 @@ because complete application equivalence remains unproved.
 Blocker checks validate the declared structure, not whether a claimed dependency is
 actually unavailable or every possible probe has been exhausted. Independent trace
 and consumer review remain necessary; scope labels do not establish integration.
+
+### Governed headless completion (optional host integration)
+
+`governed-headless.js` replaces DSH's one-shot `headless-runner` for an authorized
+run that must review premature final answers. Disable `headless-runner` on the
+actor and insert this plugin with immutable host config:
+
+```json
+{"reviewURL":"http://127.0.0.1:8788","runId":"host-run-id","taskHash":"immutable-task-digest","deadlineMs":1790000000000}
+```
+
+`deadlineMs` is the **original absolute authorized deadline**, not a renewed
+allowance. The plugin creates one agent/session, reads the original task from
+stdin, and preserves that session throughout continuations. Deadline and signals
+cancel current work. No restart, added model budget, proof timeout, iteration
+limit, or benchmark-specific semantic rule is introduced.
+
+Before its final message, the actor calls `vera_completion_propose` with status
+`ready|partial|blocked`, remaining obligation IDs, core/adapter paths, claimed
+test commands/results, and a concrete blocker if any. These are **actor claims**,
+not trusted evidence. Each new continuation clears the previous proposal.
+
+At idle, the driver posts to the fixed loopback `/completion/review` endpoint:
+`{run_id,task_hash,session_id,turn_index,final_text,proposal}`. A missing proposal
+is null. The host must independently bind the original task/treatment inventory,
+freeze artifacts, inspect the protected current admission, and record its review
+and source digest. It must not treat actor test claims or artifact filenames as
+proof of integration. The host owns authentication/isolation and must keep its
+configuration, deadline, endpoint and journal beyond actor modification.
+
+Response fields are `run_id`, `task_hash`, `deadline_ms`, `artifact_digest`,
+`decision`, `summary`, `missing`, `evidence`, and
+`completion_scope:"accepted_stop_not_task_correctness"`. Decisions are
+`continue|ready_for_audit|blocked|time_expired|cancelled`. Each missing row has
+`id,requirement,reason,next_action`; evidence rows have `id,provenance`.
+`blocked` also requires `{kind:"inaccessible|unsafe|stalled",detail}`. A declared
+blocker remains unverified unless the host actually verifies it. It is an honest
+partial stop, not a scored success. A reviewer may stop a genuinely stalled or
+unsafe attempt rather than forcing manufactured evidence or repeated no-progress
+turns. The host, not the actor, decides this stop.
+
+`continue` sends actionable gaps to the **same agent**. `ready_for_audit` requires
+no declared missing required gaps and review evidence, but is only an accepted
+stopping candidate: independent actual integration/build/mutation and coverage
+review remains mandatory before grading. It never means whole-task correctness.
+A narrow verified core does not discharge unrelated original requirements.
+
+Malformed/binding-mismatched/unreachable review fails closed as infrastructure
+failure, preserving the DSH session for diagnosis. The original deadline wins
+before and after review, including during a hanging request. JSON records
+`completion/review` and `completion/final` distinguish readiness, partial stops,
+and infrastructure failure. Exit zero means ready for audit only. Native tests
+exercise the real DSH lifecycle with a local fake provider and reviewer, not
+production authority or semantic correctness.

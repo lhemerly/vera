@@ -7,7 +7,8 @@
   "exports": {
     ".": "./index.js",
     "./admission": "./admission.js",
-    "./broker-client": "./broker-client.js"
+    "./broker-client": "./broker-client.js",
+    "./governed-headless": "./governed-headless.js"
   },
   "engines": {
     "node": ">=24",
@@ -33,6 +34,8 @@
     "broker-client.js",
     "observer.js",
     "discovery.js",
-    "scope.js"
+    "scope.js",
+    "completion.js",
+    "governed-headless.js"
   ]
 }
