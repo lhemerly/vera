@@ -401,3 +401,9 @@ Treat actor traces as private, untrusted execution artifacts, not proof of actua
 integration or a guarantee of complete logs after abrupt process loss. Hosts must
 retain canonical DSH HOME session files before temporary-home cleanup as well as
 capture stdout. A reviewer-outage, blocked, or deadline final is not a scored success.
+
+Successful code generation returns the exact admitted VERA `source` directly
+beside `code`, `host_api`, and `receipt`. Persist all four together; preserve source
+bytes unchanged and check against `receipt.source_hash`. Do not reconstruct source
+from nested feedback, reformat it, or substitute generated Rust for the original
+VERA source. This is a handoff clarity improvement, not a new proof claim.

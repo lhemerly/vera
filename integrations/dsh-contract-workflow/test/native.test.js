@@ -368,6 +368,8 @@ for (const brokerMode of [false, true]) test(
         const begun=await callBroker(join(home,"authority.sock"),"vera_workflow_start",{requirements:"Emit supplied u64 exactly"});
         const result=await callBroker(join(home,"authority.sock"),"vera_workflow_step",{id:begun.id});
         assert.match(JSON.stringify(result),/admitted/);
+        assert.equal(result.admitted.source,source);
+        assert.equal(digest(result.admitted.source),result.admitted.receipt.source_hash);
         assert.equal(ownerStep,0,"No supervisor inference permitted");
         if(failure)throw failure;
       } else {

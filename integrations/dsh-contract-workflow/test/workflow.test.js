@@ -110,7 +110,10 @@ test("separate roles, frozen contract and receipt bind exact compiler/source/art
   );
   assert.notEqual(f.calls[0].schema, f.calls[1].schema);
   assert.equal(r.admitted.receipt.contract_hash, j.current.contract_hash);
-  assert.equal(r.admitted.receipt.source_hash, digest(impl().source));
+  assert.equal(r.admitted.source, impl().source);
+  assert.equal(r.admitted.receipt.source_hash, digest(r.admitted.source));
+  assert.notEqual(r.admitted.receipt.source_hash, digest(r.admitted.source + "\n"));
+  assert.match(r.admitted.integration_guidance, /byte-for-byte/);
   assert.equal(r.admitted.receipt.compiler.sha256, "compiler-test");
   assert.equal(r.admitted.receipt.artifact_hash, digest("generated artifact"));
   assert.equal(r.admitted.receipt.host_api_hash, digest(r.admitted.host_api));

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { compilerBackend } from "../backend.js";
-import { ContractWorkflow } from "../workflow.js";
+import { digest, ContractWorkflow } from "../workflow.js";
 export const source =
   "module ContractFixture; effect Value(value:u64); transition emit_value(value:u64) reads [] writes [] ensure value_matches:eq(effect_arg(Value,0,value),value); body { emit Value(value); commit; }";
 const binary = process.env.VERA_CONTRACT_BINARY;
@@ -110,6 +110,8 @@ test(
       signal,
     });
     assert.equal(done.status, "admitted");
+    assert.equal(done.admitted.source, source);
+    assert.equal(digest(done.admitted.source), done.admitted.receipt.source_hash);
     assert.equal(done.admitted.receipt.admission_scope, "verified_core_only");
     assert.equal(done.admitted.receipt.host_integration, "not_checked");
     assert.ok(
