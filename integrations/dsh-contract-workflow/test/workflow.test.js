@@ -63,7 +63,7 @@ function fixture(outputs) {
     return typeof result === "function" ? result(p) : result;
   };
   return {
-    machine: new ContractWorkflow({
+    machine: new ContractWorkflow({requireGrounding:false,
       backend,
       task: {
         id: "task",
@@ -528,7 +528,7 @@ test("failed initial specification retries under the same immutable task and aud
 });
 test("host obligations cannot be omitted or rewritten but unknowns remain expressible", async () => {
   const make = (coverage) =>
-    new ContractWorkflow({
+    new ContractWorkflow({requireGrounding:false,
       task: {
         id: "task",
         original_requirements: "whole task",

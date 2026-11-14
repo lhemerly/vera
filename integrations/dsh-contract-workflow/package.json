@@ -1,6 +1,6 @@
 {
   "name": "dsh-vera-contract-workflow",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "main": "index.js",
@@ -30,6 +30,7 @@
     "backend.js",
     "README.md",
     "broker.js",
-    "broker-client.js"
+    "broker-client.js",
+    "observer.js"
   ]
 }

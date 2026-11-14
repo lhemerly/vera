@@ -47,7 +47,7 @@ test(
   async () => {
     const backend = await compilerBackend(binary);
     let calls = 0;
-    const w = new ContractWorkflow({
+    const w = new ContractWorkflow({requireGrounding:false,
       task: {
         id: "fixture",
         original_requirements: "Emit exact input",

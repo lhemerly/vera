@@ -6,6 +6,7 @@ import { mkdir, readFile, open, lstat } from "node:fs/promises";
 import { constants } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { ContractWorkflow, taskManifest, digest } from "./workflow.js";
+import { observerClient, observationRequest } from "./observer.js";
 import { serveBroker } from "./broker.js";
 import { compilerBackend } from "./backend.js";
 export const name = "vera-contract-workflow";
@@ -17,6 +18,7 @@ export const Config = z.object({
   provider: z.string().default("spawn"),
   brokerSocket: z.string(),
   actorUid: z.number(),
+  observerURL: z.string(),
 });
 const output = {
   schema: { type: "object", additionalProperties: true },
@@ -32,6 +34,7 @@ const SPEC_TOOLS = [
   "vera_check",
   "vera_verify",
   "vera_authority_evidence",
+  "vera_authority_observe",
 ];
 const EXEC_TOOLS = [
   "vera_help",
@@ -262,6 +265,7 @@ export async function apply(ctx, config) {
     runRole,
     journal,
     task,
+    observe:config.observerURL?observerClient(config.observerURL):undefined,
     reserve,
     reserved: old.trim().length > 0,
   });
@@ -314,7 +318,7 @@ export async function apply(ctx, config) {
   );
   register(
     "vera_workflow_retry",
-    "Retry a failed initial specification on the SAME task and audit lineage. Cannot replace a frozen contract; use a petition for that.",
+    "Retry a failed or deferred initial specification on the SAME task and audit lineage. Cannot replace a frozen contract; use a petition for that.",
     { id: string("Existing workflow ID") },
     async (args, exec) =>
       machine.retry({
@@ -359,6 +363,14 @@ export async function apply(ctx, config) {
       });
     }
   );
+  register("vera_authority_observe",
+    "Authority-only isolated reference observation. Supply arguments, optional stdin and relative text fixtures. Fixture paths are relative to isolated /tmp/observation, also the cwd; HOME is /tmp/observation/home. Each probe starts fresh. The trusted host selects fixed executable/environment; no shell, arbitrary URL or executable. Incomplete results are not usable grounding evidence.",
+    {argv:{type:"array",items:{type:"string"},required:true},stdin:{type:"string"},fixtures:{type:"array",items:{type:"object",properties:{path:{type:"string",required:true},content:{type:"string",required:true}},additionalProperties:false}}},
+    async(args,exec)=>{
+      const role=roles.get(exec.agent?.id);
+      if(disposed||role?.role!=="specification")throw Error("Only active specification authority may observe reference");
+      return machine.observe({id:role.workflow,owner:role.owner,request:observationRequest(args),signal:exec.signal});
+    });
   for (const operation of ["verify", "codegen"])
     register(
       `vera_contract_${operation}`,

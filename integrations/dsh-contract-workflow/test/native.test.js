@@ -1,3 +1,4 @@
+import { digest } from "../workflow.js";
 import { callBroker } from "../broker.js";
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -39,12 +40,18 @@ for (const brokerMode of [false, true]) test(
       specStep = 0;
     let workflow;
     let calls = 0;
+    const observations=[];
     try {
       server = createServer(async (req, res) => {
         try {
           let raw = "";
           for await (const c of req) raw += c;
           const r = JSON.parse(raw);
+          if(req.url==="/reference/observe") {
+            const content=JSON.stringify({result:{status:"completed",stdout:r.argv[0],stderr:"",exit_code:0}});
+            const result={id:"runtime-"+observations.length,content,content_hash:digest(content),provenance:"independent local test reference",complete:true};
+            observations.push({request:r,result});res.end(JSON.stringify(result));return;
+          }
           const msgs = r.messages;
           const all = msgs.map(text).join("\n");
           const isExec = all.includes(
@@ -63,6 +70,7 @@ for (const brokerMode of [false, true]) test(
             assert.ok(!names.includes("bash"));
             assert.ok(!names.includes("vera_workflow_step"));
             assert.ok(names.includes("vera_authority_evidence"));
+            assert.ok(names.includes("vera_authority_observe"));
             const step=specStep++;
             if (step === 0) call = ["vera_authority_evidence", {}];
             else if(step === 1) {
@@ -72,15 +80,23 @@ for (const brokerMode of [false, true]) test(
               assert.equal(typeof catalog.items[0].content_hash,"string");
               assert.equal(catalog.items[0].content,undefined);
               call=["vera_authority_evidence",{evidence_id:catalog.items[0].id}];
+            } else if(step===2) {
+              const snapshot=msgs.filter(m=>m.role==="tool").map(parsed).filter(Boolean).at(-1);
+              assert.equal(snapshot?.kind,"snapshot");assert.equal(snapshot.id,"reference");
+              call=["vera_authority_observe",{argv:["0"]}];
+            } else if(step===3) {
+              const snapshot=msgs.filter(m=>m.role==="tool").map(parsed).filter(Boolean).at(-1);
+              assert.equal(snapshot?.kind,"runtime_observation");assert.equal(snapshot.complete,true);
+              call=["vera_authority_observe",{argv:["1"],stdin:"",fixtures:[{path:"input.txt",content:"fixture"}]}];
             } else {
               assert.match(all, /independent reference behavior/);
-              const snapshot=msgs.filter(m=>m.role==="tool").map(parsed).filter(Boolean).at(-1);
-              assert.equal(snapshot?.kind,"snapshot");
-              assert.equal(snapshot.id,"reference");
+              assert.equal(observations.length,2);
               call = [
                 "structured_output",
                 {
                   source,
+                  outcome:"ready",rationale:"Identity mapping belongs to emitted output",
+                  grounding:{obligation_id:"R1",target_scope:"this_executable",input_origin:"input value argument",callsite:"emit command after parsing",observable_consumer:"stdout emitted payload",contrast:[{evidence_id:"runtime-0",observed_output:"0"},{evidence_id:"runtime-1",observed_output:"1"}]},
                   requirements_map: "Input value equals emitted payload",
                   coverage: [
                     {
@@ -101,6 +117,7 @@ for (const brokerMode of [false, true]) test(
             assert.ok(names.includes("vera_contract_verify"));
             assert.ok(!names.includes("vera_verify"));
             assert.ok(!names.includes("vera_authority_evidence"));
+            assert.ok(!names.includes("vera_authority_observe"));
             assert.ok(!names.includes("bash"));
             if (execStep === 0) call = ["bash", { command: "exit 97" }];
             else if (execStep === 1) {
@@ -211,6 +228,8 @@ for (const brokerMode of [false, true]) test(
           id: "fixture",
           original_requirements: "Emit input value",
           provenance: "test fixture",
+          policy:{requireRuntimeGrounding:true},
+          obligations:[{id:"R1",requirement:"emit value"}],
           evidence: [
             {
               id: "reference",
@@ -304,6 +323,7 @@ for (const brokerMode of [false, true]) test(
                 stateDirectory: join(home, "state"),
                 taskManifest: join(home, "task.json"),
                 provider: "spawn",
+                observerURL:`http://127.0.0.1:${server.address().port}`,
                 ...(brokerMode ? {brokerSocket:join(home,"authority.sock"),actorUid:process.getuid()+1} : {}),
               },
             },
@@ -358,7 +378,7 @@ for (const brokerMode of [false, true]) test(
       assert.equal(execStep, 4);
       assert.equal(
         requests.filter((r) => r.role === "specification").length,
-        3
+        5
       );
       const log = (await readFile(join(home, "state/audit.jsonl"), "utf8"))
         .trim()
@@ -371,6 +391,8 @@ for (const brokerMode of [false, true]) test(
       assert.ok(log.some((e) => e.type === "artifact_admitted"));
       if(brokerMode) assert.ok(log.some(e=>e.type==="broker_response" && e.method==="vera_workflow_step"));
       assert.ok(log.some((e) => e.type === "authority_observed"));
+      assert.equal(log.filter(e=>e.type==="runtime_observation").length,2);
+      assert.deepEqual(observations[1].request,{argv:["1"],stdin:"",fixtures:[{path:"input.txt",content:"fixture"}]});
       console.log(
         JSON.stringify({
           paidCalls: 0,

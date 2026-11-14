@@ -31,7 +31,9 @@ export function inspectAdmission({ task, audit, receipt, code, host_api }) {
     !current ||
     receipt.version !== current.number ||
     receipt.contract_hash !== current.contract_hash ||
-    receipt.coverage_hash !== digest(current.coverage)
+    receipt.coverage_hash !== digest(current.coverage) ||
+    receipt.grounding_hash !== digest(current.grounding??null) ||
+    digest(receipt.grounding_policy)!==digest(expected.policy)
   )
     throw Error("Stale or unbound coverage/contract");
   const admitted = events.filter((e) => e.type === "artifact_admitted").at(-1);
@@ -66,6 +68,8 @@ export function inspectAdmission({ task, audit, receipt, code, host_api }) {
     host_integration: "not_checked",
     coverage_completeness: "not_established",
     task_id: expected.id,
+    grounding:structuredClone(current.grounding??null),
+    grounding_policy:expected.policy,
     coverage: structuredClone(current.coverage),
   };
 }

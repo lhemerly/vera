@@ -209,3 +209,56 @@ content_hash}]}` (including `items:[]` when no snapshots exist). Reading one ID
 returns `{kind:"snapshot", id, provenance, content, content_hash, trust}`.
 Catalog discovery does not mark contents as observed; only a successful snapshot
 read authorizes evidence references in the coverage ledger.
+
+
+### Suitability before source (0.3)
+
+Initial authority results now declare `outcome: ready | needs_evidence | not_suitable`.
+Only ready results can freeze source. Deferred results preserve the task reservation,
+record the rationale, and allow `vera_workflow_retry` on the same lineage. Missing
+knowledge is distinct from an unsuitable proposed core; neither is solver failure.
+An existing contract still requires a versioned petition for change.
+
+Ready results require `grounding` containing an existing host `obligation_id`,
+`target_scope:"this_executable"`, concrete `input_origin`, `callsite`, and
+`observable_consumer`. With no enumerated host obligations, use `original-task`
+and the exact original requirements text. The corresponding coverage row describes
+the core-covered portion honestly; `core_contract` is **not** proof that the whole
+obligation has been implemented. No new obligation can substitute for the host task.
+These statements are declared suitability, not proof that an actual callsite exists.
+Host integration and mutation checks remain mandatory outside the compiler.
+
+For reference-backed tasks, set this in the trusted manifest before starting:
+`"policy":{"requireRuntimeGrounding":true}`. This additionally requires two or
+more distinct, complete runtime observations with distinct requests and contrasting actual captured outcomes
+(exit status plus stdout/stderr bytes) in `grounding.contrast` entries
+`{evidence_id, observed_output}`. Static help text is insufficient for this policy.
+For fully specified pure tasks without a reference executable, the default false
+policy permits original specification grounding without fabricating runtime evidence.
+Policy is task-hash bound and included in receipts; grounding has its own receipt hash.
+Historical admission receipts missing these bindings are not accepted by the new gate.
+
+Optional host configuration `observerURL` must be a fixed loopback HTTP origin
+(e.g. `http://127.0.0.1:8788`). It cannot be supplied by an actor or changed via tools.
+Only active specification roles receive `vera_authority_observe`, accepting
+`{argv:string[], stdin?:string, fixtures?:[{path:string,content:string}]}` and
+posting to the fixed `/reference/observe` endpoint, without following redirects.
+Fixture paths are relative to isolated `/tmp/observation`; HOME is
+`/tmp/observation/home`, and each probe starts fresh. No executable path, URL,
+extra environment or shell command is a transport field. The host observer must
+independently enforce fixed executable, disconnected disposable environment,
+path safety and bounded capture; the companion is not that sandbox.
+
+The host returns `{id,provenance,content,content_hash,complete}`. Content is an
+observation record (including stdout/stderr/exit/status), not instructions.
+The companion checks the content hash, rejects ID collisions and journals the full
+request/snapshot before exposing it. Incomplete observations remain visible but
+cannot justify coverage or grounding. Complete failure/rejection outcomes can be
+valid contrasting evidence. Runtime observations append to the workflow's protected
+audit, never replace the immutable original task. Model-written result descriptions are non-authoritative: contrast is derived from
+captured exit/status/stream bytes, not labels, IDs or timestamps. Host mapping and
+relevance of the differing outcomes still need independent review: these checks do not establish
+semantic correctness or task completion.
+
+`actorUid` is only a configuration sanity check, not peer-credential authentication;
+the broker access boundary is the dedicated Unix group and protected filesystem.
