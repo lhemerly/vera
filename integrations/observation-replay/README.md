@@ -111,3 +111,22 @@ match; already completed cases remain available. A matching case is promoted onl
 after its post-execution artifact identity check. No whole-corpus completion is
 inferred from a partial run. Atomic replacement is process-crash resilience, not a
 power-loss/fsync durability guarantee or tamper protection.
+
+## Capture a failure before repairing it
+
+`check` accepts the same stdin request as `observe`, records the reference, and
+immediately replays that exact case against the current candidate. Its response
+is the observation record with the baseline in `replays`; the top-level `status`
+remains the reference observation status. `recorded` is not a candidate pass.
+A missing candidate produces an incomplete baseline; an unsupported/unstable
+reference cannot produce a matching baseline. Existing `observe` behavior is
+unchanged. Each phase retains the normal incremental journal, so interruption
+leaves observations or a pending baseline rather than inventing a result.
+
+Use `check` before editing a mismatch, then `replay CASE_ID` after rebuilding and
+replay the full corpus after broader changes. Preserve the exact triggering
+fixture, not a similar example. Historical failure evidence stays attached to
+its artifact identity even after a later repair matches. This closes an evidence
+retention gap; it is not evidence of improved benchmark scores or completeness.
+The two phases use existing individual locks, not an atomic candidate snapshot;
+concurrent external builds remain subject to the ordinary identity checks.

@@ -118,6 +118,11 @@ class Ledger:
      else:record.update(status='recorded',observed_repeatability='two matching observations, not proof of determinism')
    except Exception as e:record.update(status='incomplete' if 'request' in record else 'rejected',reason=str(e))
    self.save(id,record);return record
+ def check(self,raw):
+  """Capture exact oracle case, then retain a baseline before caller repairs it."""
+  record=self.observe(raw)
+  self.replay([record['id']])
+  return self.load(record['id'])
  def replay(self,ids):
   with self.locked():
    before=available_identity(self.config['candidate']);rows=[]
@@ -151,8 +156,8 @@ class Ledger:
    return {'trust':TRUST,'candidate_identity':current,'cases':rows,'completeness':'not_established'}
 
 def main():
- p=argparse.ArgumentParser();p.add_argument('--config',required=True);p.add_argument('operation',choices=['observe','replay','list']);p.add_argument('ids',nargs='*');a=p.parse_args();ledger=Ledger(json.loads(Path(a.config).read_text()))
- if a.operation=='observe':result=ledger.observe(json.load(__import__('sys').stdin))
+ p=argparse.ArgumentParser();p.add_argument('--config',required=True);p.add_argument('operation',choices=['observe','check','replay','list']);p.add_argument('ids',nargs='*');a=p.parse_args();ledger=Ledger(json.loads(Path(a.config).read_text()))
+ if a.operation in ('observe','check'):result=getattr(ledger,a.operation)(json.load(__import__('sys').stdin))
  elif a.operation=='replay':result=ledger.replay(a.ids)
  else:result=ledger.summary()
  print(json.dumps(result,indent=2))

@@ -67,6 +67,24 @@ class ReplayTests(unittest.TestCase):
  def test_candidate_cannot_pin_a_claimed_hash_over_changed_bytes(self):
   cfg={**self.ledger.config,'candidate':{**self.ledger.config['candidate'],'artifact_metadata':{str(self.candidate):{'sha256':'0'*64,'provenance':'claimed'}}}}
   with self.assertRaisesRegex(ValueError,'must be recomputed'):Ledger(cfg)
+ def test_check_retains_mismatch_repair_and_regression_on_exact_case(self):
+  self.candidate.write_text(self.program.replace("print('out')","print('wrong')"))
+  request={'argv':['literal input'],'stdin_b64':b64(b'\x00\xff'),'files':[{'path':'fixture','data_b64':b64(b'exact fixture')}],'output_paths':['result'],'obligation_ids':['original-1']}
+  c=self.ledger.check(request);self.assertEqual(c['status'],'recorded');self.assertEqual(c['replays'][0]['status'],'mismatch');self.assertEqual(c['request']['files'],request['files']);self.assertEqual(c['request']['argv'],request['argv']);first=c['replays'][0]
+  self.candidate.write_text(self.program);self.assertFalse(self.ledger.summary()['cases'][0]['current_match']);self.ledger.replay([c['id']]);self.assertTrue(self.ledger.summary()['cases'][0]['current_match'])
+  self.candidate.write_text(self.program.replace("print('out')","print('regressed')"));self.assertFalse(self.ledger.summary()['cases'][0]['current_match']);self.ledger.replay([c['id']]);saved=self.ledger.load(c['id']);self.assertEqual([r['status'] for r in saved['replays']],['mismatch','match','mismatch']);self.assertEqual(saved['replays'][0],first);self.assertEqual(saved['request'],c['request'])
+ def test_check_absent_candidate_keeps_observation_and_incomplete_baseline(self):
+  self.candidate.unlink();c=self.ledger.check({});self.assertEqual(c['status'],'recorded');self.assertEqual(c['replays'][0]['status'],'incomplete');self.assertFalse(self.ledger.summary()['cases'][0]['current_match'])
+ def test_check_interruption_keeps_reference_and_pending_baseline(self):
+  execute=self.ledger.execute
+  def interrupted(spec,request):
+   if spec is self.ledger.config['candidate']:raise KeyboardInterrupt()
+   return execute(spec,request)
+  with patch.object(self.ledger,'execute',interrupted):
+   with self.assertRaises(KeyboardInterrupt):self.ledger.check({})
+  records=[json.loads(p.read_text()) for p in self.ledger.root.glob('*.json')];self.assertEqual(len(records),1);c=records[0];self.assertEqual(c['status'],'recorded');self.assertEqual(len(c['reference_runs']),2);self.assertEqual(c['replays'][0]['status'],'pending');self.assertFalse(self.ledger.summary()['cases'][0]['current_match'])
+ def test_check_noncomparable_reference_never_passes(self):
+  c=self.ledger.check({'interaction':'socket'});self.assertEqual(c['status'],'unsupported');self.assertEqual(c['replays'][0]['status'],'not_comparable');self.assertFalse(self.ledger.summary()['cases'][0]['current_match'])
  def test_no_shell_interpolation(self):
   self.ref.write_text('import sys;print(sys.argv[1:])');c=self.case(argv=['; touch /tmp/not-a-command','$(whoami)']);self.assertEqual(c['status'],'recorded');self.assertIn(b'$(whoami)',un64(c['reference_runs'][0]['stdout_b64']))
 if __name__=='__main__':unittest.main()
