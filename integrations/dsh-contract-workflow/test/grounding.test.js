@@ -27,3 +27,12 @@ test('different model labels cannot fake contrast when actual outcomes are ident
 test('same request cannot fake contrast through nondeterministic outcomes',async()=>{const f=fixture({answer:async(f,p)=>{const s=spec();for(const v of ['a','b']){const e=await f.machine.observe({id:p.workflow,owner:'owner',request:{argv:['same']},signal:signal()});s.grounding.contrast.push({evidence_id:e.id,observed_output:v});}return s;},observe:(()=>{let n=0;return async()=>{const content=JSON.stringify({result:{status:'completed',stdout:String(++n),stderr:'',exit_code:0}});return {id:'obs-'+n,content,content_hash:digest(content),provenance:'fixture',complete:true};};})()});await assert.rejects(start(f),/contrasting/);});
 
 test('signal exit cannot be promoted to complete observation by an erroneous host flag',async()=>{const f=fixture({answer:observedSpec,observe:async()=>{const content=JSON.stringify({result:{status:'completed',stdout:'',stderr:'',exit_code:-9}});return {id:'signal',content,content_hash:digest(content),provenance:'fixture',complete:true};}});await assert.rejects(start(f),/completed runtime outcome/);assert.equal(f.events.filter(e=>e.type==='runtime_observation').length,0);});
+
+test('same-lineage retry carries prior deferral rationale without replacing requirements',async()=>{
+ for(const outcome of ['needs_evidence','not_suitable']){
+  let count=0;const reason='Candidate needs actual input origin and success/rejection observations';
+  const f=fixture({answer:async(f,p)=>{if(count++===0)return {outcome,rationale:reason};assert.match(p.prompt,/PRIOR INITIAL ASSESSMENTS/);assert.ok(p.prompt.includes(reason));assert.ok(p.prompt.includes('emit input value'));return observedSpec(f,p);}});
+  const j=await start(f);const retried=await f.machine.retry({id:j.id,owner:'owner',parent:{id:'owner'},signal:signal()});
+  assert.equal(retried.id,j.id);assert.equal(retried.status,'frozen');assert.equal(retried.requirements,'emit input value');
+ }
+});

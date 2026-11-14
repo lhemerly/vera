@@ -20,3 +20,16 @@ test('group-only broker roundtrip, same UID refusal, no existing socket replacem
  await assert.rejects(serveBroker({socketPath:path,actorUid:process.getuid()+1,dispatch(){}}),/Existing socket/);
  }finally{await close?.();await rm(dir,{recursive:true,force:true});}
 });
+
+test('actor plugin presents deferred-status handling and correct lifecycle actions',async()=>{
+ const {apply}=await import('../broker-client.js');const tools=new Map(),prompts=[];
+ apply({tools:{register:t=>tools.set(t.name,t)},systemPrompt:{section:p=>prompts.push(p.text)}},{socketPath:'/unused'});
+ assert.equal(tools.size,6);
+ assert.match(tools.get('vera_workflow_start').description,/needs_evidence\/not_suitable is not admission/);
+ assert.match(tools.get('vera_workflow_retry').description,/SAME/);
+ assert.match(tools.get('vera_workflow_retry').description,/Frozen contracts require a petition/);
+ assert.match(tools.get('vera_workflow_step').description,/not after needs_evidence/);
+ assert.match(prompts[0],/do not invent observations/i);
+ assert.match(prompts[0],/Do not loop unchanged retries or abandon the whole task/);
+ assert.match(prompts[0],/independently request reference observations/);
+});
