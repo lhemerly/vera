@@ -107,6 +107,10 @@ jobs:
           VERA_CONTRACT_BINARY: ${{ github.workspace }}/target/release/vera
         run: node --test integrations/dsh-contract-workflow/test/*.test.js
 
+      - name: Fixed reference observer isolation and failure tests
+        working-directory: integrations/reference-observer
+        run: python3 -m unittest -v
+
       - name: Upload native package
         uses: actions/upload-artifact@v4
         with:
