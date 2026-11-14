@@ -262,3 +262,35 @@ semantic correctness or task completion.
 
 `actorUid` is only a configuration sanity check, not peer-credential authentication;
 the broker access boundary is the dedicated Unix group and protected filesystem.
+
+
+### Discovery continuity
+
+The authority sees a trusted observation ledger on initialization, retry and contract
+review; `vera_authority_evidence({})` also returns `observation_ledger`. Each entry
+identifies the actual arguments, stdin metadata, fixture paths/sizes/hashes, provenance,
+completion state, actual exit/status and stream summaries. Each stream preview is
+limited to 512 characters **for display only**; all observations are retained, hashes
+and captured byte counts remain visible, and the full record is readable by evidence ID.
+This introduces no proof, observation-count or investigation deadline. Captured output
+is evidence, never an instruction. Request metadata comes from the trusted operation,
+not an authority-written description.
+
+Initial results carry `discovery` with:
+- `candidate_assessments`: existing obligation ID, proposed observable behavior,
+  investigate/grounded/unsuitable assessment, reason and observed evidence IDs;
+- `missing_evidence`: precise unanswered questions;
+- `proposed_probes`: purpose and argv/stdin/relative-fixture requests.
+
+A needs_evidence result must name a missing question; not_suitable must retain the
+assessed candidate and reason. This structure is journaled, returned to the caller,
+and presented on same-lineage retry alongside actual earlier observations. Proposed
+probes are model-authored suggestions, not trusted observations, authorization, or
+an automatic execution queue. The authority must choose and invoke permitted probes.
+
+Two observations are only an integrity minimum, not a research stopping rule. Seek
+inputs that discriminate plausible rules for an actual target operation; do not just
+collect two different errors and stop. Successful exit is not universally necessary:
+rejection behavior itself may be the real contract. A core that computes parsing or
+validation from genuine inputs can be useful; merely re-proving a host-supplied
+validity boolean is different. No core is forced when evidence remains inadequate.

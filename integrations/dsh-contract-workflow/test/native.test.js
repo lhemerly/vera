@@ -95,6 +95,7 @@ for (const brokerMode of [false, true]) test(
                 "structured_output",
                 {
                   source,
+                  discovery:{candidate_assessments:[],missing_evidence:[],proposed_probes:[]},
                   outcome:"ready",rationale:"Identity mapping belongs to emitted output",
                   grounding:{obligation_id:"R1",target_scope:"this_executable",input_origin:"input value argument",callsite:"emit command after parsing",observable_consumer:"stdout emitted payload",contrast:[{evidence_id:"runtime-0",observed_output:"0"},{evidence_id:"runtime-1",observed_output:"1"}]},
                   requirements_map: "Input value equals emitted payload",

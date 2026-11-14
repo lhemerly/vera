@@ -1,5 +1,6 @@
 import http from 'node:http';
-import {digest} from './workflow.js';
+import {createHash} from 'node:crypto';
+const digest=value=>createHash('sha256').update(value).digest('hex');
 export function observationRequest(value){
  if(!value||typeof value!=='object'||Array.isArray(value)||Object.keys(value).some(k=>!['argv','stdin','fixtures'].includes(k)))throw Error('Invalid observation request');
  if(!Array.isArray(value.argv)||value.argv.some(x=>typeof x!=='string'||x.includes('\0')))throw Error('argv must be a string array');

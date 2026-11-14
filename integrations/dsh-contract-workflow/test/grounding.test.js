@@ -9,7 +9,7 @@ function fixture({runtime=true,answer=()=>spec(),observe}={}){
  backend:{async freeze(source){freezes.push(source);return {source};}},
  journal:async e=>events.push(e),
  observe:observe??(async req=>{const content=JSON.stringify({result:{status:'completed',stdout:req.argv[0],stderr:'',exit_code:0}});return {id:'obs-'+(++n),content,content_hash:digest(content),provenance:'isolated test reference',complete:true};}),
- runRole:async p=>answer(f,p),
+ runRole:async p=>{const result=await answer(f,p);return {discovery:{candidate_assessments:result.outcome==='not_suitable'?[{obligation_id:'R1',behavior:'proposed mapping',status:'unsuitable',reason:'remote component',evidence_ids:[]}]:[],missing_evidence:result.outcome==='needs_evidence'?['Need contrasting target observations']:[],proposed_probes:[]},...result};},
  });f={machine,events,freezes};return f;
 }
 const signal=()=>new AbortController().signal;
@@ -35,4 +35,17 @@ test('same-lineage retry carries prior deferral rationale without replacing requ
   const j=await start(f);const retried=await f.machine.retry({id:j.id,owner:'owner',parent:{id:'owner'},signal:signal()});
   assert.equal(retried.id,j.id);assert.equal(retried.status,'frozen');assert.equal(retried.requirements,'emit input value');
  }
+});
+test('retry sees actual prior evidence and structured plan, continues investigation without restarting',async()=>{
+ let turn=0;let prior;
+ const f=fixture({answer:async(f,p)=>{
+  if(turn++===0){prior=await observedSpec(f,p);return {outcome:'needs_evidence',rationale:'Need discriminating boundary observation',discovery:{candidate_assessments:[{obligation_id:'R1',behavior:'input value emission',status:'investigate',reason:'Need boundary comparison',evidence_ids:prior.coverage[0].evidence_ids}],missing_evidence:['What happens at value2?'],proposed_probes:[{purpose:'Complete boundary comparison',request:{argv:['2'],stdin:'',fixtures:[]}}]}};}
+  assert.match(p.prompt,/TRUSTED OBSERVATION LEDGER/);assert.ok(p.prompt.includes('"argv":["0"]'));assert.ok(p.prompt.includes('"argv":["1"]'));assert.ok(p.prompt.includes('"exit_code":0'));assert.ok(p.prompt.includes('"preview":"1"'));assert.ok(p.prompt.includes('What happens at value2?'));assert.ok(p.prompt.includes('Complete boundary comparison'));
+  const catalog=await f.machine.evidence({id:p.workflow,owner:'owner'});assert.equal(catalog.observation_ledger.length,2);assert.equal(catalog.observation_ledger[0].request.argv[0],'0');
+  const next=await f.machine.observe({id:p.workflow,owner:'owner',request:{argv:['2']},signal:signal()});const s=spec();s.grounding.contrast=[prior.grounding.contrast[0],{evidence_id:next.id,observed_output:'2'}];s.coverage[0].evidence_ids=[prior.coverage[0].evidence_ids[0],next.id];return s;
+ }});
+ const j=await start(f);assert.equal(f.freezes.length,0);assert.equal(j.status,'needs_evidence');const next=await f.machine.retry({id:j.id,owner:'owner',parent:{id:'owner'},signal:signal()});assert.equal(next.id,j.id);assert.equal(next.status,'frozen');assert.equal(f.events.filter(e=>e.type==='runtime_observation').length,3);
+});
+test('contrasting rejection behavior does not require a successful reference exit',async()=>{
+ let n=0;const f=fixture({answer:observedSpec,observe:async request=>{const content=JSON.stringify({result:{status:'completed',exit_code:2,stdout:'',stderr:'rejected value '+request.argv[0]}});return {id:'reject-'+(++n),content,content_hash:digest(content),provenance:'reference rejection',complete:true};}});assert.equal((await start(f)).status,'frozen');
 });
