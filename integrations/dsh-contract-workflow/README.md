@@ -201,3 +201,11 @@ host correctness. HTTP upload deadlines are unchanged; no proof deadline is
 introduced. Interrupted state recovery remains fail-closed. Same-UID local tests
 exercise protocol behavior only and are **not** evidence of OS isolation; validate
 cross-UID tamper denial in the real runner before paid inference.
+
+
+Evidence tool responses are always objects, matching DSH output validation:
+`vera_authority_evidence({})` returns `{kind:"catalog", items:[{id, provenance,
+content_hash}]}` (including `items:[]` when no snapshots exist). Reading one ID
+returns `{kind:"snapshot", id, provenance, content, content_hash, trust}`.
+Catalog discovery does not mark contents as observed; only a successful snapshot
+read authorizes evidence references in the coverage ledger.

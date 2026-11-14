@@ -63,10 +63,20 @@ for (const brokerMode of [false, true]) test(
             assert.ok(!names.includes("bash"));
             assert.ok(!names.includes("vera_workflow_step"));
             assert.ok(names.includes("vera_authority_evidence"));
-            if (specStep++ === 0)
-              call = ["vera_authority_evidence", { evidence_id: "reference" }];
-            else {
+            const step=specStep++;
+            if (step === 0) call = ["vera_authority_evidence", {}];
+            else if(step === 1) {
+              const catalog=msgs.filter(m=>m.role==="tool").map(parsed).filter(Boolean).at(-1);
+              assert.equal(catalog?.kind,"catalog",JSON.stringify(catalog));
+              assert.equal(catalog.items[0].id,"reference");
+              assert.equal(typeof catalog.items[0].content_hash,"string");
+              assert.equal(catalog.items[0].content,undefined);
+              call=["vera_authority_evidence",{evidence_id:catalog.items[0].id}];
+            } else {
               assert.match(all, /independent reference behavior/);
+              const snapshot=msgs.filter(m=>m.role==="tool").map(parsed).filter(Boolean).at(-1);
+              assert.equal(snapshot?.kind,"snapshot");
+              assert.equal(snapshot.id,"reference");
               call = [
                 "structured_output",
                 {
@@ -348,7 +358,7 @@ for (const brokerMode of [false, true]) test(
       assert.equal(execStep, 4);
       assert.equal(
         requests.filter((r) => r.role === "specification").length,
-        2
+        3
       );
       const log = (await readFile(join(home, "state/audit.jsonl"), "utf8"))
         .trim()

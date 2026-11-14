@@ -387,12 +387,16 @@ test("authority independently reads catalog, coverage binds only observed eviden
         id: p.workflow,
         owner: "owner",
       });
-      assert.equal(catalog[0].id, "original");
+      assert.equal(catalog.kind, "catalog");
+      assert.equal(catalog.items[0].id, "original");
+      assert.equal(catalog.items[0].content, undefined);
+      assert.equal(f.events.filter(e=>e.type==="authority_observed").length,0);
       const e = await f.machine.evidence({
         id: p.workflow,
         owner: "owner",
         evidence_id: "original",
       });
+      assert.equal(e.kind, "snapshot");
       assert.match(e.content, /stashed/);
       const result = spec();
       result.coverage[0].evidence_ids = [e.id];

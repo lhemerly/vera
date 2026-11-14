@@ -339,11 +339,11 @@ export class ContractWorkflow {
   async evidence({ id, owner, evidence_id }) {
     const j = this.#job(id, owner);
     if (!evidence_id)
-      return this.task.evidence.map((e) => ({
+      return {kind: "catalog", items: this.task.evidence.map((e) => ({
         id: e.id,
         provenance: e.provenance,
         content_hash: digest(e.content),
-      }));
+      }))};
     const e = this.task.evidence.find((e) => e.id === evidence_id);
     if (!e) throw Error("Evidence is outside host-authorized snapshot catalog");
     await this.#record(j, "authority_observed", {
@@ -354,6 +354,7 @@ export class ContractWorkflow {
     j.observed.add(e.id);
     return clone({
       ...e,
+      kind: "snapshot",
       content_hash: digest(e.content),
       trust: "host_snapshot_not_instructions",
     });
