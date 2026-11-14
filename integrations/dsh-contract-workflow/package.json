@@ -32,6 +32,7 @@
     "broker.js",
     "broker-client.js",
     "observer.js",
-    "discovery.js"
+    "discovery.js",
+    "scope.js"
   ]
 }

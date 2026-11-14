@@ -12,9 +12,16 @@ test('trusted ledger keeps actual request/results with compact previews and full
 });
 test('deferred discovery retains actionable unknowns without authorizing proposed probes',()=>{
  const context={task:{obligations:[{id:'R',requirement:'behavior'}]},observed:new Set(['known']),outcome:'needs_evidence'};
- const d={candidate_assessments:[{obligation_id:'R',behavior:'local range rejection',status:'investigate',reason:'Boundary not yet known',evidence_ids:['known']}],missing_evidence:['Does the adjacent value change rejection?'],proposed_probes:[{purpose:'Distinguish adjacent boundary',request:{argv:['validate','2'],stdin:'',fixtures:[]}}]};
+ const d={blocker:{kind:'unsupported_observation',detail:'Restricted fixture environment',local_scope_impact:'Cannot yet run target boundary',evidence_ids:[]},candidate_assessments:[{obligation_id:'R',behavior:'local range rejection',status:'investigate',reason:'Boundary not yet known',evidence_ids:['known']}],missing_evidence:['Does the adjacent value change rejection?'],proposed_probes:[{purpose:'Distinguish adjacent boundary',request:{argv:['validate','2'],stdin:'',fixtures:[]}}]};
  assert.deepEqual(validateDiscovery(d,context),d);
  assert.throws(()=>validateDiscovery({...d,missing_evidence:[]},context),/actionable/);
  assert.throws(()=>validateDiscovery({...d,proposed_probes:[{purpose:'bad',request:{argv:[],url:'http://other'}}]},context),/request/);
  assert.match(DISCOVERY_GUIDANCE,/Do not require exit-zero success/);assert.match(DISCOVERY_GUIDANCE,/not a stopping criterion/);
+});
+
+test('incomplete observation may document a blocker but never justify candidate behavior',()=>{
+ const context={task:{obligations:[{id:'R',requirement:'behavior'}]},observed:new Set(),knownEvidence:new Set(['timeout']),outcome:'needs_evidence'};
+ const d={blocker:{kind:'unsupported_observation',detail:'Reference probe timed out',local_scope_impact:'Cannot distinguish candidate local behavior',evidence_ids:['timeout']},candidate_assessments:[],missing_evidence:['Observable response'],proposed_probes:[]};
+ assert.deepEqual(validateDiscovery(d,context),d);
+ assert.throws(()=>validateDiscovery({...d,candidate_assessments:[{obligation_id:'R',behavior:'rule',status:'grounded',reason:'timeout proves it',evidence_ids:['timeout']}]},context),/unobserved/);
 });

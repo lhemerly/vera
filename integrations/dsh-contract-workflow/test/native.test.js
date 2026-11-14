@@ -85,8 +85,9 @@ for (const brokerMode of [false, true]) test(
               assert.equal(snapshot?.kind,"snapshot");assert.equal(snapshot.id,"reference");
               call=["vera_authority_observe",{argv:["0"]}];
             } else if(step===3) {
-              const snapshot=msgs.filter(m=>m.role==="tool").map(parsed).filter(Boolean).at(-1);
-              assert.equal(snapshot?.kind,"runtime_observation");assert.equal(snapshot.complete,true);
+              call=["structured_output",{outcome:"needs_evidence",discovery:{blocker:{kind:"none",detail:"",local_scope_impact:"",evidence_ids:[]},missing_evidence:["Need next permitted contrasting input"],candidate_assessments:[],proposed_probes:[{purpose:"Compare next input",request:{argv:["1"],stdin:"",fixtures:[]}}]}}];
+            } else if(step===4) {
+              assert.match(all,/Premature evidence deferral/);
               call=["vera_authority_observe",{argv:["1"],stdin:"",fixtures:[{path:"input.txt",content:"fixture"}]}];
             } else {
               assert.match(all, /independent reference behavior/);
@@ -95,7 +96,8 @@ for (const brokerMode of [false, true]) test(
                 "structured_output",
                 {
                   source,
-                  discovery:{candidate_assessments:[],missing_evidence:[],proposed_probes:[]},
+                  core_scope:{guarantee:"Input value equals emitted payload",domain:"u64 value",assumptions:[],input_mapping:[{parameter:"value",origin:"input argument",role:"data"}],host_obligations:["Parse argument and render emitted payload"],unguaranteed_behavior:["Other host behavior"],out_of_domain_behavior:"Host handles other input syntax without truncation",equivalence_claim:"local_guarantee_only"},
+                  discovery:{blocker:{kind:"none",detail:"",local_scope_impact:"",evidence_ids:[]},candidate_assessments:[],missing_evidence:[],proposed_probes:[]},
                   outcome:"ready",rationale:"Identity mapping belongs to emitted output",
                   grounding:{obligation_id:"R1",target_scope:"this_executable",input_origin:"input value argument",callsite:"emit command after parsing",observable_consumer:"stdout emitted payload",contrast:[{evidence_id:"runtime-0",observed_output:"0"},{evidence_id:"runtime-1",observed_output:"1"}]},
                   requirements_map: "Input value equals emitted payload",
@@ -379,7 +381,7 @@ for (const brokerMode of [false, true]) test(
       assert.equal(execStep, 4);
       assert.equal(
         requests.filter((r) => r.role === "specification").length,
-        5
+        6
       );
       const log = (await readFile(join(home, "state/audit.jsonl"), "utf8"))
         .trim()

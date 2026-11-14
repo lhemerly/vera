@@ -1,0 +1,12 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {validateCoreScope,authorityCompletionGuard,SCOPE_GUIDANCE} from '../scope.js';
+const scope=()=>({guarantee:'Classify next digit and checked accumulator update',domain:'One byte and accumulator within declared numeric type',assumptions:['Host preserves input order'],input_mapping:[{parameter:'byte',origin:'next raw input byte',role:'data'},{parameter:'acc',origin:'prior accumulated value',role:'data'}],host_obligations:['Loop over all input without truncation and consume parse result/error','Preserve diagnostic precedence and protocol behavior'],unguaranteed_behavior:['Full CLI and remote service equivalence'],out_of_domain_behavior:'Streaming composition covers arbitrary length; unsupported encoding is faithfully handled by host',equivalence_claim:'local_guarantee_only'});
+test('local primitive scope is admissible without whole command or remote equivalence',()=>{const s=validateCoreScope(scope());assert.equal(s.assurance,'declared_compositional_scope_not_host_equivalence');assert.ok(s.host_obligations.length);assert.match(SCOPE_GUIDANCE,/need not prove its entire command/);assert.match(SCOPE_GUIDANCE,/Do not add arbitrary input-length restrictions/);});
+test('reject explicit host-validity passthrough and inflated whole-parser claim',()=>{assert.throws(()=>validateCoreScope({...scope(),input_mapping:[{parameter:'valid',origin:'host-computed validity',role:'precomputed_decision'}]}),/precomputed/);assert.throws(()=>validateCoreScope({...scope(),equivalence_claim:'whole_parser'}),/local guarantee only/);assert.throws(()=>validateCoreScope({...scope(),host_obligations:[]}),/host obligations/);});
+test('premature deferral gets actionable feedback, legitimate blockers and unsuitable candidates remain allowed',()=>{
+ const d={outcome:'needs_evidence',discovery:{blocker:{kind:'none',detail:'',local_scope_impact:'',evidence_ids:[]},proposed_probes:[{request:{argv:['next']}}]}};
+ assert.match(authorityCompletionGuard(d),/continue discovery here/);
+ for(const kind of ['unavailable_dependency','contradictory_observations','unsupported_observation'])assert.equal(authorityCompletionGuard({...d,discovery:{...d.discovery,blocker:{kind,detail:'Concrete environmental limitation',local_scope_impact:'Cannot discriminate this local rule',evidence_ids:[]}}}),undefined);
+ assert.equal(authorityCompletionGuard({outcome:'not_suitable'}),undefined);
+});

@@ -294,3 +294,40 @@ collect two different errors and stop. Successful exit is not universally necess
 rejection behavior itself may be the real contract. A core that computes parsing or
 validation from genuine inputs can be useful; merely re-proving a host-supplied
 validity boolean is different. No core is forced when evidence remains inadequate.
+
+
+### Compositional core scope and same-session discovery
+
+A ready authority contract includes `core_scope`: guarantee, domain, assumptions,
+input_mapping (parameter/origin/data-or-precomputed-decision), host_obligations,
+unguaranteed_behavior, out_of_domain_behavior and
+`equivalence_claim:"local_guarantee_only"`. This metadata is frozen with the version
+and bound by `core_scope_hash` in receipts and trusted admission. An entire command,
+parser or remote service need not be verified to justify a useful local primitive.
+Original task obligations still stand. This is a declared compositional boundary,
+not a proof that the supplied host mapping is truthful or integrated correctly.
+The host still needs consumer tests and constant-result mutations.
+
+The gate rejects an explicitly all-precomputed-decision input mapping and inflated
+whole-equivalence claim. It cannot infer semantic adequacy merely from field labels.
+A few local observations cannot establish a complete parser, and a valid proof does
+not authorize new input restrictions. Use faithful incremental composition or host
+handling beyond the core domain, not truncation or rejection to fit arbitrary bounds.
+
+`discovery.blocker` records kind (`none`, `unavailable_dependency`,
+`contradictory_observations`, `unsupported_observation`), detail, local_scope_impact
+and evidence_ids. `needs_evidence` requires a concrete local blocker. The DSH guard
+returns actionable feedback before an internally unsupported deferral concludes the
+same authority session; it does not invoke probes, choose an action, add an automatic
+retry loop, or introduce a new iteration/proof deadline. The authority can continue
+permitted discovery, establish a real blocker, or return not_suitable honestly.
+A valid blocker is allowed even if useful probes are listed; no plan is forced.
+
+Incomplete observations can substantiate a blocker (for example a recorded timeout),
+but remain disallowed as behavioral grounding or coverage evidence. An unknown remote
+behavior matters only when it actually blocks the chosen local slice, not merely
+because complete application equivalence remains unproved.
+
+Blocker checks validate the declared structure, not whether a claimed dependency is
+actually unavailable or every possible probe has been exhausted. Independent trace
+and consumer review remain necessary; scope labels do not establish integration.

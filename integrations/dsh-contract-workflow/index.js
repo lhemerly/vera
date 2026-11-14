@@ -1,3 +1,4 @@
+import {authorityCompletionGuard} from "./scope.js";
 import { installModelSelection } from "@deepseek-ai/dsh-agent";
 import z from "@deepseek-ai/schemastery";
 import { defineTool } from "@deepseek-ai/dsh-tools";
@@ -49,6 +50,7 @@ export function roleGuard(roles, known, exec) {
   const role = roles.get(id);
   if (!role)
     return "Contract role is closed or belongs to an earlier plugin instance";
+  if(role.role==="specification"&&exec.name==="structured_output")return authorityCompletionGuard(exec.arguments);
   const allowed = role.role === "specification" ? SPEC_TOOLS : EXEC_TOOLS;
   if (exec.name !== "structured_output" && !allowed.includes(exec.name))
     return "Tool unavailable in isolated contract role";

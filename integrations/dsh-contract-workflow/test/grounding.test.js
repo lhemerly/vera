@@ -1,15 +1,16 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {ContractWorkflow,digest} from '../workflow.js';
+const localScope=()=>({guarantee:'Emit supplied value exactly',domain:'u64 input',assumptions:[],input_mapping:[{parameter:'value',origin:'parsed user input',role:'data'}],host_obligations:['Faithful input parsing and output rendering'],unguaranteed_behavior:['Transport and other command behavior'],out_of_domain_behavior:'Host handles other syntax faithfully without discarding accepted inputs',equivalence_claim:'local_guarantee_only'});
 const grounding=()=>({obligation_id:'R1',target_scope:'this_executable',input_origin:'CLI value argument parsed to u64',callsite:'emit command after parsing',observable_consumer:'emitted stdout payload',contrast:[]});
-const spec=()=>({outcome:'ready',rationale:'Original task explicitly defines value identity',source:'fixture',requirements_map:'Identity core',coverage:[{id:'R1',requirement:'emit input value',disposition:'core_contract',justification:'Only value identity; host formatting remains external',evidence_ids:[]}],grounding:grounding(),assumptions:'u64 input',acceptance_tests:'Compare stdout for inputs 0 and 1'});
+const spec=()=>({core_scope:localScope(),outcome:'ready',rationale:'Original task explicitly defines value identity',source:'fixture',requirements_map:'Identity core',coverage:[{id:'R1',requirement:'emit input value',disposition:'core_contract',justification:'Only value identity; host formatting remains external',evidence_ids:[]}],grounding:grounding(),assumptions:'u64 input',acceptance_tests:'Compare stdout for inputs 0 and 1'});
 function fixture({runtime=true,answer=()=>spec(),observe}={}){
  let f,n=0;const events=[],freezes=[];
  const machine=new ContractWorkflow({task:{id:'task',original_requirements:'emit input value',provenance:'fixture',policy:{requireRuntimeGrounding:runtime},obligations:[{id:'R1',requirement:'emit input value'}]},
  backend:{async freeze(source){freezes.push(source);return {source};}},
  journal:async e=>events.push(e),
  observe:observe??(async req=>{const content=JSON.stringify({result:{status:'completed',stdout:req.argv[0],stderr:'',exit_code:0}});return {id:'obs-'+(++n),content,content_hash:digest(content),provenance:'isolated test reference',complete:true};}),
- runRole:async p=>{const result=await answer(f,p);return {discovery:{candidate_assessments:result.outcome==='not_suitable'?[{obligation_id:'R1',behavior:'proposed mapping',status:'unsuitable',reason:'remote component',evidence_ids:[]}]:[],missing_evidence:result.outcome==='needs_evidence'?['Need contrasting target observations']:[],proposed_probes:[]},...result};},
+ runRole:async p=>{const result=await answer(f,p);const blocker=result.outcome==='needs_evidence'?{kind:'unsupported_observation',detail:'Required observation unavailable in fixture environment',local_scope_impact:'Fixture cannot resolve next local boundary',evidence_ids:[]}:{kind:'none',detail:'',local_scope_impact:'',evidence_ids:[]};return {discovery:{blocker,candidate_assessments:result.outcome==='not_suitable'?[{obligation_id:'R1',behavior:'proposed mapping',status:'unsuitable',reason:'remote component',evidence_ids:[]}]:[],missing_evidence:result.outcome==='needs_evidence'?['Need contrasting target observations']:[],proposed_probes:[]},...result,...(result.discovery?{discovery:{blocker,...result.discovery}}:{})};},
  });f={machine,events,freezes};return f;
 }
 const signal=()=>new AbortController().signal;

@@ -1,14 +1,18 @@
+import {BLOCKER_SCHEMA,authorityCompletionGuard} from './scope.js';
 import {createHash} from 'node:crypto';
 import {observationRequest} from './observer.js';
 const hash=s=>createHash('sha256').update(s).digest('hex');
 const field={type:'string'};
 export const DISCOVERY_SCHEMA={type:'object',additionalProperties:false,properties:{
+ blocker:BLOCKER_SCHEMA,
  candidate_assessments:{type:'array',items:{type:'object',additionalProperties:false,properties:{obligation_id:field,behavior:field,status:{type:'string',enum:['investigate','grounded','unsuitable']},reason:field,evidence_ids:{type:'array',items:field}},required:['obligation_id','behavior','status','reason','evidence_ids']}},
  missing_evidence:{type:'array',items:field},
  proposed_probes:{type:'array',items:{type:'object',additionalProperties:false,properties:{purpose:field,request:{type:'object',additionalProperties:false,properties:{argv:{type:'array',items:field},stdin:field,fixtures:{type:'array',items:{type:'object',additionalProperties:false,properties:{path:field,content:field},required:['path','content']}}},required:['argv','stdin','fixtures']}},required:['purpose','request']}}
-},required:['candidate_assessments','missing_evidence','proposed_probes']};
-export function validateDiscovery(d,{task,observed,outcome}){
- if(!d||typeof d!=='object'||Array.isArray(d)||Object.keys(d).some(k=>!['candidate_assessments','missing_evidence','proposed_probes'].includes(k))||!['candidate_assessments','missing_evidence','proposed_probes'].every(k=>Array.isArray(d[k])))throw Error('Structured discovery state required');
+},required:['candidate_assessments','missing_evidence','proposed_probes','blocker']};
+export function validateDiscovery(d,{task,observed,knownEvidence=observed,outcome}){
+ if(!d||typeof d!=='object'||Array.isArray(d)||Object.keys(d).some(k=>!['candidate_assessments','missing_evidence','proposed_probes','blocker'].includes(k))||!['candidate_assessments','missing_evidence','proposed_probes'].every(k=>Array.isArray(d[k])))throw Error('Structured discovery state required');
+ const feedback=authorityCompletionGuard({outcome,discovery:d});if(feedback)throw Error(feedback);
+ if(!d.blocker||!['none','unavailable_dependency','contradictory_observations','unsupported_observation'].includes(d.blocker.kind)||typeof d.blocker.detail!=='string'||typeof d.blocker.local_scope_impact!=='string'||!Array.isArray(d.blocker.evidence_ids)||d.blocker.evidence_ids.some(id=>!knownEvidence.has(id)))throw Error('Invalid discovery blocker');
  const text=(v,n)=>{if(typeof v!=='string'||!v.trim())throw Error('Invalid discovery '+n);};
  const obligations=task.obligations.length?task.obligations.map(r=>r.id):['original-task'];
  for(const c of d.candidate_assessments){

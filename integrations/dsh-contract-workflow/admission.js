@@ -33,6 +33,7 @@ export function inspectAdmission({ task, audit, receipt, code, host_api }) {
     receipt.contract_hash !== current.contract_hash ||
     receipt.coverage_hash !== digest(current.coverage) ||
     receipt.grounding_hash !== digest(current.grounding??null) ||
+    receipt.core_scope_hash !== digest(current.core_scope??null) ||
     digest(receipt.grounding_policy)!==digest(expected.policy)
   )
     throw Error("Stale or unbound coverage/contract");
@@ -69,6 +70,7 @@ export function inspectAdmission({ task, audit, receipt, code, host_api }) {
     coverage_completeness: "not_established",
     task_id: expected.id,
     grounding:structuredClone(current.grounding??null),
+    core_scope:structuredClone(current.core_scope??null),
     grounding_policy:expected.policy,
     coverage: structuredClone(current.coverage),
   };
