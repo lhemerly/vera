@@ -17,19 +17,19 @@ test(
     assert.equal(matching.ok, true, JSON.stringify(matching));
     const weakened = source.replace(
       "eq(effect_arg(Value,0,value),value)",
-      "true",
+      "true"
     );
     assert.equal((await backend.compare(frozen, weakened, signal)).ok, false);
     assert.equal(
       (await backend.compare(frozen, "invalid syntax", signal)).ok,
-      false,
+      false
     );
     const proof = await backend.verify(source, signal);
     assert.equal(proof.ok, true, JSON.stringify(proof));
     assert.ok(proof.result.results[0].specification_footprint);
     const failed = await backend.verify(
       source.replace("emit Value(value)", "emit Value(0)"),
-      signal,
+      signal
     );
     assert.equal(failed.ok, false);
     assert.ok(failed.result.results[0].counterexample);
@@ -39,7 +39,7 @@ test(
     assert.equal(generated.host_api.schema_version, 1);
     assert.equal(generated.host_api.target, "rust");
     assert.deepEqual(generated.host_api.functions, []);
-  },
+  }
 );
 test(
   "real compiler integrated workflow admission rejects spec drift and repairs with footprint",
@@ -48,6 +48,11 @@ test(
     const backend = await compilerBackend(binary);
     let calls = 0;
     const w = new ContractWorkflow({
+      task: {
+        id: "fixture",
+        original_requirements: "Emit exact input",
+        provenance: "fixture",
+      },
       backend,
       runRole: async () => {
         calls++;
@@ -55,6 +60,15 @@ test(
           ? {
               source,
               requirements_map: "Emit exact input",
+              coverage: [
+                {
+                  id: "R1",
+                  requirement: "emit input",
+                  disposition: "core_contract",
+                  justification: "contract",
+                  evidence_ids: [],
+                },
+              ],
               assumptions: "finite u64",
               acceptance_tests: "Check actual emitted value",
             }
@@ -64,7 +78,7 @@ test(
                 calls === 2
                   ? source.replace(
                       "eq(effect_arg(Value,0,value),value)",
-                      "true",
+                      "true"
                     )
                   : source,
               explanation: "candidate",
@@ -87,7 +101,7 @@ test(
           signal,
         })
       ).status,
-      "not_verified",
+      "not_verified"
     );
     const done = await w.step({
       id: j.id,
@@ -99,17 +113,27 @@ test(
     assert.equal(done.admitted.receipt.admission_scope, "verified_core_only");
     assert.equal(done.admitted.receipt.host_integration, "not_checked");
     assert.ok(
-      done.admitted.evidence.proof.result.results[0].specification_footprint,
+      done.admitted.evidence.proof.result.results[0].specification_footprint
     );
-  },
+  }
 );
 
-test("real compiler returns stable source-named pure-function host API", { skip: !binary }, async () => {
-  const backend = await compilerBackend(binary);
-  const generated = await backend.codegen("module Host; function identity(x:u64)->u64 ensure exact:eq(result,x); body { yield x; }", signal);
-  assert.equal(generated.ok, true);
-  assert.equal(generated.host_api.functions[0].name, "identity");
-  assert.equal(generated.host_api.functions[0].rust_path, "functions::call_identity");
-  assert.equal(generated.host_api.functions[0].host_domain_validation, true);
-  assert.match(generated.code, /pub fn call_identity/);
-});
+test(
+  "real compiler returns stable source-named pure-function host API",
+  { skip: !binary },
+  async () => {
+    const backend = await compilerBackend(binary);
+    const generated = await backend.codegen(
+      "module Host; function identity(x:u64)->u64 ensure exact:eq(result,x); body { yield x; }",
+      signal
+    );
+    assert.equal(generated.ok, true);
+    assert.equal(generated.host_api.functions[0].name, "identity");
+    assert.equal(
+      generated.host_api.functions[0].rust_path,
+      "functions::call_identity"
+    );
+    assert.equal(generated.host_api.functions[0].host_domain_validation, true);
+    assert.match(generated.code, /pub fn call_identity/);
+  }
+);

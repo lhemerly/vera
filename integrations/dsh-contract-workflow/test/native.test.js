@@ -34,7 +34,8 @@ test(
       failure;
     const requests = [];
     let ownerStep = 0,
-      execStep = 0;
+      execStep = 0,
+      specStep = 0;
     let workflow;
     let calls = 0;
     try {
@@ -46,7 +47,7 @@ test(
           const msgs = r.messages;
           const all = msgs.map(text).join("\n");
           const isExec = all.includes(
-            "Implement against the frozen VERA contract below.",
+            "Implement against the frozen VERA contract below."
           );
           const isSpec =
             !isExec &&
@@ -60,32 +61,48 @@ test(
             assert.ok(names.includes("structured_output"));
             assert.ok(!names.includes("bash"));
             assert.ok(!names.includes("vera_workflow_step"));
-            call = [
-              "structured_output",
-              {
-                source,
-                requirements_map: "Input value equals emitted payload",
-                assumptions: "u64 bounded domain",
-                acceptance_tests: "Compare actual emitted effect",
-              },
-            ];
+            assert.ok(names.includes("vera_authority_evidence"));
+            if (specStep++ === 0)
+              call = ["vera_authority_evidence", { evidence_id: "reference" }];
+            else {
+              assert.match(all, /independent reference behavior/);
+              call = [
+                "structured_output",
+                {
+                  source,
+                  requirements_map: "Input value equals emitted payload",
+                  coverage: [
+                    {
+                      id: "R1",
+                      requirement: "emit value",
+                      disposition: "core_contract",
+                      justification: "reference observation",
+                      evidence_ids: ["reference"],
+                    },
+                  ],
+                  assumptions: "u64 bounded domain",
+                  acceptance_tests: "Compare actual emitted effect",
+                },
+              ];
+            }
           } else if (role === "executor") {
             assert.ok(!all.includes("OWNER_SECRET_NOT_FOR_CHILD"));
             assert.ok(names.includes("vera_contract_verify"));
             assert.ok(!names.includes("vera_verify"));
+            assert.ok(!names.includes("vera_authority_evidence"));
             assert.ok(!names.includes("bash"));
             if (execStep === 0) call = ["bash", { command: "exit 97" }];
             else if (execStep === 1) {
               assert.match(
                 all,
-                /unknown|not found|denied|unavailable|not registered/i,
+                /unknown|not found|denied|unavailable|not registered/i
               );
               call = [
                 "vera_contract_verify",
                 {
                   source: source.replace(
                     "eq(effect_arg(Value,0,value),value)",
-                    "true",
+                    "true"
                   ),
                 },
               ];
@@ -144,7 +161,7 @@ test(
                   model: "fixture",
                   choices: [{ index: 0, delta, finish_reason }],
                 }) +
-                "\n\n",
+                "\n\n"
             );
           chunk({
             role: "assistant",
@@ -178,6 +195,22 @@ test(
       await mkdir(join(home, "workspace"));
       await mkdir(join(home, "state"), { mode: 0o700 });
       await writeFile(
+        join(home, "task.json"),
+        JSON.stringify({
+          id: "fixture",
+          original_requirements: "Emit input value",
+          provenance: "test fixture",
+          evidence: [
+            {
+              id: "reference",
+              provenance: "host captured original binary",
+              content:
+                "independent reference behavior: input equals emitted value",
+            },
+          ],
+        })
+      );
+      await writeFile(
         join(home, "profiles/headless/package.json"),
         JSON.stringify({
           name: "dsh-profile-headless",
@@ -188,7 +221,7 @@ test(
               bundles: ["@deepseek-ai/dsh-base", "@deepseek-ai/dsh-headless"],
             },
           },
-        }),
+        })
       );
       const patch = [
         "session-title-llm",
@@ -257,11 +290,12 @@ test(
               config: {
                 binary,
                 stateDirectory: join(home, "state"),
+                taskManifest: join(home, "task.json"),
                 provider: "spawn",
               },
             },
           ],
-        },
+        }
       );
       await writeFile(join(home, "patch.json"), JSON.stringify(patch));
       child = spawn(
@@ -279,10 +313,10 @@ test(
             FIXTURE_KEY: "local-not-real",
           },
           stdio: ["pipe", "pipe", "pipe"],
-        },
+        }
       );
       child.stdin.end(
-        "OWNER_SECRET_NOT_FOR_CHILD. Run local contract fixture.",
+        "OWNER_SECRET_NOT_FOR_CHILD. Run local contract fixture."
       );
       child.stdout.on("data", (b) => (stdout += b));
       child.stderr.on("data", (b) => (stderr += b));
@@ -298,7 +332,7 @@ test(
       assert.equal(execStep, 4);
       assert.equal(
         requests.filter((r) => r.role === "specification").length,
-        1,
+        2
       );
       const log = (await readFile(join(home, "state/audit.jsonl"), "utf8"))
         .trim()
@@ -309,13 +343,14 @@ test(
       assert.notEqual(reserved[0].child_id, reserved[1].child_id);
       assert.equal(log.filter((e) => e.type === "role_closed").length, 2);
       assert.ok(log.some((e) => e.type === "artifact_admitted"));
+      assert.ok(log.some((e) => e.type === "authority_observed"));
       console.log(
         JSON.stringify({
           paidCalls: 0,
           localFixtureRequests: calls,
           distinctChildSessions: reserved.map((e) => e.child_id),
           admitted: true,
-        }),
+        })
       );
     } catch (e) {
       console.error(stderr);
@@ -326,5 +361,5 @@ test(
       if (server) await new Promise((r) => server.close(r));
       await rm(home, { recursive: true, force: true });
     }
-  },
+  }
 );

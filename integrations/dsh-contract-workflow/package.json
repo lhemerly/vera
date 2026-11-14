@@ -1,11 +1,12 @@
 {
   "name": "dsh-vera-contract-workflow",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "index.js",
   "exports": {
-    ".": "./index.js"
+    ".": "./index.js",
+    "./admission": "./admission.js"
   },
   "engines": {
     "node": ">=24",
@@ -23,6 +24,7 @@
   "files": [
     "index.js",
     "workflow.js",
+    "admission.js",
     "backend.js",
     "README.md"
   ]

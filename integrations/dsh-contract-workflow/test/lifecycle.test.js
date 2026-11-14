@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, rm, readFile } from "node:fs/promises";
+import { writeFile, mkdtemp, rm, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { apply } from "../index.js";
@@ -66,6 +66,15 @@ test(
                   source:
                     "module T; transition t() reads [] writes [] body { commit; }",
                   requirements_map: "test",
+                  coverage: [
+                    {
+                      id: "R1",
+                      requirement: "test",
+                      disposition: "core_contract",
+                      justification: "fixture",
+                      evidence_ids: [],
+                    },
+                  ],
                   assumptions: "none",
                   acceptance_tests: "test",
                 },
@@ -77,19 +86,32 @@ test(
           },
         },
       };
-      await apply(ctx, { binary, stateDirectory: dir, provider: "spawn" });
+      await writeFile(
+        join(dir, "task.json"),
+        JSON.stringify({
+          id: "test",
+          original_requirements: "test",
+          provenance: "fixture",
+        })
+      );
+      await apply(ctx, {
+        binary,
+        stateDirectory: dir,
+        taskManifest: join(dir, "task.json"),
+        provider: "spawn",
+      });
       await assert.rejects(
         registered
           .get("vera_workflow_start")
           .execute(
             { requirements: "test" },
-            { agent: { id: "parent" }, signal: new AbortController().signal },
+            { agent: { id: "parent" }, signal: new AbortController().signal }
           ),
-        /disposal failed/,
+        /disposal failed/
       );
       assert.match(
         guard({ agent: { id: childId }, name: "vera_help" }),
-        /closed/,
+        /closed/
       );
       const rows = (await readFile(join(dir, "audit.jsonl"), "utf8"))
         .trim()
@@ -100,5 +122,5 @@ test(
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
-  },
+  }
 );
